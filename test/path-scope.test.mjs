@@ -119,12 +119,23 @@ test("the real registry scopes: fixtures to src|test|README, drydock to its own 
   assert.deepEqual(fx1.allowlist, ["src/", "test/", "README.md"]);
 
   const drydock = entryOrThrow("lalanikarim/drydock");
-  // A self-run may edit factory/fleet code, its own tests, and the research docs…
+  // A self-run may edit factory/fleet code, its own tests, the research docs, and — decision E1 —
+  // the two root documents, including the one that describes how it works.
   assert.equal(checkPathScope(["factory/worker.ts", "test/x.test.mjs", "research/multi-repo-factory-plan.md"], drydock).ok, true);
-  // …but not the vendored kernel, not its own dependencies, and not repo governance files.
-  for (const forbidden of ["vendor/engram", "package.json", "package-lock.json", "AGENTS.md", ".github/workflows/ci.yml"]) {
+  assert.equal(checkPathScope(["README.md", "AGENTS.md"], drydock).ok, true, "E1: self-work documents itself");
+
+  // What stays off-limits is everything that changes what the pipeline *can do* rather than what it
+  // knows: the vendored kernel, dependency manifests, and CI configuration.
+  for (const forbidden of ["vendor/engram", "package.json", "package-lock.json", ".github/workflows/ci.yml"]) {
     assert.equal(checkPathScope([forbidden], drydock).ok, false, `${forbidden} must be off-limits to a drydock self-run`);
   }
+
+  // E1's stated safety argument, checked rather than asserted in prose: AGENTS.md is advisory text
+  // read by the model, while enforcement reads this registry file — which lives in the graded repo
+  // but is not reachable through the graded workspace's own writes. Editing the instructions cannot
+  // widen the scope, because scope never consults them.
+  assert.equal(checkPathScope(["AGENTS.md", "gates/probes/list-total-count.mjs"], drydock).ok, false,
+    "a permitted docs edit bundled with an oracle edit is still refused wholesale");
 
   // Self-grading: `gates/` is deliberately outside drydock's allowlist. For a fixture repo the gates
   // being editable would not matter — G2 runs from outside the graded repo. Drydock IS its own graded

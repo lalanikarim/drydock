@@ -1,5 +1,5 @@
 {
-  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Runtime config stays in factory/config/<owner>_<repo>.json; the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true — see research/multi-repo-factory-plan.md §5.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md §5.11.",
+  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Runtime config stays in factory/config/<owner>_<repo>.json; the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true \u2014 see research/multi-repo-factory-plan.md \u00a75.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md \u00a75.11.",
   "defaults": {
     "eligibilityLabel": "agent",
     "autoMerge": true,
@@ -9,10 +9,17 @@
     {
       "repo": "lalanikarim/factory-fixture",
       "configFile": "factory/config/lalanikarim_factory-fixture.json",
-      "pathAllowlist": ["src/", "test/", "README.md"],
+      "pathAllowlist": [
+        "src/",
+        "test/",
+        "README.md"
+      ],
       "oracleBoot": {
         "command": "node",
-        "args": ["src/server.mjs", "0"],
+        "args": [
+          "src/server.mjs",
+          "0"
+        ],
         "portFrom": "stdout",
         "stdoutPattern": "127\\.0\\.0\\.1:(\\d+)"
       }
@@ -20,10 +27,16 @@
     {
       "repo": "lalanikarim/factory-fixture-2",
       "configFile": "factory/config/lalanikarim_factory-fixture-2.json",
-      "pathAllowlist": ["src/", "test/", "README.md"],
+      "pathAllowlist": [
+        "src/",
+        "test/",
+        "README.md"
+      ],
       "oracleBoot": {
         "command": "node",
-        "args": ["src/server.js"],
+        "args": [
+          "src/server.js"
+        ],
         "portFrom": "env",
         "envPortVar": "PORT"
       }
@@ -33,10 +46,19 @@
       "enabled": true,
       "autoMerge": false,
       "configFile": "factory/config/lalanikarim_drydock.json",
-      "pathAllowlist": ["factory/", "fleet/", "test/", "research/"],
-      "protectedPaths": ["gates/probes/"],
+      "pathAllowlist": [
+        "factory/",
+        "fleet/",
+        "test/",
+        "research/",
+        "README.md",
+        "AGENTS.md"
+      ],
+      "protectedPaths": [
+        "gates/probes/"
+      ],
       "eligibilityLabel": "build",
-      "note": "N3 dogfood target, enabled for LOCAL human-dispatched self-work only: there is no fleet entry and no published webhook listener, so nothing starts a factory here by itself; runs are started deliberately (gates/self-run-task.mjs) against this checkout. autoMerge is false permanently — drydock runs stop at the draft PR for a human to merge (§5.11). pathAllowlist deliberately excludes gates/ so a self-run cannot edit the oracles that judge it, and gates/probes/ is additionally protected."
+      "note": "N3 dogfood target, enabled for LOCAL human-dispatched self-work only: there is no fleet entry and no published webhook listener, so nothing starts a factory here by itself; runs are started deliberately (gates/self-run-task.mjs) against this checkout. autoMerge is false permanently \u2014 drydock runs stop at the draft PR for a human to merge (\u00a75.11). pathAllowlist deliberately excludes gates/ so a self-run cannot edit the oracles that judge it, and gates/probes/ is additionally protected. README.md and AGENTS.md are writable by decision E1 (2026-10-31): self-work documents itself, including its own operating rules, because the file is advisory while the enforcement points live outside the workspace \u2014 this registry and the reviewer. An AGENTS.md edit only changes future behaviour once a human merges it."
     }
   ]
 }
