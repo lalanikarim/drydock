@@ -30,9 +30,32 @@ Single-operator host; `fleet/fleet.local.json` and `.env` are gitignored. Revisi
 
 ## 2026-10-31 — identity & credentials
 
-### B1 — One fine-grained PAT scoped to exactly the managed repos · **adopted**
+### B1 — One fine-grained PAT scoped to exactly the managed repos · **superseded 2026-10-31 by B1-rev**
 
 One secret, explicit repo list, no org-wide write. Scopes needed by the current flow: `contents:write`, `pull_requests:write`, `issues:read`. Supersedes "account-wide via gh keychain" (which is what actually runs today, per #70).
+
+*Superseded because a GitHub App (`drydock-factory`) turned out to be configured already and satisfies the same requirement without a long-lived secret — see B1-rev. The PAT is never cut.*
+
+### B1-rev — The GitHub App installation is the factory credential; no PAT · **adopted — verified 2026-10-31, code wiring pending**
+
+Operator decision: "we have a GitHub App configured already and updated .env. we'll proceed with that instead of PAT." B3 (App for authorship) stops being a later phase and becomes the credential decision as well — one identity for both, which is cleaner than B1 + B3 coexisting.
+
+**Verified against the live installation** (`gates/github-app-check.mjs`, read-only apart from one reversible ref probe):
+
+| Property | Value | Verdict |
+|---|---|---|
+| App | `drydock-factory` (id 5557270), owned by `lalanikarim` | — |
+| Installation | 177271737 on user `lalanikarim` | — |
+| Permissions granted | `contents:write`, `issues:write`, `pull_requests:write`, `metadata:read` | **covers everything the factory needs**, incl. more than B1 asked (`issues:write` vs `issues:read`) |
+| Write capability | created then deleted a branch ref on `lalanikarim/drydock` with an installation token (201 → 204) | **proven, not just granted** |
+| Read access | issues + pulls HTTP 200 on drydock and both fixtures (private ones included) | ok |
+| Token lifetime | installation tokens expire ~1 h; app JWT minted for ≤10 min from `GITHUB_APP_PRIVATE_KEY_PATH` | strictly better than a PAT that never expires |
+| **Repository selection** | **`all` — 172 repositories (5 private), including ones created later** | **⚠ narrower in kind than the keychain, far wider in reach than B1 intended** |
+| App webhook events | none subscribed | fine today (repo webhook + secret); relevant if we ever want app-driven wakeups instead |
+
+**The honest part:** an App is often described as the scoped option, and here it isn't — `repository_selection: all` means a leaked key can touch every repo in the account, which is *more* than the fine-grained PAT would have allowed. What it does buy over the PAT: no never-expiring secret in any env var or keychain, 1-hour tokens, four permission types instead of an auth surface that can do anything the account can, and revocation by uninstalling rather than by rotation. So the decision is adopted **with the reach finding recorded as R7**, and narrowing the installation to the managed repos is a named operator step (queue item 3) rather than something the code can fix.
+
+**What is not true yet:** no drydock code reads `GITHUB_APP_*`. Runs today still fall back to the host keychain (#70's warning fires). The credential work is therefore *not* finished by this decision — it moves from "cut a PAT" (dropped) to "implement the token exchange and wire it into clone/push/PR authorship" (queue item 3b, promoted into the pre-publish sequence because R3 always required a non-keychain credential before publishing).
 
 ### B2 — Missing factory token: start, but log the credential path loudly · **adopted — implemented**
 
@@ -40,13 +63,13 @@ Boot must state which credential path it resolved (`FACTORY_GITHUB_TOKEN` set vs
 
 Implemented: `factory/credential-source.ts` resolves the same order the pipeline uses (env → per-repo config → host helpers → none) and `main.ts` logs it at boot; the host-helper and none cases are `console.warn`. Live-verified on this machine's real configuration: boot now prints `WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig). On a developer machine that entry is typically ACCOUNT-WIDE; scope it (decision B1) or set FACTORY_GITHUB_TOKEN.`
 
-### B3 — PRs should be authored by a GitHub App · **adopted (later in sequence)**
+### B3 — PRs should be authored by a GitHub App · **adopted — App now created and installed**
 
-Answers #68 properly: PRs appear as the app, reviewable before merge by a human, with an identity distinct from the operator's. Sequenced after B1 rather than instead of it: the scoped PAT unblocks everything now and does not need rotation tooling that the App would replace. Migration path is recorded so nobody builds PAT automation twice.
+Answers #68 properly: PRs appear as the app, reviewable before merge by a human, with an identity distinct from the operator's. Originally sequenced after B1; superseded sequencing by B1-rev — the App is created, installed, permission-verified (2026-10-31), and is now both the credential and the author identity. Remaining for #68: implement the exchange in code and confirm PRs actually appear as `drydock-factory` rather than `lalanikarim` on the first app-authored run.
 
-### I2 — interpretation: PAT now, App later · **interpretation**
+### I2 — interpretation: PAT now, App later · **superseded 2026-10-31 by B1-rev**
 
-B1 and B3 could read as contradictory. Reading: PAT = today's credential with a bounded blast radius; App = identity for authorship, delivered as D1 item 3. Correct me if the intent was "wait for the App".
+B1 and B3 could read as contradictory. Reading at the time: PAT = today's credential with a bounded blast radius; App = identity for authorship. *Rendered moot: no PAT is cut; the App does both.*
 
 ---
 
@@ -113,7 +136,7 @@ Notable that all three ranked items are new capability rather than the open defe
 
 ### I1 — interpretation: in-flight correctness first, then the ranked features · **interpretation**
 
-D1 ranks three capabilities while A3 gates deployment on #69 and C1 was chosen as the CI substitute. Combined with G3 ("wrap up all in-flight work as soon as possible and get this ready for production"), the queue runs: #69 → #70 → PAT → #61 → E1 allowlist → publish, then D1's ranked list. Correct me if the intent was to start #67 immediately instead.
+D1 ranks three capabilities while A3 gates deployment on #69 and C1 was chosen as the CI substitute. Combined with G3 ("wrap up all in-flight work as soon as possible and get this ready for production"), the queue ran: #69 → #70 → PAT → #61 → E1 allowlist → publish, then D1's ranked list. **Updated 2026-10-31:** #69, #70 and #61 are shipped; "PAT" became "App credential wired into code (3b) + narrow installation reach (3a)" under B1-rev, so the remaining pre-publish sequence is 3a → 3b → E1 allowlist → publish.
 
 ### D2 — Target 2 (#42): design document only, no build · **adopted**
 
@@ -187,7 +210,8 @@ Concrete enough to check against `research/work-queue.md`: every in-flight item 
 |---|---|---|---|
 | R1 | ~~No CI~~ and 0 required approving reviews: nothing *required* re-runs tests after a draft PR exists | C2-rev + E3 | **Mostly closed by C2-rev**: CI runs on every draft PR head. Residual gap until the operator makes `unit-suite` a required status check (advisory today); C1 still covers the pre-push path |
 | R2 | Self-work can edit `AGENTS.md`, the file that constrains it | E1 | Recommend moving it to `protectedPaths`; human merge is currently the only control |
-| R3 | Public listener (Funnel) on a laptop holding an account-wide credential | A1 + A2, credential status today | B1 PAT is a **prerequisite** for publishing, not a follow-up; funnel URL is revocable; `allowedSenders` stays on |
+| R3 | Public listener (Funnel) on a laptop holding an account-wide credential | A1 + A2 | Was "B1 PAT first"; now **B1-rev: App-based credential wired into the code before publishing** (queue item 3b), since the keychain fallback is exactly what the warning in #70 describes. Funnel URL is revocable; `allowedSenders` stays on |
+| R7 | App installation reach is **all 172 account repos (5 private), including future ones** — wider than the PAT it replaced | B1-rev, `repository_selection: all` | Operator narrows the installation to the managed repos (queue item 3a); until then a leaked `app.pem` is account-wide. Mitigations that do exist: no admin grants, ~1 h tokens, revocation by uninstalling, and the key never enters git (`.env` + a path outside the repo). Verify any time with `node gates/github-app-check.mjs` |
 | R4 | ~~Stale policy accepted between fleet change and restart~~ | **#69 closed** (this PR) | Supervisor writes fresh routes before spawn (atomic, always overwrite); adapter re-hashes per request and exits on drift. Residual: fleet-file changes still need a supervisor restart (fleet is read once at start) — documented in the runbook |
 | R5 | ~~Re-verification of a draft PR after rework relies on the same worker-run command~~ | **closed** by C1 + C2-rev | Verification now runs host-side at push time (not inside the worker's sandbox), and CI runs the same suite on the resulting PR head independently of the factory. Byte-scoped approval (#47) means an approval names the commit that was tested |
 | R6 | Two latent fail-open coercions found while implementing C1 — both now fixed, kept here as the lesson | registry validation | (a) `Boolean("false") === true`, so a JSON typo like `"autoMerge": "false"` would have **granted** merge rights; safety flags are now type-checked. (b) A nested `node --test` inheriting `NODE_TEST_CONTEXT` skips every file and exits 0 — a green verification with zero tests behind it; the child env is stripped and zero collected tests is treated as failure. Both were found by testing, not review: suspect this class of bug in any flag coerced with `Boolean()` or any gate that trusts an exit code alone |
