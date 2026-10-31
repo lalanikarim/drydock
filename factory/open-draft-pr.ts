@@ -13,42 +13,14 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
-import { commandArgv } from "./factory-config.ts";
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
+import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
 
 const pExecFile = promisify(execFile);
 
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
   const { stdout } = await pExecFile(cmd, args, { maxBuffer: 16 * 1024 * 1024, ...opts });
   return stdout.trim();
-}
-
-// Per-repo test command (validated argv, never a shell). `# tests/# pass/# fail`
-// counts are parsed only for node --test suites; other commands report
-// exit-status + tail so the evidence body stays honest about what was checked.
-export async function runTestSuite(ws: string, testCommand = "node --test") {
-  const parse = (out: string) => ({
-    total: lastCount(out, "# tests"),
-    pass: lastCount(out, "# pass"),
-    fail: lastCount(out, "# fail"),
-  });
-  const argv = commandArgv(testCommand);
-  const [cmd, ...args] = argv;
-  const isNodeTest = cmd === "node" && args.includes("--test");
-  try {
-    const out = await sh(cmd, args, { cwd: ws });
-    return { passed: true, ...(isNodeTest ? parse(out) : {}), tail: out.split("\n").slice(-6).join("\n") };
-  } catch (e) {
-    const err = e as Error & { stdout?: string; stderr?: string };
-    const out = String(err.stdout ?? "") + String(err.stderr ?? "");
-    return { passed: false, ...(isNodeTest ? parse(out) : {}), tail: out.split("\n").slice(-10).join("\n") };
-  }
-}
-
-/** Last `# <label> N` summary line of a `node --test` run (undefined if absent). */
-function lastCount(out: string, label: string): number | undefined {
-  const matches = [...out.matchAll(new RegExp(`^${label} (\\d+)$`, "gm"))];
-  return matches.length ? Number(matches.at(-1)![1]) : undefined;
 }
 
 /** Per-file diff stat of the branch against its merge base with main. */
@@ -89,19 +61,18 @@ export interface ReviewVerdict {
 /** G4 evidence packager: every non-obvious section of the PR body, assembled from
  *  host-verified facts (diff, suite counts) plus the reviewer verdict and the
  *  worker's final report from the transcript. */
-function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log }: {
+function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification }: {
   issueNumber: number;
   summary: string;
   verdict: ReviewVerdict;
-  tests: { passed: boolean; total?: number; pass?: number; fail?: number; tail: string };
+  tests: VerificationEvidence;
   diffStatText: string;
   workerReport: string | null;
   log: string;
+  requireVerification: boolean;
 }): string {
   const evidence = (verdict.evidence ?? []).map((e) => `- ${e}`).join("\n");
   const concerns = verdict.concerns?.length ? verdict.concerns.map((c) => `- ${c}`).join("\n") : "- none";
-  const counts = [tests.total !== undefined && `${tests.total} tests`, tests.pass !== undefined && `${tests.pass} passed`, tests.fail !== undefined && `${tests.fail} failed`]
-    .filter(Boolean).join(", ");
   return [
     `Fixes #${issueNumber}.`,
     "",
@@ -119,11 +90,8 @@ function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, worke
     "Reviewer concerns:",
     concerns,
     "",
-    "## Test suite (host-verified at PR creation)",
-    tests.passed ? `PASS${counts ? ` — ${counts}` : ""}` : "FAIL",
-    "```",
-    tests.tail,
-    "```",
+    "## Verification (host-run at PR creation, decision C1)",
+    formatVerificationEvidence(tests, { requireVerification }),
     "",
     "## Worker report (transcript excerpt)",
     "```",
@@ -162,6 +130,12 @@ export interface OpenDraftPrOptions {
   reviewerTaskDef: ToolTask;
   testCommand?: string;
   /**
+   * Registry policy (decision C1): must a passing verification run exist before this repo's branch
+   * may be pushed? Defaults to true. False is the documented escape hatch for repos with no test
+   * command; it does not suppress disclosure — the PR body then says nothing was verified.
+   */
+  requireVerification?: boolean;
+  /**
    * Which paths this repo's policy lets a run change (factory/path-scope.ts + the repo registry).
    * Defaults to unrestricted-except-protected, because `vendor/` is protected unconditionally — the
    * vendored kernel pin is a human decision and must not be changeable by omission.
@@ -169,11 +143,11 @@ export interface OpenDraftPrOptions {
   pathScope?: PathScope;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef, reviewerTaskDef, testCommand = "node --test", pathScope = UNRESTRICTED_SCOPE }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE }: OpenDraftPrOptions) {
   return defineTool({
     name: "open_draft_pr",
     description:
-      "Push the worker's branch agent/issue-<n> and open a DRAFT pull request for it (never merges). BEFORE pushing it runs an independent read-only review of the committed branch; if the review fails, no push or PR happens and the findings are returned. Idempotent: returns the existing draft PR if one is already open for the branch. Include the test result in the PR body.",
+      "Push the worker's branch agent/issue-<n> and open a DRAFT pull request for it (never merges). Two structural gates run before the push and neither can be skipped: (1) this repo's test command is executed and a non-zero exit refuses the push outright; (2) an independent read-only review of the committed branch, which also refuses the push on failure. Refusals return the findings and create nothing — re-delegate the worker with them and call again. Idempotent: returns the existing draft PR if one is already open for the branch.",
     parameters: Type.Object({
       issueNumber: Type.Integer(),
       title: Type.String(),
@@ -235,6 +209,27 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
         };
       }
 
+      // Verification gate (#61, decision C1): run the repo's test command and refuse to push on a
+      // non-zero exit. Ordered before the reviewer because it costs seconds while a review costs
+      // minutes of inference — but note this is NOT a substitute for the review: a green suite says
+      // the change did not break known behavior, which is exactly the thing a wrong-but-passing
+      // implementation survives. Both gates own their own evidence.
+      const tests = await verifyWorkspace({ cwd: ws, testCommand });
+      const gate = verificationGate(tests, { requireVerification });
+      if (gate.action === "refuse") {
+        return {
+          output: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              refused: true,
+              reason: gate.reason,
+              verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, timedOut: tests.timedOut, tail: tests.tail },
+              hint: "Re-delegate the worker with the failing output named, then call open_draft_pr again. Nothing was pushed and no PR exists.",
+            }),
+          }],
+        };
+      }
+
       // Structural gate (not prompt-dependent): run an independent read-only
       // review of the committed branch NOW; only push if it passes. The
       // orchestrator model cannot skip this — the gate owns its evidence.
@@ -253,10 +248,9 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
         };
       }
 
-      const tests = await runTestSuite(ws, testCommand);
       const diffStatText = await diffStat(ws, branch);
       const workerReport = await workerReportFromTranscript(api, ctx);
-      const body = buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log });
+      const body = buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification });
       await pushBranch(ws, branch, ghToken);
 
       // Idempotency: reuse an open PR for this head branch if one exists.
@@ -285,7 +279,12 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
       }
 
       return {
-        output: [{ type: "text" as const, text: JSON.stringify({ prUrl, isDraft: true, branch, head, testsPassed: tests.passed }) }],
+        output: [{
+          type: "text" as const,
+          // The sha here is what the orchestrator must pass to pr_status/merge_pr (#47): an approval
+          // is scoped to this commit, so a later push cannot reuse it.
+          text: JSON.stringify({ prUrl, isDraft: true, branch, head, verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, passed: tests.passed } }),
+        }],
       };
     },
   });
