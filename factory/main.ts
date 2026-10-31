@@ -22,6 +22,7 @@ import { loadFactoryConfig } from "./factory-config.ts";
 import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
+import { resolveCredentialSource, describeCredentialSource } from "./credential-source.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -139,6 +140,16 @@ async function main() {
 
   // Resolve the model ref here (not inline) so readiness can be gated on it below.
   const modelRef = await resolveModelRef(factoryCfg.models);
+
+  // Credential posture (#70, decision B2): name which credential path git operations will take,
+  // before announcing ready. Never fatal — a developer machine with a keychain entry is a legal
+  // configuration — but never silent: an account-wide fallback must be visible in the boot log.
+  const credentialSource = resolveCredentialSource(process.env, factoryCfg.gitToken);
+  if (credentialSource.kind === "host-helper" || credentialSource.kind === "none") {
+    console.warn(`[factory] ${repo}: WARNING — ${describeCredentialSource(credentialSource)}`);
+  } else {
+    console.log(`[factory] ${repo}: ${describeCredentialSource(credentialSource)}`);
+  }
 
   const pipelineOpts = {
     workDir: workRoot,

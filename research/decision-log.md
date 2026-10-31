@@ -34,9 +34,11 @@ Single-operator host; `fleet/fleet.local.json` and `.env` are gitignored. Revisi
 
 One secret, explicit repo list, no org-wide write. Scopes needed by the current flow: `contents:write`, `pull_requests:write`, `issues:read`. Supersedes "account-wide via gh keychain" (which is what actually runs today, per #70).
 
-### B2 — Missing factory token: start, but log the credential path loudly · **adopted**
+### B2 — Missing factory token: start, but log the credential path loudly · **adopted — implemented**
 
 Boot must state which credential path it resolved (`FACTORY_GITHUB_TOKEN` set vs host credential helper) and that an unset variable means account-wide. Never silent, never fatal — local work stays friction-free. Implements #70.
+
+Implemented: `factory/credential-source.ts` resolves the same order the pipeline uses (env → per-repo config → host helpers → none) and `main.ts` logs it at boot; the host-helper and none cases are `console.warn`. Live-verified on this machine's real configuration: boot now prints `WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig). On a developer machine that entry is typically ACCOUNT-WIDE; scope it (decision B1) or set FACTORY_GITHUB_TOKEN.`
 
 ### B3 — PRs should be authored by a GitHub App · **adopted (later in sequence)**
 
