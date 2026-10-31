@@ -56,3 +56,24 @@ test(".env (when present) carries a concrete OPENAI_BASE_URL", async (t) => {
     `.env OPENAI_BASE_URL should be a concrete URL, got ${real.OPENAI_BASE_URL}`,
   );
 });
+
+// B1-rev: the GitHub App is the factory credential and no PAT will be cut. The example file is the
+// only documentation an operator has, so the three keys must appear there — with a placeholder key
+// path, never a real one, and never key material.
+test(".env.example documents the GitHub App credential keys", async () => {
+  const env = parseEnv(await readFile(ENV_EXAMPLE, "utf8"));
+  for (const key of ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_APP_INSTALLATION_ID"]) {
+    assert.ok(key in env, `${key} missing from .env.example — operators have no way to learn it exists`);
+  }
+  // Placeholder (or empty), never a real absolute path to someone's keychain file.
+  assert.match(
+    String(env.GITHUB_APP_PRIVATE_KEY_PATH),
+    /^(<[^>]*>[\/\w.-]*|)$/,
+    `the key path must be a placeholder like <path-outside-repo>/app.pem, got ${env.GITHUB_APP_PRIVATE_KEY_PATH}`,
+  );
+});
+
+test("no private key material is committed anywhere in the example env", async () => {
+  const text = await readFile(ENV_EXAMPLE, "utf8");
+  assert.ok(!/BEGIN (RSA )?PRIVATE KEY/.test(text), ".env.example must never contain a key");
+});

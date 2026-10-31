@@ -13,6 +13,17 @@ Date: 2026-10-31. Everything below is the remaining deployment path; the code si
 | `build` label exists on the repo | done | created 2026-10-31 (GitHub does not auto-create labels; intake matches on name) |
 | Path scope excludes `gates/`; `gates/probes/` protected | done | registry + `test/path-scope.test.mjs` |
 | `/health` discloses nothing; bodies capped at 1 MiB | done | #59 — oracle `gates/self-intake-hardening.mjs` 6/6 on `main`, G0 20/20, `npm test` exit 0 |
+| Verification gate on push (C1) | done | #61 — `factory/verification.ts`; boot logs `verification required — open_draft_pr runs \`npm test\` …` |
+| Routes cannot go stale under a running adapter (C3) | done | #69 — supervisor writes before spawn, adapter re-hashes per request and exits on drift |
+| CI + required status check on `main` | done | PR #73; `unit-suite` made required 2026-10-31 (`required_status_checks: [unit-suite]`, strict, admins enforced) |
+| **Credential: GitHub App, not a PAT** (B1-rev) | **configured, not wired** | App `drydock-factory` installed with `contents:write`, `pull_requests:write`, `issues:write`, `metadata:read`; write proven by creating+deleting a ref. **No code reads `GITHUB_APP_*` yet**, so runs still use the host keychain — queue item 3b (R8). Installation narrowed to `selected` (6 repos, 2 private); 3 of them are unmanaged and should be dropped or, for `engram`, protected — queue item 3a-ii (R7) |
+
+Verify the credential situation before publishing, every time — it prints no secrets:
+
+```bash
+node gates/github-app-check.mjs                    # identity, grants, reach-vs-registry check, read probes
+node gates/github-app-check.mjs --probe-push <owner/repo>   # optional: create+delete a ref to prove contents:write
+```
 
 ## 1. Fleet file (deployment, not checked in)
 
@@ -39,6 +50,7 @@ Required environment (`.env` at repo root is read by `factory/main.ts`; export i
 
 Two more are **optional but should be set explicitly**, because their fallbacks are invisible rather than absent:
 
+- **Credential: GitHub App (B1-rev), no PAT.** `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY_PATH` / `GITHUB_APP_INSTALLATION_ID` in `.env` describe the installation the factory is meant to use. Until queue item 3b wires them up, nothing reads them — which is why the next bullet still fires on this machine.
 - `FACTORY_GITHUB_TOKEN` — when unset, clone and push do not fail; git uses the machine's credential helper. Verified on this host: with no token anywhere in the environment, a private repo still cloned, because `/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig` sets `credential.helper=osxkeychain` and that keychain entry is an **account-wide** token. Setting the variable makes the factory's actual credential explicit and lets it be scoped to one repo; leaving it unset means "which token pushed that?" has no answer in config. **Since #70:** boot no longer stays silent about this — `factory/main.ts` logs the resolved credential path, and the host-helper fallback is a `WARNING … ACCOUNT-WIDE` line you cannot miss in the startup log (e.g. `WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (…)`)
 - `FACTORY_SANDBOX_IMAGE` — defaults to `factory-sandbox:latest` (`factory/main.ts`). Fine on a machine where exactly that image is built; name it when the image lives under a registry prefix.
 
@@ -53,7 +65,7 @@ node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json
 Two posture lines are worth reading rather than skimming, both printed before `ready`:
 
 ```
-[factory] lalanikarim/drydock: WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (…). On a developer machine that entry is typically ACCOUNT-WIDE; scope it (decision B1) or set FACTORY_GITHUB_TOKEN.
+[factory] lalanikarim/drydock: WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (…). On a developer machine that entry is typically ACCOUNT-WIDE; use the App (B1-rev) or set FACTORY_GITHUB_TOKEN.
 [factory] lalanikarim/drydock: verification required — open_draft_pr runs `npm test` and refuses to push on a non-zero exit
 ```
 
