@@ -28,6 +28,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { loadRootEnv, resolveWebhookSecret, webhookSecretVar } from "../factory/env-file.ts";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,7 +102,9 @@ export function buildRoutes(
     if (!entry) throw new Error(`buildRoutes: ${f.repo} is not in the repo registry`);
     return {
       repo: f.repo,
-      secret: env[`GITHUB_WEBHOOK_SECRET_${f.repo.replace("/", "_")}`] ?? f.secret!,
+      // resolveWebhookSecret throws on an empty or placeholder value rather than handing the adapter
+      // a string that would fail every HMAC check with an external-looking cause.
+      secret: resolveWebhookSecret(f.repo, env, f.secret).secret,
       ...(bases.has(f.repo) ? { target: bases.get(f.repo)! } : {}),
       ...(f.token ? { token: f.token } : {}),
       ...(f.allowedSenders ? { allowedSenders: f.allowedSenders } : {}),
@@ -137,13 +140,10 @@ function loadFleet(path: string): Fleet {
     if (typeof f.repo !== "string" || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(f.repo)) {
       throw new Error(`factory entry has invalid repo: ${JSON.stringify(f)}`);
     }
-    // The webhook secret must be explicit in the fleet file (it has to match
-    // the secret configured on GitHub); env override is allowed but never
-    // silently defaulted — an empty secret would crash-loop the adapter.
-    const secret = process.env[`GITHUB_WEBHOOK_SECRET_${f.repo.replace("/", "_")}`] ?? f.secret;
-    if (typeof secret !== "string" || !secret) {
-      throw new Error(`factory ${f.repo} has no webhook secret (fleet entry .secret or GITHUB_WEBHOOK_SECRET_${f.repo.replace("/", "_")})`);
-    }
+    // Validate through the same helper buildRoutes uses, so "does this fleet boot?" and "what secret
+    // will it actually sign with?" can never diverge. Prints the source, never the value.
+    const { source } = resolveWebhookSecret(f.repo, process.env, f.secret);
+    console.log(`[supervisor] ${f.repo}: webhook secret from ${source === "env" ? webhookSecretVar(f.repo) : "fleet file .secret"} (value not logged)`);
   }
   checkRegistryPolicy(fleet.factories.map((f) => f.repo));
   return fleet;
@@ -310,6 +310,12 @@ async function statusFleet(fleetPath: string): Promise<void> {
 // call process.exit — which is what the previous unconditional block did to any importer.
 const isDirectRun = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) {
+  // Load the repo-root .env before anything reads configuration. Without this the adapter's HMAC
+  // secret silently came from the fleet file placeholder when started from a plain shell, and every
+  // GitHub delivery failed "invalid signature" with an external-looking cause. Non-overriding, so an
+  // explicitly exported value still wins; factory children load the same file themselves.
+  const applied = loadRootEnv();
+  if (applied.length) console.log(`[supervisor] loaded ${applied.length} variable(s) from .env (ambient values not overwritten)`);
   const [cmd, fleetPath] = process.argv.slice(2);
   if (cmd === "run" && fleetPath) {
     runFleet(fleetPath).catch((e) => {
