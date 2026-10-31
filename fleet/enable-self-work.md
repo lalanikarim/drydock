@@ -4,6 +4,31 @@ Date: 2026-10-31. Everything below is the remaining deployment path; the code si
 
 **Transport is deliberately not part of this design.** The factory listens on `127.0.0.1` and knows nothing about how a request reached it. Anything that gives GitHub an HTTPS URL whose requests arrive at that socket is acceptable — reverse proxy, hosted tunnel, cloud load balancer, tailnet funnel. Nothing here names or recommends one, because a runbook that hardcodes a transport quietly turns an operator choice into an architectural dependency, and the security properties below have to hold regardless of which one is picked.
 
+## Merge policy on `main` (what gates a merge, and who can step over it)
+
+Two mechanisms are in force at once — GitHub enforces both:
+
+| Gate | Requirement | Applies to admins? | Set by |
+|---|---|---|---|
+| CI | `unit-suite` must pass, **strict** (branch up to date first) | **Yes** | classic branch protection, `enforce_admins: true` |
+| Review | 1 approving review | **No — repo admin may bypass** | ruleset `main-review-gate-admin-bypass` (`pull_request` rule, `bypass_actors: [RepositoryRole/5 = Admin, always]`) |
+| Force push / branch deletion | refused | Yes | classic branch protection |
+
+The asymmetry is deliberate. A green suite is the one claim this repo treats as non-negotiable — it is cheap, deterministic, and the only gate that says nothing about correctness *or* anything else if it is missing. Review carries judgment, and on a single-maintainer repository "waiting for a second opinion that cannot arrive" turns a review gate into an outage; so review is required by default (it disciplines the author, and makes factory PRs genuinely reviewed) while an admin can step over it when the human is also the only reviewer.
+
+Two consequences worth knowing before they surprise you:
+
+- **Your own PRs cannot be approved by you.** GitHub refuses self-approval, so a `lalanikarim`-authored branch reaches merge through the admin bypass, not through an approval. That is expected, not a malfunction.
+- **Factory PRs (`app/drydock-factory`) can be approved normally**, because the author differs — which is the pairing decision E3 anticipated: bot authorship plus one human approval is a real control; "approve your own work as a second human" mostly adds latency.
+
+To inspect or undo (rulesets and classic protection coexist; both are enforced, so remove the ruleset to drop the review gate without touching CI):
+
+```bash
+gh api repos/lalanikarim/drydock/rulesets --jq '.[] | "\(.id) \(.name) \(.enforcement)"'
+gh api repos/lalanikarim/drydock/branches/main/protection --jq '"CI strict=\(.required_status_checks.strict) enforce_admins=\(.enforce_admins.enabled)"'
+gh api -X DELETE repos/lalanikarim/drydock/rulesets/<id>     # drop the review gate only
+```
+
 ## Prerequisites
 
 | Item | Status | Evidence |
