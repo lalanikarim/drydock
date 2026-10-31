@@ -51,14 +51,20 @@ test("no token and no host helper is reported as a hard failure to come, not a s
   assert.match(describeCredentialSource(source), /private repos will fail to clone/);
 });
 
-test("live detection on this machine is consistent with its description", () => {
-  // Environment-dependent by design: whatever the host actually has, the description must name it.
+test("live detection is consistent with its description on whatever host this is", () => {
+  // Environment-dependent by design: a developer laptop has a helper, a CI runner typically does
+  // not. Both branches must produce a description that matches the resolved kind — and both must
+  // actually execute, since asserting only one branch hides failures from whichever machine you
+  // happen to run on (this test's first version did exactly that).
   const source = resolveCredentialSource({});
   const text = describeCredentialSource(source);
   if (source.kind === "host-helper") {
-    for (const h of source.helpers) assert.match(text, new RegExp(h.helper));
+    assert.ok(source.helpers.length > 0, "host-helper kind must name at least one helper");
+    for (const h of source.helpers) assert.match(text, new RegExp(h.helper.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   } else {
-    assert.notMatch(text, /NO factory token configured — clone\/push will fall back/);
+    assert.equal(source.kind, "none", `expected none on a helper-less host, got ${JSON.stringify(source)}`);
+    assert.doesNotMatch(text, /fall back to the host credential helper/);
+    assert.match(text, /no factory token and no host helper configured/);
   }
 });
 
