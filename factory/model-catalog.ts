@@ -64,6 +64,16 @@ export function unavailableModelError(ref: ModelRefLike, payload: unknown): stri
 }
 
 /**
+ * Model identity for comparison, independent of separator formatting: the instance reports its
+ * default as `provider:modelId`, while refs are formatted here as `provider/modelId` — both name
+ * the same model. Split at the first separator so a colon inside the model id itself still survives.
+ */
+function modelIdentity(s: string): string {
+  const sep = s.search(/[/:]/);
+  return (sep === -1 ? s : `${s.slice(0, sep)}/${s.slice(sep + 1)}`).toLowerCase();
+}
+
+/**
  * Warn (do not fail) when the instance's default model differs from the pinned one. The root agent
  * and every task get the pinned ref explicitly, so a differing default is usually harmless — but it
  * has already been the cause of one silent outage, so say it out loud rather than let the next reader
@@ -72,7 +82,9 @@ export function unavailableModelError(ref: ModelRefLike, payload: unknown): stri
 export function defaultMismatchWarning(ref: ModelRefLike, payload: unknown): string | null {
   const def = (payload as { default?: unknown })?.default;
   if (typeof def !== "string" || !def) return null;
-  return def.toLowerCase() === `${ref.provider}/${ref.modelId}`.toLowerCase()
+  // Compare identity, not formatting (`provider:model` vs `provider/model` name the same model);
+  // keep each side's raw form in the message — "what did each side say" is the diagnostic.
+  return modelIdentity(def) === modelIdentity(`${ref.provider}/${ref.modelId}`)
     ? null
     : `instance default model is ${def} but this repo pins ${ref.provider}/${ref.modelId} — the factory runs the pinned ref; anything inheriting the default (a new role, a manual /tasks call) will not`;
 }
