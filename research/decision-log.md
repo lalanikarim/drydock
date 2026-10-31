@@ -169,9 +169,13 @@ The safety argument, stated as mechanism rather than optimism: `AGENTS.md` is ad
 
 Human merges, always. Consistent with capability removal being the enforcement mechanism: there is no repo config in which a destructive tool should appear in the worker's tool list.
 
-### E3 — Keep 0 required approving reviews on `main`, revisit after the App lands · **adopted-with-risk**
+### E3 — Review gate ON (1 approval), admin may bypass; CI stays required for everyone · **superseded 2026-10-31 by the operator's ruling**
 
-Recorded verbatim: *"This can be revisited once Github App integration is completed."* Coherent pairing — bot-authored PRs plus one human approval is a meaningful control; "approve your own PR as a second human" mostly adds latency. Until then see R1.
+Recorded verbatim at the time: *"This can be revisited once Github App integration is completed."* The App landed and authored its first merged PR (#83), so the precondition was met and the question came back. The operator's answer: **"CI gate is required — review gate should be optional for admin."**
+
+Implemented as ruleset `main-review-gate-admin-bypass` (`pull_request`, 1 approving review, stale reviews dismissed on push) with `bypass_actors: [RepositoryRole/5 = Admin → always]`, layered on the existing classic protection (`unit-suite` strict, `enforce_admins: true`). The asymmetry is the point: a green suite is treated as non-negotiable and review as judgment that a solo maintainer may step over — with the caveat, recorded in the runbook, that GitHub refuses self-approval, so your own branches merge by bypass while factory-authored branches can be approved normally.
+
+Implementation note worth keeping: classic branch protection has no per-rule admin bypass — `enforce_admins` is all-or-nothing for the branch — so expressing "CI for everyone, review optional for admin" required a ruleset. Rulesets and classic protection coexist and both are enforced, which is why CI did not need moving. Two API traps hit on the way: the review rule type is `pull_request` (not `required_reviews` or `pull_request_rule`), and the bypass actor type is `RepositoryRole` with `actor_id: 5` for admin — `RepositoryAdmin` is rejected as invalid.
 
 ### E4 — Token budgets: warn and annotate, never abort · **adopted**
 
