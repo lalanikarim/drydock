@@ -29,6 +29,33 @@ test("env token wins over everything", () => {
   assert.deepEqual(source, { kind: "env", variable: "FACTORY_GITHUB_TOKEN" });
 });
 
+// A stand-in helper list so these tests assert resolution logic, not this machine's keychain.
+const SOME_HOST_HELPER = [{ origin: "file:/etc/gitconfig", helper: "store" }];
+
+test("GitHub App is chosen when configured, and named in the log line", () => {
+  const appEnv = { GITHUB_APP_ID: "5557270", GITHUB_APP_PRIVATE_KEY_PATH: "/k.pem", GITHUB_APP_INSTALLATION_ID: "177271737" };
+  const source = resolveCredentialSource(appEnv, "ghp_config_ignored", SOME_HOST_HELPER);
+  assert.deepEqual(source, { kind: "app", appId: "5557270", installationId: "177271737" });
+  const line = describeCredentialSource(source);
+  assert.match(line, /GitHub App 5557270/);
+  assert.match(line, /installation 177271737/);
+  assert.doesNotMatch(line, /ghp_|BEGIN/, "the log line never carries secret material");
+});
+
+test("an env token still beats the App — and says that it does", () => {
+  const appEnv = { FACTORY_GITHUB_TOKEN: "explicit", GITHUB_APP_ID: "1", GITHUB_APP_PRIVATE_KEY_PATH: "/k.pem", GITHUB_APP_INSTALLATION_ID: "2" };
+  const source = resolveCredentialSource(appEnv, undefined, SOME_HOST_HELPER);
+  assert.equal(source.kind, "env");
+  // Without this note, "the factory uses the App" becomes quietly untrue the moment a stray export
+  // lands in the shell — the exact class of drift #70 was filed about.
+  assert.match(describeCredentialSource(source), /GitHub App is configured but this takes precedence/);
+});
+
+test("a half-configured App is an error, not a silent downgrade to the keychain", () => {
+  assert.throws(() => resolveCredentialSource({ GITHUB_APP_ID: "1" }, undefined, SOME_HOST_HELPER), /incomplete/i);
+  assert.throws(() => resolveCredentialSource({ GITHUB_APP_INSTALLATION_ID: "2" }, undefined, SOME_HOST_HELPER), /GITHUB_APP_ID/);
+});
+
 test("config token is used when the env var is absent", () => {
   const source = resolveCredentialSource({}, "config-token");
   assert.deepEqual(source, { kind: "config", field: "gitToken" });

@@ -31,6 +31,7 @@ import { configure, defineTask, defineTool, type Context, type ToolExecutionApi 
 import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
 import { runSetupInContainer } from "./setup-sandbox.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
+import { cloneUrlWithAuth, createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 
 const pExecFile = promisify(execFile);
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -60,13 +61,11 @@ export function reviewCwd(branch: string): string {
   return `review-${branch.replace(/[^a-zA-Z0-9]+/g, "-")}`;
 }
 
-async function fetchIssue(fixturesRepo: string, issueNumber: number): Promise<string> {
-  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], {
-    env: { ...process.env, GH_TOKEN: process.env.FACTORY_GITHUB_TOKEN ?? "" },
-  });
+async function fetchIssue(fixturesRepo: string, issueNumber: number, env: NodeJS.ProcessEnv): Promise<string> {
+  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], { env });
 }
 
-async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber }: { workDir: string; fixturesRepo: string; branch: string; issueNumber: number }): Promise<string> {
+async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber, auth }: { workDir: string; fixturesRepo: string; branch: string; issueNumber: number; auth: GitAuth }): Promise<string> {
   const ws = reviewWorkspace(workDir, branch);
   rmSync(ws, { recursive: true, force: true });
   // Prefer the worker's local checkout: in the closed loop review runs BEFORE
@@ -78,9 +77,7 @@ async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumb
     // --recurse-submodules: managed repos may pin shared libs as submodules.
     await sh("git", ["clone", "--quiet", "--recurse-submodules", "--branch", branch, local, ws]);
   } catch {
-    const authUrl = process.env.FACTORY_GITHUB_TOKEN
-      ? `https://x-access-token:${process.env.FACTORY_GITHUB_TOKEN}@github.com/${fixturesRepo}.git`
-      : `https://github.com/${fixturesRepo}.git`;
+    const authUrl = await cloneUrlWithAuth(auth, fixturesRepo);
     await sh("git", ["clone", "--quiet", "--recurse-submodules", "--branch", branch, authUrl, ws]);
   }
   return ws;
@@ -179,9 +176,12 @@ export interface ReviewerTaskOptions {
   setupCommand?: string | null;
   wallSecsPerIssue?: number;
   sandboxPolicy?: { allowImages: string[]; mountRoot: string } | null;
+  /** Credential for issue fetch + fallback clone (B1-rev). Defaults to the environment's resolution. */
+  gitAuth?: GitAuth;
 }
 
-export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null }: ReviewerTaskOptions) {
+export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null, gitAuth }: ReviewerTaskOptions) {
+  const auth: GitAuth = gitAuth ?? createGitAuth();
   const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
     try {
       return await fn(task, runtime, ctx);
@@ -200,8 +200,8 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
         const { branch, issueNumber, provider, modelId } = task.input;
 
         // Host-side prep (deterministic).
-        const issueText = await fetchIssue(fixturesRepo, issueNumber);
-        const ws = await prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber });
+        const issueText = await fetchIssue(fixturesRepo, issueNumber, await gitAuthEnv(auth));
+        const ws = await prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber, auth });
 
         // Setup phase (§3.6): the reviewer's sealed sandbox needs the same
         // dependency install before it can run tests (one-shot networked

@@ -15,6 +15,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
 import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
+import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -107,8 +108,7 @@ function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, worke
  *  branch is ever forced, and the lease refuses to clobber anything we have not
  *  fetched). Deleting the branch first would auto-close the open PR tracking it,
  *  so in-place replacement preserves PR continuity. */
-async function pushBranch(ws: string, branch: string, ghToken: string): Promise<void> {
-  const env = { ...process.env, GH_TOKEN: ghToken ?? "" };
+async function pushBranch(ws: string, branch: string, env: NodeJS.ProcessEnv): Promise<void> {
   try {
     await sh("git", ["-C", ws, "push", "-u", "origin", branch], { env });
   } catch (e) {
@@ -125,7 +125,13 @@ async function pushBranch(ws: string, branch: string, ghToken: string): Promise<
 export interface OpenDraftPrOptions {
   workDir: string;
   fixturesRepo: string;
+  /** @deprecated Prefer gitAuth (B1-rev). Kept so existing callers/tests still compose. */
   ghToken?: string;
+  /**
+   * Credential for push + PR calls, resolved per use so a GitHub App installation token is always
+   * current (they expire ~hourly; a boot-time snapshot would fail mid-run).
+   */
+  gitAuth?: GitAuth;
   modelRef: { provider: string; modelId: string };
   reviewerTaskDef: ToolTask;
   testCommand?: string;
@@ -143,7 +149,8 @@ export interface OpenDraftPrOptions {
   pathScope?: PathScope;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE }: OpenDraftPrOptions) {
+  const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
   return defineTool({
     name: "open_draft_pr",
     description:
@@ -157,7 +164,9 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
     execute: async ({ issueNumber, title, summary }, api, ctx) => {
       const ws = join(workDir, `issue-${issueNumber}`);
       const branch = `agent/issue-${issueNumber}`;
-      const env = { ...process.env, GH_TOKEN: ghToken };
+      // Resolved here (once per tool call) and reused for the PR calls below; an App token minted
+      // for this run cannot expire inside it.
+      const env = await gitAuthEnv(auth);
 
       // Verify the worker actually committed on the branch (cheap; before
       // spending minutes on a review of nothing).
@@ -168,9 +177,7 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
         // No local workspace (e.g. after a machine reset): recover from the remote
         // branch if it was pushed by an earlier run of this issue.
         try {
-          const authUrl = ghToken
-            ? `https://x-access-token:${ghToken}@github.com/${fixturesRepo}.git`
-            : `https://github.com/${fixturesRepo}.git`;
+          const authUrl = await cloneUrlWithAuth(auth, fixturesRepo);
           await sh("git", ["clone", "--quiet", "--branch", branch, authUrl, ws]);
           head = await sh("git", ["-C", ws, "rev-parse", "--verify", `refs/heads/${branch}`]);
         } catch {
@@ -251,7 +258,7 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", modelRef,
       const diffStatText = await diffStat(ws, branch);
       const workerReport = await workerReportFromTranscript(api, ctx);
       const body = buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification });
-      await pushBranch(ws, branch, ghToken);
+      await pushBranch(ws, branch, env);
 
       // Idempotency: reuse an open PR for this head branch if one exists.
       let prJson: { number: number; url: string } | null = null;

@@ -40,6 +40,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-durable";
+import { gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -104,7 +105,8 @@ async function commitParents(fixturesRepo: string, sha: string, ghToken: string)
  * triggering a destructive approval, otherwise every merge would burn an approval on a discovery
  * call. It is also the honest way to check "did that merge land?" after a restart.
  */
-export function prStatusTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: string; ghToken?: string }) {
+export function prStatusTool({ fixturesRepo, ghToken = "", gitAuth }: { fixturesRepo: string; ghToken?: string; gitAuth?: GitAuth }) {
+  const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
   return defineTool({
     name: PR_STATUS_TOOL,
     description:
@@ -112,7 +114,8 @@ export function prStatusTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: str
     parameters: Type.Object({ issueNumber: Type.Integer() }),
     replay: "safe",
     execute: async ({ issueNumber }) => {
-      const env = { ...process.env, GH_TOKEN: ghToken };
+      const gh = await auth.token();
+      const env = { ...process.env, GH_TOKEN: gh };
       const branch = `agent/issue-${issueNumber}`;
       try {
         const out = await sh(
@@ -123,7 +126,7 @@ export function prStatusTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: str
         const list = JSON.parse(out || "[]") as Array<{ number: number; state: string }>;
         if (!list.length) return ok({ prNumber: null, state: "NONE", branch });
         const preferred = list.find((p) => p.state === "OPEN") ?? list.find((p) => p.state === "MERGED") ?? list[0];
-        const pr = await readPr(fixturesRepo, preferred.number, ghToken);
+        const pr = await readPr(fixturesRepo, preferred.number, gh);
         return ok({
           prNumber: pr.number,
           state: pr.state,
@@ -139,7 +142,8 @@ export function prStatusTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: str
   });
 }
 
-export function mergePrTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: string; ghToken?: string }) {
+export function mergePrTool({ fixturesRepo, ghToken = "", gitAuth }: { fixturesRepo: string; ghToken?: string; gitAuth?: GitAuth }) {
+  const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
   return defineTool({
     name: MERGE_TOOL,
     description:
@@ -150,7 +154,8 @@ export function mergePrTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: stri
     }),
     replay: "unsafe", // real git side effect; idempotent via the verified PR-state check
     execute: async ({ issueNumber, headSha }) => {
-      const env = { ...process.env, GH_TOKEN: ghToken };
+      const gh = await auth.token();
+      const env = { ...process.env, GH_TOKEN: gh };
       const branch = `agent/issue-${issueNumber}`;
 
       // Locate the PR for this head branch (open preferred, else merged).
@@ -173,7 +178,7 @@ export function mergePrTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: stri
 
       let pr: Awaited<ReturnType<typeof readPr>>;
       try {
-        pr = await readPr(fixturesRepo, preferred.number, ghToken);
+        pr = await readPr(fixturesRepo, preferred.number, gh);
       } catch (e) {
         return err(`gh pr view failed: ${String((e as Error).message).slice(0, 300)}`);
       }
@@ -226,7 +231,7 @@ export function mergePrTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: stri
       // Verify the terminal state rather than trusting the CLI exit code.
       let after: Awaited<ReturnType<typeof readPr>>;
       try {
-        after = await readPr(fixturesRepo, pr.number, ghToken);
+        after = await readPr(fixturesRepo, pr.number, gh);
       } catch (e) {
         return err(`post-merge verification failed: ${(e as Error).message}`);
       }
@@ -238,7 +243,7 @@ export function mergePrTool({ fixturesRepo, ghToken = "" }: { fixturesRepo: stri
       const mergeOid = after.mergeCommit?.oid ?? null;
       let landedVerified: boolean | "unknown" = "unknown";
       try {
-        landedVerified = mergeOid ? (await commitParents(fixturesRepo, mergeOid, ghToken)).includes(headSha.toLowerCase()) : false;
+        landedVerified = mergeOid ? (await commitParents(fixturesRepo, mergeOid, gh)).includes(headSha.toLowerCase()) : false;
       } catch {
         landedVerified = "unknown"; // API hiccup: report unknown, never a false true.
       }
