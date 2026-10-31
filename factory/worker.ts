@@ -30,6 +30,7 @@ import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
 import { runSetupInContainer, type SetupPolicy } from "./setup-sandbox.ts";
 import { readLessons } from "./lessons.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
+import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -38,11 +39,9 @@ async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJ
   return stdout.trim();
 }
 
-/** Fetch one issue as plain text via gh (host-side; token from env or stored auth). */
-async function fetchIssue(fixturesRepo: string, issueNumber: number): Promise<string> {
-  const out = await sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], {
-    env: { ...process.env, GH_TOKEN: process.env.FACTORY_GITHUB_TOKEN ?? "" },
-  });
+/** Fetch one issue as plain text via gh (host-side; credential resolved by the caller). */
+async function fetchIssue(fixturesRepo: string, issueNumber: number, env: NodeJS.ProcessEnv): Promise<string> {
+  const out = await sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], { env });
   return out;
 }
 
@@ -103,12 +102,15 @@ export interface WorkerTaskOptions {
   image?: string;
   testCommand?: string;
   setupCommand?: string | null;
+  /** Credential for issue fetch + clone (B1-rev). Defaults to the environment's resolution. */
+  gitAuth?: GitAuth;
   wallSecsPerIssue?: number;
   lessonsFile?: string; // standing lessons fed to every worker prompt
   sandboxPolicy?: SetupPolicy | null;
 }
 
-export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null }: WorkerTaskOptions) {
+export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth }: WorkerTaskOptions) {
+  const auth: GitAuth = gitAuth ?? createGitAuth();
   const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
     try {
       return await fn(task, runtime, ctx);
@@ -125,10 +127,12 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
     phases: {
       spawn: guarded("SPAWN", async (task, runtime, ctx) => {
         const { issueNumber, provider, modelId } = task.input;
-        const token = process.env.FACTORY_GITHUB_TOKEN ?? "";
+        // Resolved per spawn: an installation token minted at boot would expire mid-day.
+        const authEnv = await gitAuthEnv(auth);
+        const token = authEnv.GH_TOKEN ?? "";
 
         // Host-side prep (deterministic; re-runs idempotently on resume).
-        const issueText = await fetchIssue(fixturesRepo, issueNumber);
+        const issueText = await fetchIssue(fixturesRepo, issueNumber, authEnv);
         // Phase 5 feedback loop: standing lessons from prior review findings
         // (written by the orchestrator via note_lesson) reach every new worker.
         const lessons = readLessons(lessonsFile);

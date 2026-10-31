@@ -22,7 +22,7 @@ import { loadFactoryConfig } from "./factory-config.ts";
 import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
-import { resolveCredentialSource, describeCredentialSource } from "./credential-source.ts";
+import { createGitAuth } from "./github-auth.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -141,14 +141,26 @@ async function main() {
   // Resolve the model ref here (not inline) so readiness can be gated on it below.
   const modelRef = await resolveModelRef(factoryCfg.models);
 
-  // Credential posture (#70, decision B2): name which credential path git operations will take,
-  // before announcing ready. Never fatal — a developer machine with a keychain entry is a legal
-  // configuration — but never silent: an account-wide fallback must be visible in the boot log.
-  const credentialSource = resolveCredentialSource(process.env, factoryCfg.gitToken);
-  if (credentialSource.kind === "host-helper" || credentialSource.kind === "none") {
-    console.warn(`[factory] ${repo}: WARNING — ${describeCredentialSource(credentialSource)}`);
+  // Credential posture (#70 / B2) and the App credential itself (B1-rev, queue 3b). One resolver
+  // decides, so this line cannot drift from what the tools actually use.
+  const gitAuth = createGitAuth(process.env, factoryCfg.gitToken);
+  if (gitAuth.kind === "none") {
+    console.warn(`[factory] ${repo}: WARNING — ${gitAuth.describe()}`);
   } else {
-    console.log(`[factory] ${repo}: ${describeCredentialSource(credentialSource)}`);
+    console.log(`[factory] ${repo}: ${gitAuth.describe()}`);
+  }
+  // Prove the App credential before claiming ready (same reasoning as the model-catalog check): a
+  // wrong installation id or unreadable key should fail at boot, not 40 minutes into a run. The
+  // token itself is discarded — this only demonstrates that an exchange succeeds.
+  if (gitAuth.kind === "app") {
+    try {
+      await gitAuth.token();
+      console.log(`[factory] ${repo}: installation token exchange verified`);
+    } catch (e) {
+      console.error(`[factory] ${repo}: ${gitAuth.describe()} — but the token exchange failed: ${(e as Error).message}`);
+      console.error(`[factory] refusing to announce ready on a credential that does not work`);
+      process.exit(1);
+    }
   }
 
   const pipelineOpts = {
@@ -157,7 +169,7 @@ async function main() {
     autoMerge: policy.autoMerge,
     requireVerification: policy.requireVerification,
     pathScope: scopeOf(policy),
-    ghToken: process.env.FACTORY_GITHUB_TOKEN ?? factoryCfg.gitToken,
+    gitAuth,
     modelRef,
     image,
     testCommand: factoryCfg.testCommand,

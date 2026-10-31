@@ -20,6 +20,7 @@ import { openDraftPrTool } from "./open-draft-pr.ts";
 import { mergePrTool, prStatusTool } from "./merge-gate.ts";
 import { noteLessonTool } from "./lessons.ts";
 import type { PathScope } from "./path-scope.ts";
+import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
 /**
  * The orchestrator prompt.
@@ -65,6 +66,12 @@ export interface PipelineOptions {
   /** Which paths open_draft_pr may push (from the repo registry; see factory/path-scope.ts). */
   pathScope?: PathScope;
   /**
+   * Credential for every host-side GitHub call (issue fetch, clone, push, PR, merge). Built once by
+   * factory/main.ts via createGitAuth so boot can log which credential is in force; each use site
+   * resolves a token from it, which is what keeps a ~hourly GitHub App installation token fresh.
+   */
+  gitAuth?: GitAuth;
+  /**
    * Registry policy (factory/repo-registry.json `autoMerge`). When false, merge_pr is not registered
    * at all and the orchestrator prompt stops at the draft PR — capability removal rather than a
    * runtime refusal, so there is no approval to grant and nothing to forget to check.
@@ -81,6 +88,11 @@ export interface PipelineOptions {
 
 export function factoryPipeline(opts: PipelineOptions) {
   const lessonsFile = opts.lessonsFile ?? join(opts.workDir, "..", "lessons.md");
+  // One auth for the whole extension; a bare ghToken still works for callers that have no opinion
+  // (tests, fixtures) by wrapping it as a static credential.
+  // No token at all → fall back to environment resolution (the pre-B1-rev behavior); an explicit
+  // empty string is not the same as "unset" here.
+  const auth: GitAuth = opts.gitAuth ?? (opts.ghToken ? gitAuthFromToken(opts.ghToken) : createGitAuth());
   const image = opts.image ?? process.env.FACTORY_SANDBOX_IMAGE ?? "factory-sandbox:latest";
   const workerTaskDef = factoryWorkerTask({
     workDir: opts.workDir,
@@ -91,6 +103,7 @@ export function factoryPipeline(opts: PipelineOptions) {
     wallSecsPerIssue: opts.wallSecsPerIssue,
     lessonsFile,
     sandboxPolicy: opts.sandboxPolicy,
+    gitAuth: auth,
   });
   const reviewerTaskDef = factoryReviewerTask({
     workDir: opts.workDir,
@@ -99,6 +112,7 @@ export function factoryPipeline(opts: PipelineOptions) {
     setupCommand: opts.setupCommand,
     wallSecsPerIssue: opts.wallSecsPerIssue,
     sandboxPolicy: opts.sandboxPolicy,
+    gitAuth: auth,
   });
 
   return defineExtension({
@@ -108,7 +122,7 @@ export function factoryPipeline(opts: PipelineOptions) {
       openDraftPrTool({
         workDir: opts.workDir,
         fixturesRepo: opts.fixturesRepo,
-        ghToken: opts.ghToken ?? "",
+        gitAuth: auth,
         modelRef: opts.modelRef,
         reviewerTaskDef,
         testCommand: opts.testCommand,
@@ -118,12 +132,12 @@ export function factoryPipeline(opts: PipelineOptions) {
       // Read-only PR state, registered for every repo including autoMerge=false ones: merge_pr needs
       // the current head sha (#47 byte-scoped approval) and the orchestrator must be able to read it
       // without burning a destructive approval on a discovery call.
-      prStatusTool({ fixturesRepo: opts.fixturesRepo, ghToken: opts.ghToken ?? "" }),
+      prStatusTool({ fixturesRepo: opts.fixturesRepo, gitAuth: auth }),
       // Capability removal, not a runtime check: with autoMerge=false the orchestrator never sees a
       // merge tool, so a policy violation would require inventing one rather than misclicking.
       ...(opts.autoMerge === false
         ? []
-        : [mergePrTool({ fixturesRepo: opts.fixturesRepo, ghToken: opts.ghToken ?? "" })]),
+        : [mergePrTool({ fixturesRepo: opts.fixturesRepo, gitAuth: auth })]),
       noteLessonTool(lessonsFile),
       ...makeReviewerRoleTools({ workDir: opts.workDir, testCommand: opts.testCommand }),
     ],
