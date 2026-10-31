@@ -31,6 +31,7 @@ import { runSetupInContainer, type SetupPolicy } from "./setup-sandbox.ts";
 import { readLessons } from "./lessons.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
+import { resolveGitIdentity } from "./git-identity.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -57,8 +58,14 @@ async function prepareWorkspace({ workDir, fixturesRepo, issueNumber, token }: {
   await sh("git", ["clone", "--quiet", "--recurse-submodules", authUrl, ws]);
   // Scrub the credential from the stored remote URL; the worker never pushes.
   await sh("git", ["-C", ws, "remote", "set-url", "origin", `https://github.com/${fixturesRepo}.git`]);
-  await sh("git", ["-C", ws, "config", "user.name", process.env.FACTORY_GIT_NAME ?? "factory-worker"]);
-  await sh("git", ["-C", ws, "config", "user.email", process.env.FACTORY_GIT_EMAIL ?? "factory-worker@localhost"]);
+  // Commit identity (#87): derived from the credential in use, so the commits name the same
+  // principal that authors the pull request. Logged because "which identity wrote this" should be
+  // answerable from the run rather than reconstructed afterwards. Fails the run if it cannot be
+  // resolved — inventing an author is what made every factory commit unattributed.
+  const identity = await resolveGitIdentity({ token });
+  console.error(`[factory.worker] git identity: ${identity.name} <${identity.email}>`);
+  await sh("git", ["-C", ws, "config", "user.name", identity.name]);
+  await sh("git", ["-C", ws, "config", "user.email", identity.email]);
   await sh("git", ["-C", ws, "checkout", "-b", `agent/issue-${issueNumber}`]);
   return ws;
 }
