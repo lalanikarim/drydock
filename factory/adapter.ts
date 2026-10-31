@@ -27,21 +27,76 @@ export function routesFileHash(path: string): string {
 }
 
 /**
- * Per-request drift check for a routes file (decision C3, #69): the adapter validates signatures and
- * routes against the snapshot it loaded at start; if the file on disk no longer hashes to that
- * snapshot, serving on old authority is wrong — refuse the request (the caller gets 503) and stop,
- * so the supervisor can restart us against the new policy. No silent reload: a policy change taking
- * effect without an explicit process boundary would break "policy reviews like code".
+ * The policy-relevant projection of a routes list: every field except `target`, serialized
+ * deterministically. This exists because the routes file mixes two kinds of state — policy (which
+ * repos are served, which secret signs for each, which label makes work eligible, who may send) and
+ * runtime state (the ephemeral port a factory child learned after it became ready). Only the first
+ * deserves a process boundary; treating the second as drift made every cold start cost an adapter
+ * restart (#81), because "a factory finished booting" rewrites the file by design.
+ *
+ * Array order inside a route (e.g. `allowedSenders`) is significant here: a reordered allowlist is
+ * treated as a change and forces the conservative path. Being occasionally over-strict about drift is
+ * safe; being clever about it is how a policy reload gets missed.
+ */
+export function policyFingerprint(routes: unknown): string {
+  const project = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(project);
+    if (value && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(value).sort()) {
+        if (key === "target") continue; // runtime state, not authority
+        out[key] = project((value as Record<string, unknown>)[key]);
+      }
+      return out;
+    }
+    return value;
+  };
+  const list = Array.isArray(routes) ? routes : [];
+  // Sort route entries by repo so the fingerprint does not depend on serialization order across
+  // writers; a repo appearing or disappearing still changes the set, and therefore the fingerprint.
+  const projected = list.map(project).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  return createHash("sha256").update(JSON.stringify(projected)).digest("hex");
+}
+
+/**
+ * Per-request drift check for a routes file (decision C3, #69), refined by #81.
+ *
+ * The adapter validates signatures and routes against the snapshot it loaded at start. If the file on
+ * disk no longer hashes to that snapshot, the change is classified rather than assumed fatal:
+ *
+ *  - **policy unchanged** (only `target` values moved): adopt the new targets in place and keep
+ *    serving. This is a factory becoming ready, not an authority change, and both hashes are logged so
+ *    the reload is visible in exactly the same way a refusal is.
+ *  - **anything else** — secret, token, eligibility label, sender allowlist, repo set, an unparsable or
+ *    unreadable file: refuse the request (503) and stop, so the supervisor restarts against current
+ *    policy. No silent reload of authority; "policy reviews like code" survives intact.
+ *
+ * `liveRoutes` is the array this process is actually routing with; it is mutated in place on a benign
+ * reload so dispatch follows the new port instead of a dead one. Without it, a target-only change still
+ * cannot be applied safely, so the check reports drift — conservative by construction.
  *
  * `terminate` is injectable so tests can observe the exit instead of dying; the default exits after a
  * short delay so the 503 response has a chance to flush first.
  */
-export function makeRoutesDriftCheck({ routesFile, startupHash, terminate }: {
+export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveRoutes, onReload }: {
   routesFile: string;
   startupHash: string;
   terminate?: () => void;
+  liveRoutes?: Route[];
+  onReload?: (routes: Route[]) => void;
 }): () => void {
   const die = terminate ?? (() => setTimeout(() => process.exit(1), 250).unref());
+
+  // Baseline authority: prefer the snapshot in memory (that is what we are routing with), else the
+  // bytes at construction time. A baseline we cannot compute means every later change is drift.
+  let knownPolicy: string | null;
+  try {
+    knownPolicy = policyFingerprint(liveRoutes ?? JSON.parse(readFileSync(routesFile, "utf8")));
+  } catch {
+    knownPolicy = null;
+  }
+  let knownHash = startupHash;
+
   return () => {
     let current: string;
     try {
@@ -49,11 +104,37 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate }: {
     } catch {
       current = "<unreadable>"; // a missing file is drift too: the policy behind us is gone
     }
-    if (current !== startupHash) {
-      console.error(`[adapter] routes drift: ${routesFile} changed since start (startup ${startupHash.slice(0, 16)}, now ${String(current).slice(0, 16)}) — exiting for supervisor restart`);
-      die();
-      throw new RoutesDriftedError(`routes file changed since adapter start (startup hash ${startupHash.slice(0, 16)}, current ${String(current).slice(0, 16)})`);
+    if (current === knownHash) return;
+
+    // Something changed. Before refusing, ask whether it touched authority at all.
+    if (liveRoutes && knownPolicy !== null) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(readFileSync(routesFile, "utf8"));
+      } catch {
+        parsed = undefined; // unparsable is never benign
+      }
+      if (parsed !== undefined && policyFingerprint(parsed) === knownPolicy) {
+        const before = liveRoutes.map((r) => `${r.repo}:${r.target ?? "-"}`).join(", ");
+        const next = parsed as Route[];
+        for (const route of liveRoutes) {
+          const fresh = next.find((r) => r?.repo === route.repo);
+          if (fresh && typeof fresh.target === "string") route.target = fresh.target;
+          else if (!fresh || fresh.target === undefined) delete route.target; // factory exited: refuse until it returns
+        }
+        knownHash = current;
+        const changed = liveRoutes.map((r) => `${r.repo}:${r.target ?? "-"}`).join(", ");
+        if (before !== changed) {
+          console.log(`[adapter] routes refreshed at runtime: target-only change adopted in place (policy ${knownPolicy.slice(0, 16)}, file ${current.slice(0, 16)}; ${changed})`);
+        }
+        onReload?.(next);
+        return;
+      }
     }
+
+    console.error(`[adapter] routes drift: ${routesFile} changed since start (startup ${knownHash.slice(0, 16)}, now ${String(current).slice(0, 16)}) — exiting for supervisor restart`);
+    die();
+    throw new RoutesDriftedError(`routes file changed since adapter start (startup hash ${knownHash.slice(0, 16)}, current ${String(current).slice(0, 16)})`);
   };
 }
 
@@ -96,9 +177,12 @@ if (isMain) {
     routes,
     dispatch: makeRouteDispatch(routes),
     logPath,
-    routesDriftCheck: makeRoutesDriftCheck({ routesFile, startupHash }),
+    routesDriftCheck: makeRoutesDriftCheck({ routesFile, startupHash, liveRoutes: routes }),
   }).then(({ server, port: actualPort, host }) => {
-    console.log(`adapter listening on http://${host}:${actualPort} (routes: ${routes.map((r) => r.repo).join(", ")}, routes-hash ${startupHash.slice(0, 16)})`);
+    // Both hashes are printed because they answer different questions: routes-hash is "which bytes am
+    // I serving?" and policy-hash is "which authority am I serving under?" — a target-only refresh
+    // moves the first and must never move the second (#81).
+    console.log(`adapter listening on http://${host}:${actualPort} (routes: ${routes.map((r) => r.repo).join(", ")}, routes-hash ${startupHash.slice(0, 16)}, policy-hash ${policyFingerprint(routes).slice(0, 16)})`);
     const shutdown = () => {
       server.close();
       process.exit(0);

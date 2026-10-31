@@ -69,6 +69,6 @@ Scheduled full-battery runs (C5 says per-release, and the host is a laptop) · G
 |---|---|---|---|---|
 | P1 | Review and merge #83 (first App-authored PR; reviewer flagged an out-of-scope `factory/verification.ts` change to look at) | 🧑 | — | merged or sent back with review comments |
 | P2 | Decide whether the public listener stays published between self-work bursts or is torn down (`tailscale serve reset`) and restored per burst | 🧑 | — | stated posture, reflected in the runbook |
-| P3 | #81 — routes-drift fires on the expected post-ready `target` fill; classify target-only changes as reloads, keep hard drift for repo-set/secret/label/sender changes | 🤖 | — | cold start serves without an adapter restart; drift tests extended |
+| ~~P3~~ ✅ | #81 — routes-drift classified: `target` is runtime state (adopted in place, both hashes logged), policy fields stay hard drift; unparsable files never benign | 🤖 | — | ✅ cold start served with **one** adapter attempt and a 200 on first delivery; 7 new checks incl. cold-start integration + non-vacuity proof |
 | P4 | R9 — path scope cannot express intent: consider requiring an issue to name the files it expects to change, or per-task allowlists | 🧑🤖 | P1 (evidence) | decision recorded, then implemented or explicitly deferred |
 | P5 | E3 re-decision is now possible (App authorship confirmed): branch protection cannot condition reviews on author, so weigh "one approval for everything" against status quo | 🧑 | — | recorded either way |
