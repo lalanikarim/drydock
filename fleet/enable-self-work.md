@@ -21,6 +21,10 @@ Two consequences worth knowing before they surprise you:
 - **Your own PRs cannot be approved by you.** GitHub refuses self-approval, so a `lalanikarim`-authored branch reaches merge through the admin bypass, not through an approval. That is expected, not a malfunction.
 - **Factory PRs (`app/drydock-factory`) can be approved normally**, because the author differs — which is the pairing decision E3 anticipated: bot authorship plus one human approval is a real control; "approve your own work as a second human" mostly adds latency.
 
+**Exercised, not just configured (2026-10-31).** PR #86 was merged by the repo admin with `unit-suite` green and **no approving review**: the merge stayed `BLOCKED` / `REVIEW_REQUIRED` until the bypass was taken, then landed. CI refused nothing and permitted nothing — it simply had to be green, which is the asymmetry working as designed.
+
+One caveat found while setting this up, tracked as **#87**: factory *commits* are authored by a placeholder (`factory-worker <factory-worker@localhost>`), while the ruleset reports `require_extra_approval_for_unattributed_changes: true`. The admin bypass covers it today, but an email that resolves to nobody is what "unattributed" means, so expect surprises until commits carry the App's bot identity.
+
 To inspect or undo (rulesets and classic protection coexist; both are enforced, so remove the ruleset to drop the review gate without touching CI):
 
 ```bash

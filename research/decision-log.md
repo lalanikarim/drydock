@@ -177,6 +177,8 @@ Implemented as ruleset `main-review-gate-admin-bypass` (`pull_request`, 1 approv
 
 Implementation note worth keeping: classic branch protection has no per-rule admin bypass — `enforce_admins` is all-or-nothing for the branch — so expressing "CI for everyone, review optional for admin" required a ruleset. Rulesets and classic protection coexist and both are enforced, which is why CI did not need moving. Two API traps hit on the way: the review rule type is `pull_request` (not `required_reviews` or `pull_request_rule`), and the bypass actor type is `RepositoryRole` with `actor_id: 5` for admin — `RepositoryAdmin` is rejected as invalid.
 
+**Evidence, operational rather than configured:** the operator merged #86 (docs-only, `unit-suite` green) with no approving review. Before the bypass the PR read `reviewDecision=REVIEW_REQUIRED`, `mergeStateStatus=BLOCKED`; after, it merged. CI was neither consulted as an exception nor waived. Follow-up found while wiring this: **#87** — factory commits carry a placeholder author (`factory-worker@localhost`) while the ruleset reports `require_extra_approval_for_unattributed_changes: true`, so B3's identity story is currently true of the pull request and false of the commits.
+
 ### E4 — Token budgets: warn and annotate, never abort · **adopted**
 
 Collect a distribution before enforcing. Baselines exist now (§5.17: 160K–467K tokens per task, 78–88% cache reads), so an eventual ceiling can be set from data instead of guesses — and M4's lesson (a budget below task duration looks like a failure) is still true.
