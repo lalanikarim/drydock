@@ -48,6 +48,8 @@ export const REGISTRY_DEFAULTS = {
   autoMerge: true,
   enabled: true,
   requireVerification: true,
+  // Comments on this repo's open PRs are NOT a trigger unless a repo opts in (#67).
+  prFeedback: false,
 };
 
 export interface OracleBoot {
@@ -66,6 +68,12 @@ export interface RepoEntry {
   enabled: boolean;
   autoMerge: boolean;
   eligibilityLabel: string;
+  /**
+   * Opt-in for `/factory …` comments on open pull requests as a rework trigger (#67). Policy, not
+   * deployment: it decides whether a conversational surface can start work in this repo at all. The
+   * supervisor copies it onto the route so the adapter enforces exactly what the registry declares.
+   */
+  prFeedback: boolean;
   /** Path to the per-repo factory config, relative to the drydock repo root. Null only for a
    * disabled entry (enabling a repo without runtime config is a validation error). */
   configFile: string | null;
@@ -171,13 +179,14 @@ export function validateRegistry(raw: unknown): Registry {
 
   const d = (obj.defaults ?? {}) as Record<string, unknown>;
   for (const key of Object.keys(d)) {
-    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
+    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification", "prFeedback"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
   }
   const defaults = {
     eligibilityLabel: typeof d.eligibilityLabel === "string" && d.eligibilityLabel.trim() ? d.eligibilityLabel.trim() : REGISTRY_DEFAULTS.eligibilityLabel,
     autoMerge: d.autoMerge === undefined ? REGISTRY_DEFAULTS.autoMerge : requireBoolean(d.autoMerge, "defaults.autoMerge"),
     enabled: d.enabled === undefined ? REGISTRY_DEFAULTS.enabled : requireBoolean(d.enabled, "defaults.enabled"),
     requireVerification: d.requireVerification === undefined ? REGISTRY_DEFAULTS.requireVerification : requireBoolean(d.requireVerification, "defaults.requireVerification"),
+    prFeedback: d.prFeedback === undefined ? REGISTRY_DEFAULTS.prFeedback : requireBoolean(d.prFeedback, "defaults.prFeedback"),
   };
 
   if (!Array.isArray(obj.repos) || obj.repos.length === 0) throw new Error("registry.repos must be a non-empty array");
@@ -186,7 +195,7 @@ export function validateRegistry(raw: unknown): Registry {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`registry.repos[${i}] must be an object`);
     const r = entry as Record<string, unknown>;
     for (const key of Object.keys(r)) {
-      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "note"].includes(key)) {
+      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "note"].includes(key)) {
         throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
@@ -226,6 +235,7 @@ export function validateRegistry(raw: unknown): Registry {
       pathAllowlist: validatePathList(r.pathAllowlist, `${repo}: pathAllowlist`, { allowNull: true }),
       protectedPaths: validatePathList(r.protectedPaths, `${repo}: protectedPaths`) ?? [],
       requireVerification: r.requireVerification === undefined ? defaults.requireVerification : requireBoolean(r.requireVerification, `${repo}: requireVerification`),
+      prFeedback: r.prFeedback === undefined ? defaults.prFeedback : requireBoolean(r.prFeedback, `${repo}: prFeedback`),
       ...(typeof r.note === "string" ? { note: r.note } : {}),
     };
   });

@@ -87,7 +87,7 @@ export function writeRoutesFile(routesFile: string, routes: unknown): string {
 export function buildRoutes(
   factories: FactoryEntry[],
   bases: Map<string, string>,
-  registry: { repos: Array<{ repo: string; eligibilityLabel: string }> },
+  registry: { repos: Array<{ repo: string; eligibilityLabel: string; prFeedback?: boolean }> },
   env: NodeJS.ProcessEnv = process.env,
 ): Array<{
   repo: string;
@@ -96,6 +96,7 @@ export function buildRoutes(
   token?: string;
   allowedSenders?: string[];
   eligibilityLabel: string;
+  prFeedback?: boolean;
 }> {
   return factories.map((f) => {
     const entry = registry.repos.find((r) => r.repo === f.repo);
@@ -109,6 +110,9 @@ export function buildRoutes(
       ...(f.token ? { token: f.token } : {}),
       ...(f.allowedSenders ? { allowedSenders: f.allowedSenders } : {}),
       eligibilityLabel: entry.eligibilityLabel,
+      // Only written when enabled, so a route that never opted in keeps the exact shape it had before
+      // #67 (absent means disabled; the adapter treats missing as false).
+      ...(entry.prFeedback ? { prFeedback: true } : {}),
     };
   });
 }

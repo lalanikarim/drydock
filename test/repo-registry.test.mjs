@@ -194,3 +194,55 @@ test("every oracle declares a repo, and every oracle repo is in the registry", a
     );
   }
 });
+
+// --- prFeedback: comments as a rework trigger (#67) -------------------------------------------
+
+test("PR feedback is off unless a repo says otherwise", () => {
+  const registry = validateRegistry({ repos: [entry()] });
+  assert.equal(registry.defaults.prFeedback, false);
+  assert.equal(registry.repos[0].prFeedback, false, "a comment-driven trigger cannot arrive by inheritance from the defaults");
+});
+
+test("prFeedback cascades from defaults and can be overridden per repo", () => {
+  const registry = validateRegistry({
+    defaults: { prFeedback: true },
+    repos: [entry(), entry({ repo: "octo/other", prFeedback: false })],
+  });
+  assert.equal(registry.repos[0].prFeedback, true);
+  assert.equal(registry.repos[1].prFeedback, false);
+});
+
+test("prFeedback must be a real boolean — Boolean(\"false\") is true (R6)", () => {
+  for (const bad of ["false", "true", 0, 1, null]) {
+    assert.throws(
+      () => validateRegistry({ repos: [entry({ prFeedback: bad })] }),
+      /prFeedback/,
+      `${JSON.stringify(bad)} must not load as a policy flag`,
+    );
+  }
+});
+
+test("drydock opts in, the fixtures do not", () => {
+  const registry = loadRegistry(join(ROOT, "factory/repo-registry.json"));
+  const byName = Object.fromEntries(registry.repos.map((r) => [r.repo, r]));
+  // drydock: dogfooding target — a human comments "/factory rebase" on its own draft PRs.
+  assert.equal(byName["lalanikarim/drydock"].prFeedback, true);
+  // Fixtures stay off: they are graded targets, and a trigger reachable by comment would be one more
+  // thing an oracle run could accidentally set off.
+  assert.equal(byName["lalanikarim/factory-fixture"].prFeedback, false);
+  assert.equal(byName["lalanikarim/factory-fixture-2"].prFeedback, false);
+});
+
+test("the supervisor copies prFeedback onto the route it hands the adapter", async () => {
+  const { buildRoutes } = await import("../fleet/supervisor.ts");
+  const factories = [
+    { repo: "lalanikarim/drydock", secret: "s1" },
+    { repo: "lalanikarim/factory-fixture", secret: "s2" },
+  ];
+  const registry = loadRegistry(join(ROOT, "factory/repo-registry.json"));
+  const routes = buildRoutes(factories, new Map(), registry, { WEBHOOK_SECRET_LALANIKARIM_DRYDOCK: "x1", WEBHOOK_SECRET_LALANIKARIM_FACTORY_FIXTURE: "x2" });
+  const drydock = routes.find((r) => r.repo === "lalanikarim/drydock");
+  const fixture = routes.find((r) => r.repo === "lalanikarim/factory-fixture");
+  assert.equal(drydock.prFeedback, true, "policy has to reach the adapter or it enforces nothing");
+  assert.equal("prFeedback" in fixture, false, "a repo that never opted in gets no field, so routes stay byte-stable");
+});

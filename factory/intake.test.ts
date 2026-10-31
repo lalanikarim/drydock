@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import net from "node:net";
 import { createHmac } from "node:crypto";
-import { startIntakeServer, verifyGitHubSignature, isAgentIssueEvent, MAX_WEBHOOK_BODY_BYTES } from "./intake.ts";
+import { startIntakeServer, verifyGitHubSignature, isAgentIssueEvent, validateRoutes, MAX_WEBHOOK_BODY_BYTES } from "./intake.ts";
 
 const SECRET = "test-webhook-secret";
 
@@ -268,6 +268,124 @@ const issueEvent = (repo: string, opts: { action?: string; labels?: string[]; se
   }
 
   server.close();
+}
+
+// --- PR feedback (#67): a `/factory …` comment on an open PR is opt-in work -----------------
+{
+  const prComment = (repo: string, body: string, sender = { login: "lalanikarim", type: "User" }) => ({
+    action: "created",
+    repository: { full_name: repo },
+    issue: { number: 42, pull_request: { url: `https://api.github.com/repos/${repo}/pulls/42` } },
+    comment: { id: 900, body },
+    sender,
+  });
+
+  const calls: Array<{ repo: string; body: string }> = [];
+  const { server, port } = await startIntakeServer({
+    port: 0,
+    host: "127.0.0.1",
+    routes: [
+      // The bot login is deliberately allowlisted below: the point of that case is that the bot guard
+      // fires even for a sender the allowlist would let through.
+      { repo: "alpha/one", secret: SECRET, target: "http://127.0.0.1:1/tasks", token: "t", allowedSenders: ["lalanikarim", "drydock-factory[bot]"], prFeedback: true },
+      // Same sender, same signature scheme — but feedback was never enabled here.
+      { repo: "beta/two", secret: "other-secret", target: "http://127.0.0.1:2/tasks", token: "t", allowedSenders: ["lalanikarim"] },
+    ],
+    dispatch: async (repo: string, event: any) => {
+      calls.push({ repo, body: event.comment.body });
+      return { submissionId: 7 };
+    },
+  });
+
+  const postTo = async (p: number, event: unknown, secret: string) => {
+    const raw = Buffer.from(JSON.stringify(event));
+    const res = await fetch(`http://127.0.0.1:${p}/webhook/github`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}` },
+      body: raw.toString(),
+    });
+    return { status: res.status, json: await res.json().catch(() => ({})) as any };
+  };
+
+  // Accepted: enabled repo + command present → 202 and a pr-feedback task request id.
+  {
+    const r = await postTo(port, prComment("alpha/one", "/factory rebase"), SECRET);
+    assert.equal(r.status, 202, `a /factory comment on an opted-in repo must be accepted, got ${r.status}: ${JSON.stringify(r.json)}`);
+    assert.equal(r.json.kind, "pr-feedback");
+    assert.equal(r.json.requestId, "pr-42-c-900", "the request id carries the comment id, so redelivery is exactly-once per comment");
+    assert.deepEqual(calls.at(-1), { repo: "alpha/one", body: "/factory rebase" });
+  }
+
+  // Refused: same comment on a repo that never opted in (200, not 202; nothing dispatched).
+  {
+    const before = calls.length;
+    const r = await postTo(port, prComment("beta/two", "/factory rebase"), "other-secret");
+    assert.equal(r.status, 200, `feedback on a non-opted-in repo must not be accepted, got ${r.status}`);
+    assert.equal(r.json.accepted, false);
+    assert.match(r.json.reason, /not enabled/);
+    assert.equal(calls.length, before, "a refused comment must never reach dispatch");
+  }
+
+  // Refused: prose on an opted-in repo (no command) — the common case of normal review discussion.
+  {
+    const r = await postTo(port, prComment("alpha/one", "could we maybe rebase this?"), SECRET);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.accepted, false);
+    assert.match(r.json.reason, /does not start with \/factory/);
+  }
+
+  // Refused: a bot author, even an allowlisted one — comment-triggered pipelines loop.
+  {
+    const r = await postTo(port, prComment("alpha/one", "/factory rebase", { login: "drydock-factory[bot]", type: "Bot" }), SECRET);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.accepted, false);
+    assert.match(r.json.reason, /bot/i);
+  }
+
+  // Sender allowlist still applies to comment events (403 before any parsing of intent).
+  {
+    const r = await postTo(port, prComment("alpha/one", "/factory rebase", { login: "stranger", type: "User" }), SECRET);
+    assert.equal(r.status, 403, `a non-allowlisted commenter must be rejected outright, got ${r.status}`);
+  }
+
+  server.close();
+}
+
+// A policy refusal decided after the state check is a 200 (no retry), not a 502.
+{
+  const { server, port } = await startIntakeServer({
+    port: 0,
+    host: "127.0.0.1",
+    routes: [{ repo: "alpha/one", secret: SECRET, target: "http://127.0.0.1:1/tasks", token: "t", prFeedback: true }],
+    dispatch: async () => ({ accepted: false, reason: "PR #42 is CLOSED, not OPEN" }),
+  });
+  const raw = Buffer.from(JSON.stringify({
+    action: "created",
+    repository: { full_name: "alpha/one" },
+    issue: { number: 42, pull_request: {} },
+    comment: { id: 1, body: "/factory rebase" },
+    sender: { login: "lalanikarim", type: "User" },
+  }));
+  const res = await fetch(`http://127.0.0.1:${port}/webhook/github`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-hub-signature-256": sign(raw) },
+    body: raw.toString(),
+  });
+  const json = await res.json() as any;
+  assert.equal(res.status, 200, `a refusal that will repeat identically must not ask GitHub to retry (got ${res.status})`);
+  assert.equal(json.accepted, false);
+  assert.match(json.reason, /CLOSED/);
+  server.close();
+}
+
+// prFeedback is a safety-shaped flag: a string "false" must not enable it (the R6 lesson).
+{
+  assert.throws(
+    () => validateRoutes([{ repo: "a/b", secret: "s", prFeedback: "false" as any }]),
+    /prFeedback must be a boolean/,
+    'prFeedback: "false" would be truthy and silently enable a comment trigger nobody asked for',
+  );
+  validateRoutes([{ repo: "a/b", secret: "s", prFeedback: false }]);
 }
 
 console.log("intake (TS port): all checks passed");
