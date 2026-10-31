@@ -46,4 +46,10 @@ Rules here:
 - Do not rebase a layer that has unresolved review comments without saying so in the PR — a rebase destroys the "outdated" trail a reviewer uses to find what they already read.
 - The factory pipeline is exempt: worker/reviewer branches are single-layer `agent/issue-<n>` refs pushed by the merge gate. Stacks are for work authored outside that pipeline.
 
-**Known collision with our branch protection — check before relying on it.** `gh stack merge` documents that *"Bypassing merge requirements is not supported for stacks"*, and GitHub refuses self-approval. Under the current ruleset (1 approving review, admin may bypass) an `gh stack merge` of a self-authored stack may therefore be refused even though the identical PR merges from the web UI through the admin bypass. If that happens, merge the layers individually in the UI — do **not** answer it by removing the review requirement.
+**Landing under our branch protection — verified (stack #92, 2026-10-31).** A two-layer self-authored stack landed from the web UI with **zero approvals**: GitHub applies the admin bypass per layer, so the "1 approving review" ruleset does not block a stack. Three behaviors observed while it happened:
+
+- Layers land **sequentially, bottom first** — and merging a lower layer **retargets** the PR above it to `main` on its own (#91's base went from `docs-stacked-pr-convention` to `main` with no intervention).
+- Remote branches are deleted on merge. The local stack stays listed by `gh stack view`, marked `merged`; that is bookkeeping, not debris to clean up.
+- `unit-suite` was required and green on **each layer independently** — the review bypass did not extend to CI, which is exactly the split we want.
+
+`gh stack merge` states that *"Bypassing merge requirements is not supported for stacks"* and has **not** been tested against the admin bypass (it offers no dry run, so testing it means merging). Prefer landing from the UI. If a CLI path does refuse someday, merge layers individually — do **not** answer it by dropping the review requirement.
