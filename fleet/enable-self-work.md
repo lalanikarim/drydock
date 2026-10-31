@@ -50,6 +50,15 @@ node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json
 
 (`run` is a subcommand — bare `supervisor.ts <file>` prints usage and exits.) Expect, in order: the adapter listening line, then `[factory] lalanikarim/drydock ready on http://127.0.0.1:<port>/`, then `wrote 1 route(s) to …/data/routes.json`. Readiness also runs the model-catalog self-check (#54): if the pinned model is absent from the instance's own `/models` it exits **before** announcing ready, so "ready" means what it says.
 
+Two posture lines are worth reading rather than skimming, both printed before `ready`:
+
+```
+[factory] lalanikarim/drydock: WARNING — git credential: NO factory token configured — clone/push will fall back to the host credential helper(s): osxkeychain (…). On a developer machine that entry is typically ACCOUNT-WIDE; scope it (decision B1) or set FACTORY_GITHUB_TOKEN.
+[factory] lalanikarim/drydock: verification required — open_draft_pr runs `npm test` and refuses to push on a non-zero exit
+```
+
+The first is the #70 credential warning (loud, not fatal — see §Prerequisites). The second is the #61 verification gate; if it ever says `WARNING — verification waived by registry policy`, that repo can open draft PRs with no test run at all.
+
 ### Gotcha found while bringing this up: stale routes in a running adapter
 
 The adapter reads its routes file when it starts; the supervisor writes that file when factories come up. On a machine that previously ran a different fleet, the adapter boots against the **leftover** file and logs the old repositories — then the supervisor overwrites the file underneath it and nothing reloads. Observed on first bring-up:

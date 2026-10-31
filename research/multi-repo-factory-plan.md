@@ -494,3 +494,27 @@ Issue #30 (migration onto the engram core) closed: Phases 0–3 are done with ev
 | fixture-1 #45 (`probe:list-sort-amount`) | Last live target across both fixtures; oracles hold green on `main` elsewhere | **Decided** (D3): run it — queue item 7, produces a draft PR for human merge |
 | **Decision questionnaire** for everything above and the operator-only calls | Built as a self-contained form: `research/decision-questionnaire-2026-10-31.html` (27 questions, 6 flagged as needing you; autosaves locally, exports JSON or Markdown). **Answered 2026-10-31** → `decision-log.md`; two free-text items remain open (G2 unease, G4 corrections) |
 | G3's positive control reviewed nothing | **Fixed here.** It named `agent/issue-1` literally; after that merged, the reviewer's `origin/main...HEAD` diff was empty and the control passed on nothing. Re-seeded as a good twin of trap #4 (`agent/issue-4-seeded-good`, own suite green before push). G3 re-run: T1 fail-with-root-cause 48s, T2 pass 42s | — |
+
+### 5.19 The verification gate: a draft PR cannot exist without a recorded test run (2026-10-31)
+
+Issue #61, decision C1. The first self-work run (§5.16) produced a PR body asserting the suite passed while `npm test` crashed — because the suite result was *reported* and nothing gated on it. Evidence nobody is required to read is documentation, not a control. This closes that gap and, together with CI (C2-rev), closes R1/R5.
+
+**Mechanism.** `factory/verification.ts` runs the repo's configured test command **host-side** — in the workspace, not inside the worker's sandbox, so the entity being graded does not run its own check — records `{command, exitCode, timedOut, counts, tail}`, and `open_draft_pr` refuses to push unless the gate says proceed. It runs after the path-scope check and **before** the reviewer: seconds before minutes of inference, same ordering logic as the scope gate. The two gates stay independent on purpose — a green suite says nothing about correctness, which is precisely what a wrong-but-passing implementation survives.
+
+**Policy.** Registry field `requireVerification`, default **true**. Boot logs the posture (`verification required — open_draft_pr runs \`npm test\` and refuses to push on a non-zero exit`). The escape hatch exists for repos with genuinely no runnable suite, and it is deliberately weak in exactly one direction: a waived repo with no command proceeds (with `**NOT VERIFIED — nothing was executed**` in the PR body), but a waived repo whose command *ran* and failed still cannot push. Waiving verification is not a license to ship red. No checked-in repo waives, and a test asserts that so a future waiver is a named event rather than a quiet JSON diff.
+
+**Four cases the decision text left open, resolved in code:**
+
+| Case | Behavior | Why |
+|---|---|---|
+| exit ≠ 0 | refuse; reason names command + exit code; 60-line tail returned for rework | the C1 core |
+| timeout (our own 900 s ceiling) | refuse, reported as TIMEOUT not FAIL | "slow" must never be recorded as "broken", but it still blocks |
+| exit 0, **zero tests collected** | refuse (`vacuous`) | a runner that matches no files proves nothing; see the defect below |
+| no command + waived | proceed, disclose loudly in the body | policy, not defect — and the human merger sees it |
+
+**Two fail-open bugs found while writing the tests** (both fixed; recorded as R6):
+
+1. **Vacuous green via inherited runner state.** A nested `node --test` that inherits `NODE_TEST_CONTEXT` from the outer harness prints `run() is being called recursively within a test file. skipping running files` and **exits 0 having executed nothing** — reproduced on node 22. So the gate could have been satisfied by a run of zero tests. Fix: strip that variable from the child env; plus zero-collected-tests is now a refusal in its own right. The regression test fails without the fix, which is the only reason to trust it.
+2. **`Boolean("false") === true`.** The registry coerced safety flags, so `"autoMerge": "false"` — a plausible JSON typo — would have *granted* merge rights in the one field whose failure mode is destroying something irreplaceable. `enabled`, `autoMerge` and `requireVerification` are now type-checked at load with a message that explains the trap.
+
+**Proof.** Two test files, both wired into `npm test`: `test/verification-gate.test.mjs` (9 checks — full decision matrix as pure functions, plus real processes for exit codes, timeout, vacuity, argv-not-shell) and `test/verification-push-gate.test.mjs` (3 checks driving the actual `open_draft_pr` tool against a scratch git repo whose origin already holds an older commit on the branch). The integration test asserts the operational claims directly: refusal payload names the command and exit code; **origin's branch tip is unchanged**; no reviewer task was created (`createTask` call list is empty, so a red run costs zero inference); and a green suite stops at the *next* gate rather than pushing. Suite: 9 + 3 checks, `npm test` exit 0, G0 20/20, intake hardening oracle 6/6, boot line verified live.
