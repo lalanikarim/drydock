@@ -23,6 +23,7 @@ import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
 import { createGitAuth } from "./github-auth.ts";
+import { loadRootEnv } from "./env-file.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,15 +48,9 @@ function parseArgs(argv: string[]) {
 }
 
 function loadFactoryEnv(): void {
-  const envFile = join(__dirname, "..", ".env");
-  if (!existsSync(envFile)) return;
-  for (const line of readFileSync(envFile, "utf8").split("\n")) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!m) continue;
-    let v = m[2];
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-    process.env[m[1]] ??= v;
-  }
+  // Shared with fleet/supervisor.ts (factory/env-file.ts): the two entry points must agree on which
+  // .env they applied, or a secret can be visible to one and not the other.
+  loadRootEnv();
 }
 
 /** Resolve the factory's model ref. "auto" probes the inference endpoint and
