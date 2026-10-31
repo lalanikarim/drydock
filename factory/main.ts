@@ -155,6 +155,7 @@ async function main() {
     workDir: workRoot,
     fixturesRepo: factoryCfg.repo,
     autoMerge: policy.autoMerge,
+    requireVerification: policy.requireVerification,
     pathScope: scopeOf(policy),
     ghToken: process.env.FACTORY_GITHUB_TOKEN ?? factoryCfg.gitToken,
     modelRef,
@@ -173,6 +174,12 @@ async function main() {
   if (!policy.autoMerge) {
     console.log(`[factory] ${repo}: registry policy autoMerge=false — merge_pr is not offered; runs stop at the draft PR for a human to merge`);
   }
+  // Verification posture (#61, decision C1) logged the same way: what open_draft_pr will require.
+  console.log(
+    policy.requireVerification
+      ? `[factory] ${repo}: verification required — open_draft_pr runs \`${factoryCfg.testCommand}\` and refuses to push on a non-zero exit`
+      : `[factory] ${repo}: WARNING — verification waived by registry policy; draft PRs may be opened with no test run at all`,
+  );
 
   createCoreInstance({
     config,

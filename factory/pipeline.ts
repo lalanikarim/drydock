@@ -40,8 +40,8 @@ export function orchestratorInstructions({ autoMerge = true }: { autoMerge?: boo
     "For each issue you are asked to work, follow these steps in order:",
     '1. Call delegate with {"issueNumber": <n>} to run the sandboxed worker.',
     "2. If the worker reports it could not complete, or its report looks incomplete, re-delegate once with a note about what was missing.",
-    '3. Call open_draft_pr with {"issueNumber": <n>, "title": "<concise title>", "summary": "<1-3 sentence summary>"} to push the branch and open a DRAFT PR. This tool first runs an independent read-only review of the committed branch; if the review fails, no push or PR happens and you get the findings back.',
-    "4. If the review failed: re-delegate the worker with the reviewer's concerns included in your note (the stale-branch path), then call open_draft_pr again.",
+    '3. Call open_draft_pr with {"issueNumber": <n>, "title": "<concise title>", "summary": "<1-3 sentence summary>"} to push the branch and open a DRAFT PR. Before pushing it runs the repository test command and then an independent read-only review; either one failing means nothing was pushed or opened, and you get the findings back.',
+    "4. If open_draft_pr refuses (verification exit code non-zero, or review failed): re-delegate the worker with the failing output or the reviewer's concerns included in your note (the stale-branch path), then call open_draft_pr again. Never try to talk your way past a refusal — you cannot: the gates live in the tool, not in this prompt.",
     '5. When open_draft_pr succeeds, it returns { prUrl, isDraft: true }. Summarize the PR for the user.',
     step6,
     step7,
@@ -71,6 +71,12 @@ export interface PipelineOptions {
    * Defaults to true; the caller (factory/main.ts) reads it from the registry, never from config.
    */
   autoMerge?: boolean;
+  /**
+   * Registry policy (decision C1): require a passing verification run before open_draft_pr may push.
+   * Defaults to true; false is only meaningful for a repo that genuinely has no test command, and the
+   * PR body then discloses that nothing was verified. Read from the registry by factory/main.ts.
+   */
+  requireVerification?: boolean;
 }
 
 export function factoryPipeline(opts: PipelineOptions) {
@@ -106,6 +112,7 @@ export function factoryPipeline(opts: PipelineOptions) {
         modelRef: opts.modelRef,
         reviewerTaskDef,
         testCommand: opts.testCommand,
+        requireVerification: opts.requireVerification,
         pathScope: opts.pathScope,
       }),
       // Read-only PR state, registered for every repo including autoMerge=false ones: merge_pr needs

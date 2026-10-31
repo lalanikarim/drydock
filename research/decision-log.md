@@ -52,9 +52,18 @@ B1 and B3 could read as contradictory. Reading: PAT = today's credential with a 
 
 ## 2026-10-31 — verification strategy (this is the load-bearing change)
 
-### C1 — `open_draft_pr` runs the repo's test command and refuses to push on non-zero · **adopted**
+### C1 — `open_draft_pr` runs the repo's test command and refuses to push on non-zero · **adopted — implemented**
 
 Strongest option chosen: no PR without a passing verification run, exit code attached as evidence. Directly prevents the §5.16 failure (a PR body asserting "tests pass" over a crashing `npm test`).
+
+Implemented in `factory/verification.ts` (+ wired into `open-draft-pr.ts`, gated by registry policy `requireVerification`, default **true**). Four things the decision text did not spell out, settled during implementation:
+
+1. **A waiver is not a license to ship red.** `requireVerification: false` covers "this repo has nothing to run"; if a command *is* configured and exits non-zero — or times out — the push is refused anyway. Otherwise the escape hatch would have been a way to disable the gate entirely.
+2. **Exit 0 with zero tests collected is not verification.** A runner that matches no files can succeed vacuously; the evidence records `vacuous` and the gate refuses, required *and* waived. This caught a real defect while writing the test: a nested `node --test` inheriting `NODE_TEST_CONTEXT` prints "skipping running files" and **exits 0 having run nothing** (reproduced on node 22). The child env is now stripped of that variable, with a regression test that would fail without the fix.
+3. **Timeout ≠ red.** A suite terminated by our own ceiling is reported as TIMEOUT, not FAIL, so "slow" is never recorded as "broken" — but it still blocks the push.
+4. **Ordering: verification before review.** Seconds versus minutes of inference, same reasoning as the path-scope gate. Both gates stay independent — a green suite says nothing about correctness, which is exactly what a wrong-but-passing implementation survives.
+
+Evidence shape in the PR body: exact command, exit code, result line, output tail (60 lines on failure, deliberately long enough to contain the assertion error so the orchestrator's re-delegation carries something actionable). A waived repo gets `**NOT VERIFIED — nothing was executed**` plus "a human reviewing this PR is the only verification it has had".
 
 ### C2 — No GitHub Actions. All tests local only. · **superseded 2026-10-31 (same day) by C2-rev**
 
@@ -180,4 +189,5 @@ Concrete enough to check against `research/work-queue.md`: every in-flight item 
 | R2 | Self-work can edit `AGENTS.md`, the file that constrains it | E1 | Recommend moving it to `protectedPaths`; human merge is currently the only control |
 | R3 | Public listener (Funnel) on a laptop holding an account-wide credential | A1 + A2, credential status today | B1 PAT is a **prerequisite** for publishing, not a follow-up; funnel URL is revocable; `allowedSenders` stays on |
 | R4 | ~~Stale policy accepted between fleet change and restart~~ | **#69 closed** (this PR) | Supervisor writes fresh routes before spawn (atomic, always overwrite); adapter re-hashes per request and exits on drift. Residual: fleet-file changes still need a supervisor restart (fleet is read once at start) — documented in the runbook |
-| R5 | Re-verification of a draft PR after rework relies on the same worker-run command | C1 without CI | Byte-scoped approval (#47) means an approval names a commit, but nothing re-tests that commit independently |
+| R5 | ~~Re-verification of a draft PR after rework relies on the same worker-run command~~ | **closed** by C1 + C2-rev | Verification now runs host-side at push time (not inside the worker's sandbox), and CI runs the same suite on the resulting PR head independently of the factory. Byte-scoped approval (#47) means an approval names the commit that was tested |
+| R6 | Two latent fail-open coercions found while implementing C1 — both now fixed, kept here as the lesson | registry validation | (a) `Boolean("false") === true`, so a JSON typo like `"autoMerge": "false"` would have **granted** merge rights; safety flags are now type-checked. (b) A nested `node --test` inheriting `NODE_TEST_CONTEXT` skips every file and exits 0 — a green verification with zero tests behind it; the child env is stripped and zero collected tests is treated as failure. Both were found by testing, not review: suspect this class of bug in any flag coerced with `Boolean()` or any gate that trusts an exit code alone |

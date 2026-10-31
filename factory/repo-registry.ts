@@ -1,9 +1,10 @@
 // Repo registry (multi-repo plan §5.11): the checked-in list of repos the factory manages, plus
 // the two policy decisions that only make sense per managed repo:
 //
-//   eligibilityLabel — which GitHub label makes an issue workable for this repo
-//   autoMerge        — whether the pipeline may merge its own PRs here
-//   oracleBoot       — how to start that repo's server so a behavior probe can judge it
+//   eligibilityLabel     — which GitHub label makes an issue workable for this repo
+//   autoMerge            — whether the pipeline may merge its own PRs here
+//   requireVerification  — whether a passing test run is required before a branch may be pushed
+//   oracleBoot           — how to start that repo's server so a behavior probe can judge it
 //
 // Three config artifacts exist and they are deliberately separate, because their failure modes and
 // secrecy differ:
@@ -46,6 +47,7 @@ export const REGISTRY_DEFAULTS = {
   eligibilityLabel: "agent",
   autoMerge: true,
   enabled: true,
+  requireVerification: true,
 };
 
 export interface OracleBoot {
@@ -76,6 +78,13 @@ export interface RepoEntry {
   pathAllowlist: string[] | null;
   /** Never-change prefixes in addition to the unconditional `vendor/` protection. */
   protectedPaths: string[];
+  /**
+   * Decision C1 (#61): open_draft_pr must run this repo's test command and refuse to push on a
+   * non-zero exit. True by default — a draft PR may not exist without verification.
+   * Setting false is the escape hatch for a repo with no runnable suite, and it hides nothing:
+   * the PR body must then state that nothing was verified.
+   */
+  requireVerification: boolean;
   note?: string;
 }
 
@@ -98,6 +107,16 @@ function validatePathList(raw: unknown, field: string, { allowNull = false }: { 
     checkNoShell(p, `${field} entry`);
   }
   return [...raw] as string[];
+}
+
+/**
+ * Safety flags must be real booleans. Loose coercion (`Boolean(x)`) is unsafe here specifically:
+ * `"autoMerge": "false"` in JSON coerces to TRUE, so a typo would grant merge rights — in the one
+ * field whose failure mode is destroying something irreplaceable. Fail loudly at load instead.
+ */
+function requireBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${field} must be a boolean (not ${JSON.stringify(value)} — a string like "false" would otherwise coerce to true)`);
+  return value;
 }
 
 function checkNoShell(value: string, field: string): void {
@@ -152,12 +171,13 @@ export function validateRegistry(raw: unknown): Registry {
 
   const d = (obj.defaults ?? {}) as Record<string, unknown>;
   for (const key of Object.keys(d)) {
-    if (!["eligibilityLabel", "autoMerge", "enabled"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
+    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
   }
   const defaults = {
     eligibilityLabel: typeof d.eligibilityLabel === "string" && d.eligibilityLabel.trim() ? d.eligibilityLabel.trim() : REGISTRY_DEFAULTS.eligibilityLabel,
-    autoMerge: d.autoMerge === undefined ? REGISTRY_DEFAULTS.autoMerge : Boolean(d.autoMerge),
-    enabled: d.enabled === undefined ? REGISTRY_DEFAULTS.enabled : Boolean(d.enabled),
+    autoMerge: d.autoMerge === undefined ? REGISTRY_DEFAULTS.autoMerge : requireBoolean(d.autoMerge, "defaults.autoMerge"),
+    enabled: d.enabled === undefined ? REGISTRY_DEFAULTS.enabled : requireBoolean(d.enabled, "defaults.enabled"),
+    requireVerification: d.requireVerification === undefined ? REGISTRY_DEFAULTS.requireVerification : requireBoolean(d.requireVerification, "defaults.requireVerification"),
   };
 
   if (!Array.isArray(obj.repos) || obj.repos.length === 0) throw new Error("registry.repos must be a non-empty array");
@@ -166,7 +186,7 @@ export function validateRegistry(raw: unknown): Registry {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`registry.repos[${i}] must be an object`);
     const r = entry as Record<string, unknown>;
     for (const key of Object.keys(r)) {
-      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "note"].includes(key)) {
+      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "note"].includes(key)) {
         throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
@@ -175,8 +195,8 @@ export function validateRegistry(raw: unknown): Registry {
     if (seen.has(repo)) throw new Error(`duplicate registry entry for ${repo}`);
     seen.add(repo);
 
-    const enabled = r.enabled === undefined ? defaults.enabled : Boolean(r.enabled);
-    const autoMerge = r.autoMerge === undefined ? defaults.autoMerge : Boolean(r.autoMerge);
+    const enabled = r.enabled === undefined ? defaults.enabled : requireBoolean(r.enabled, `${repo}: enabled`);
+    const autoMerge = r.autoMerge === undefined ? defaults.autoMerge : requireBoolean(r.autoMerge, `${repo}: autoMerge`);
     // Fail closed: a repo the factory does not run must never carry a merge grant. If someone
     // disables an entry but forgets to drop autoMerge, that leftover is a latent surprise for
     // whoever re-enables it — make them state it again instead.
@@ -205,6 +225,7 @@ export function validateRegistry(raw: unknown): Registry {
       oracleBoot: validateOracleBoot(r.oracleBoot, repo),
       pathAllowlist: validatePathList(r.pathAllowlist, `${repo}: pathAllowlist`, { allowNull: true }),
       protectedPaths: validatePathList(r.protectedPaths, `${repo}: protectedPaths`) ?? [],
+      requireVerification: r.requireVerification === undefined ? defaults.requireVerification : requireBoolean(r.requireVerification, `${repo}: requireVerification`),
       ...(typeof r.note === "string" ? { note: r.note } : {}),
     };
   });

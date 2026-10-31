@@ -140,6 +140,30 @@ test("drydock is enabled for self-work and can never auto-merge", () => {
   assert.ok(drydock.protectedPaths.includes("gates/probes/"), "the oracles stay protected even if gates/ were ever allowlisted");
 });
 
+test("verification is required by default and waiving it is explicit (#61 / decision C1)", () => {
+  assert.equal(validateRegistry({ repos: [entry()] }).repos[0].requireVerification, true, "a draft PR may not exist without verification unless policy says otherwise");
+  const waived = validateRegistry({ defaults: { requireVerification: false }, repos: [entry(), entry({ repo: "octo/other", requireVerification: true })] });
+  assert.deepEqual(waived.repos.map((r) => r.requireVerification), [false, true], "defaults cascade, per-repo overrides");
+});
+
+test("safety flags must be real booleans — \"false\" as a string is a typo, not a grant", () => {
+  // Boolean("false") === true. In autoMerge that would hand out merge rights on a typo, so the
+  // registry rejects non-boolean values for every safety flag instead of coercing them.
+  assert.throws(() => validateRegistry({ repos: [entry({ autoMerge: "false" })] }), /autoMerge.*must be a boolean/);
+  assert.throws(() => validateRegistry({ repos: [entry({ enabled: "true" })] }), /enabled.*must be a boolean/);
+  assert.throws(() => validateRegistry({ repos: [entry({ requireVerification: "no" })] }), /requireVerification.*must be a boolean/);
+  assert.throws(() => validateRegistry({ defaults: { autoMerge: "false" }, repos: [entry()] }), /defaults\.autoMerge must be a boolean/);
+});
+
+test("no checked-in repo waives verification", () => {
+  // The escape hatch exists for repos with no runnable suite. None of ours qualify, and the day one
+  // is waived this test names it instead of the waiver being a quiet diff in a JSON file.
+  const registry = loadRegistry();
+  for (const entry of registry.repos) {
+    assert.equal(entry.requireVerification, true, `${entry.repo} waives verification — PR bodies there would say "NOT VERIFIED"`);
+  }
+});
+
 test("every registry entry's runtime config parses, including disabled repos", () => {
   // A disabled entry is still checked in and reviewed; discovering that drydock's config has a bad
   // field on the day we finally enable it is the worst possible time. loadRegistry checks existence,
