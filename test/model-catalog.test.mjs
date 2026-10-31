@@ -76,6 +76,32 @@ test("the instance default differing from the pin is reported, not swallowed", (
   assert.equal(defaultMismatchWarning(ref, { models: [] }), null, "no default reported is not a mismatch");
 });
 
+test("default comparison is model identity, not separator formatting", () => {
+  const esc = (s) => new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  // The instance reports its default as `provider:modelId` while the pin is formatted
+  // `provider/modelId` — same model, so no warning (the false alarm that fired on every boot).
+  assert.equal(defaultMismatchWarning(ref, { models: [], default: `aurora:${PINNED}` }), null);
+  // Case-insensitivity preserved across both separators.
+  assert.equal(defaultMismatchWarning(ref, { models: [], default: `AURORA:${PINNED.toLowerCase()}` }), null);
+  assert.equal(
+    defaultMismatchWarning({ provider: "Aurora", modelId: PINNED }, { models: [], default: `aurora/${PINNED.toLowerCase()}` }),
+    null,
+  );
+  // A genuinely different model id still warns, naming both sides in their raw form.
+  const otherId = defaultMismatchWarning(ref, { models: [], default: "aurora/unsloth/gemma-4-12b-it-GGUF" });
+  assert.ok(otherId);
+  assert.match(otherId, /instance default model is aurora\/unsloth\/gemma-4-12b-it-GGUF but this repo pins aurora\//);
+  assert.match(otherId, esc(PINNED));
+  // A different provider still warns, with both names in the message.
+  const otherProv = defaultMismatchWarning(ref, { models: [], default: `spark:${PINNED}` });
+  assert.ok(otherProv);
+  assert.match(otherProv, /instance default model is spark:/);
+  assert.match(otherProv, esc(PINNED));
+  // Missing or empty default: no warning (unchanged).
+  assert.equal(defaultMismatchWarning(ref, { models: [] }), null);
+  assert.equal(defaultMismatchWarning(ref, { models: [], default: "" }), null);
+});
+
 test("main.ts pins the orchestrator model instead of inheriting the endpoint's loaded model", () => {
   // Tripwire: core.ts falls back to defaultModelRef() (DEFAULT_MODEL, else the *loaded* model) when
   // rootAgent.model is unset. That fallback is what silently ran a model absent from the catalog.
