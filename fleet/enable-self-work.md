@@ -16,12 +16,12 @@ Date: 2026-10-31. Everything below is the remaining deployment path; the code si
 | Verification gate on push (C1) | done | #61 — `factory/verification.ts`; boot logs `verification required — open_draft_pr runs \`npm test\` …` |
 | Routes cannot go stale under a running adapter (C3) | done | #69 — supervisor writes before spawn, adapter re-hashes per request and exits on drift |
 | CI + required status check on `main` | done | PR #73; `unit-suite` made required 2026-10-31 (`required_status_checks: [unit-suite]`, strict, admins enforced) |
-| **Credential: GitHub App, not a PAT** (B1-rev) | **configured, not wired** | App `drydock-factory` installed with `contents:write`, `pull_requests:write`, `issues:write`, `metadata:read`; write proven by creating+deleting a ref. **No code reads `GITHUB_APP_*` yet**, so runs still use the host keychain — queue item 3b. Installation reach is currently *all repos* (R7) — queue item 3a |
+| **Credential: GitHub App, not a PAT** (B1-rev) | **configured, not wired** | App `drydock-factory` installed with `contents:write`, `pull_requests:write`, `issues:write`, `metadata:read`; write proven by creating+deleting a ref. **No code reads `GITHUB_APP_*` yet**, so runs still use the host keychain — queue item 3b (R8). Installation narrowed to `selected` (6 repos, 2 private); 3 of them are unmanaged and should be dropped or, for `engram`, protected — queue item 3a-ii (R7) |
 
 Verify the credential situation before publishing, every time — it prints no secrets:
 
 ```bash
-node gates/github-app-check.mjs                    # identity, grants, repo reach, read probes
+node gates/github-app-check.mjs                    # identity, grants, reach-vs-registry check, read probes
 node gates/github-app-check.mjs --probe-push <owner/repo>   # optional: create+delete a ref to prove contents:write
 ```
 

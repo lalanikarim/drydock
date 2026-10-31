@@ -121,6 +121,25 @@ const missing = Object.entries(want).filter(([k, level]) => {
   return level === "write" ? have !== "write" : !have;
 });
 
+/**
+ * Repositories the factory's own policy (factory/repo-registry.json) says it works in. Read straight
+ * from the JSON rather than importing repo-registry.ts so this probe runs under plain `node`.
+ *
+ * Why the comparison matters: the registry gates ROUTES — an issue in an unmanaged repo is never
+ * dispatched — but it does nothing about CREDENTIAL REACH. If the installation can write a repo the
+ * policy does not mention, that gap is invisible from either side alone, and one of those repos is
+ * the vendored kernel whose commit this project pins.
+ */
+function managedRepoNames() {
+  try {
+    const registry = JSON.parse(readFileSync(new URL("../factory/repo-registry.json", import.meta.url), "utf8"));
+    return new Set((registry.repos ?? []).map((r) => r.repo));
+  } catch (e) {
+    console.error(`(could not read factory/repo-registry.json: ${e.message})`);
+    return new Set();
+  }
+}
+
 /** What the installation may do in each repo the factory actually manages. */
 const targetRepos = {};
 for (const full of targets) {
@@ -156,6 +175,10 @@ const report = {
   accessible_repository_count_truncated: truncated,
   accessible_private_count: repos.filter((r) => r.private).length,
   managed_repositories: targetRepos,
+  reachable_but_unmanaged: (() => {
+    const managed = managedRepoNames();
+    return repos.filter((r) => !managed.has(r.full_name)).map((r) => r.full_name);
+  })(),
   accessible_repositories_sample: repos.slice(0, 10).map((r) => r.full_name),
   read_probes: reads,
   required_scopes_missing: missing.map(([k, v]) => `${k}:${v}`),
@@ -178,6 +201,20 @@ if (process.argv.includes("--json")) {
   console.log(`Read probes:`);
   for (const [name, r] of Object.entries(reads)) console.log(`  - ${name}: issues HTTP ${r.issues}, pulls HTTP ${r.pulls}`);
   console.log(`Factory needs contents:write, pull_requests:write, issues:read → ${missing.length === 0 ? "ALL PRESENT" : `MISSING: ${report.required_scopes_missing.join(", ")}`}`);
+  const unmanaged = report.reachable_but_unmanaged;
+  if (unmanaged.length === 0) {
+    console.log(`Reach matches policy exactly: every reachable repo is in factory/repo-registry.json`);
+  } else {
+    console.log(`\n⚠ Reach exceeds policy — ${unmanaged.length} repos the registry does NOT manage are writable by this credential:`);
+    for (const name of unmanaged) console.log(`    - ${name}`);
+    console.log(`    Routes stay closed to these repos (intake refuses unknown repos), so this is about misuse`);
+    console.log(`    of a leaked key, not ordinary operation — but drop them from the installation unless intended.`);
+    if (unmanaged.some((n) => /engram/i.test(n))) {
+      console.log(`    NOTE: one of them is the vendored kernel. drydock pins a specific engram commit and protects`);
+      console.log(`    vendor/ unconditionally; a credential that can push that repo's default branch bypasses the`);
+      console.log(`    entire pin discipline. Either remove it or protect that branch.`);
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------------------------
