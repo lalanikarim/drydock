@@ -152,24 +152,39 @@ gh api repos/lalanikarim/drydock/hooks -f active=true \
   -f config[content_type]=json -f config[secret]=<same-secret> -f config[insecure_ssl]=0
 ```
 
-## 5. Smoke test, and what a failure looks like
+## 5. Smoke test — done on the published listener (2026-10-31)
 
-Pick or create an issue genuinely worth doing, then:
+The first public-driven run went end to end: issue **#80** → `build` label → signed delivery → worker in sandbox → independent review → **draft PR #83 authored by `app/drydock-factory`**, which stopped there. Nothing merged, no approval was pending (`GET /approvals` → `{"approvals":[]}`, consistent with `autoMerge: false` having removed the merge tool entirely).
 
-```bash
-gh issue edit <n> -R lalanikarim/drydock --add-label build
-tail -f fleet/data/intake-adapter.jsonl      # one line per inbound event, with reason on refusal
-```
+| Probe | Result |
+|---|---|
+| GitHub-signed ping after secret realignment | **200 OK**; adapter logs `not an agent issue event`, which is correct for issues-only intake |
+| Public `/health` | `{"status":"ok"}` and nothing else — #57's acceptance test over the public path |
+| Wrong signature | 403 `invalid signature` (checked before the payload is read) |
+| Missing signature | 403 `invalid signature` |
+| Signed for drydock, payload names another repo | 403 `cross-repo naming: signed for lalanikarim/drydock, payload names lalanikarim/factory-fixture` |
+| Correct signature, sender not in `allowedSenders` | 403 `sender not allowlisted for lalanikarim/drydock: someone-else` |
+| Replay of the accepted dispatch (same issue, label, allowed sender) | adapter replies 202 `accepted, requestId: issue-80`; **no second worker started** (setup count stayed at 2, zero factory containers, `agent/issue-80` head unchanged) — dedupe happens below the adapter, in the durable store keyed by `requestId` |
+| PR authorship (decision B3) | **confirmed**: `#83 [app/drydock-factory] draft=true` — every earlier PR on this repo is `[lalanikarim]`, so factory work is now distinguishable from human work by identity rather than by convention |
 
-Dispatch → worker clones, runs `npm ci`, implements, is independently reviewed → **draft PR**, and it stops there. A rejected event (wrong label, bad signature, cross-repo naming) is logged with a reason; GitHub retries 5xx, so an instance that is down does not silently lose work — `requestId = issue-<n>` makes the redelivery idempotent.
+Two things this does not prove, stated plainly: the adapter's 202 means "handed off", not "will run" — idempotency lives in the durable store, so a probe that never reaches eligibility (e.g. missing top-level `label`, which is what eligibility reads) proves nothing about dedupe; and one successful run is one run, on one repo, with one model pinned.
 
-Two operational facts worth remembering: re-labeling an issue **cannot** re-run it (same `requestId`, permanently deduplicated in the durable store — use a fresh issue or a manual `POST /tasks`), and removing the eligibility label after merge is still manual, as it is for the fixtures.
+Operational facts learned:
+
+- Re-labeling an issue **cannot** re-run it (same `requestId`, permanently deduplicated). To retry deliberately: fresh issue, or a manual task submission.
+- A worker may touch files the issue did not name as long as they are inside the path allowlist — #83's run also modified `factory/verification.ts` and the reviewer flagged it as bundled-in scope creep. Path scope answers "may this file change at all?", not "should this issue change it?"; review is the control for that (recorded as R9).
+- Reviewer output includes the verification block (`npm test`, exit code, tail) from decision C1, so a green claim is attached to a command rather than asserted.
 
 ## Rollback
 
+Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
+
 ```bash
-gh api -X PATCH repos/lalanikarim/drydock/hooks/<hook-id> -f active=false   # stop intake at the source
+tailscale serve reset                    # clears the published path (funnel rides on the serve config)
+gh api -X PATCH repos/lalanikarim/drydock/hooks/703101252 -f active=false   # stop intake at the source
 # then unpublish/stop whatever forwards to 127.0.0.1:9700, per that tool's own commands
 ```
 
 Disabling self-work entirely is one line in the registry (`enabled: false`), which both the supervisor and `factory/main.ts` enforce before any child spawns — demonstrated live when the first self-run refused to start.
+
+**What stays published is a decision, not a default.** A funnel URL is an HTTPS listener on a laptop that anyone on the internet can post signed-looking requests to; the refusals above are what makes that tolerable, and they only hold while the secret stays secret and the loopback bind stays loopback. If self-work is driven in bursts rather than continuously, tear the funnel down between bursts and re-run `tailscale funnel --bg 9700` when needed — GitHub retries failed deliveries with backoff, but that is not a durable queue you should rely on: if the window matters, re-add the label once the listener is back (nothing was recorded while it was down, so the same issue dispatches cleanly — `requestId` only deduplicates against work that actually started).
