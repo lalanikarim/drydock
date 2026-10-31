@@ -16,7 +16,9 @@ Date: 2026-10-31. Everything below is the remaining deployment path; the code si
 | Verification gate on push (C1) | done | #61 — `factory/verification.ts`; boot logs `verification required — open_draft_pr runs \`npm test\` …` |
 | Routes cannot go stale under a running adapter (C3) | done | #69 — supervisor writes before spawn, adapter re-hashes per request and exits on drift |
 | CI + required status check on `main` | done | PR #73; `unit-suite` made required 2026-10-31 (`required_status_checks: [unit-suite]`, strict, admins enforced) |
-| **Credential: GitHub App, not a PAT** (B1-rev) | **configured, not wired** | App `drydock-factory` installed with `contents:write`, `pull_requests:write`, `issues:write`, `metadata:read`; write proven by creating+deleting a ref. **No code reads `GITHUB_APP_*` yet**, so runs still use the host keychain — queue item 3b (R8). Installation narrowed to `selected` (6 repos, 2 private); 3 of them are unmanaged and should be dropped or, for `engram`, protected — queue item 3a-ii (R7) |
+| **Credential: GitHub App, not a PAT** (B1-rev) | done — wired and boot-verified | `factory/github-auth.ts` exchanges the App JWT for an installation token; boot prints `git credential: GitHub App <id> (installation <n>)` then `installation token exchange verified`, and refuses to announce ready if the exchange fails. The #70 keychain warning is gone from this path. Reach still needs the operator's eye: 3 reachable repos are unmanaged (queue 3a-ii, R7) |
+| Sandbox image present | required | `docker build -t localhost/factory-sandbox:latest factory/sandbox-image` — the worker image is built from that Dockerfile, not pulled; a missing image fails at worker spawn, not at boot. Also tag `factory-sandbox:latest` when `FACTORY_SANDBOX_IMAGE` is unset (the default resolves unqualified) |
+| Webhook secret actually matches GitHub | required | Prove it with a GitHub-signed ping rather than by reading config: `gh api -X POST repos/<owner>/<repo>/hooks/<id>/pings`, then check that delivery. **200/OK means the HMAC matched.** The adapter logs a ping as `not an agent issue event`, which is correct (events are issues-only). 403 with `reason: "invalid signature"` means the two sides disagree — see §Secret mismatch |
 
 Verify the credential situation before publishing, every time — it prints no secrets:
 
@@ -46,7 +48,13 @@ Create `fleet/fleet.local.json`. Keep the real secret in the environment — the
 
 `allowedSenders` is defense in depth, not decoration: the signature proves GitHub sent the request, the sender allowlist additionally requires that the actor is you. On a published listener both are cheap and they fail differently.
 
-Required environment (`.env` at repo root is read by `factory/main.ts`; export it for the supervisor process too — see the gotcha below): `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `GITHUB_WEBHOOK_SECRET_<owner>_<repo>`.
+Required environment: `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `GITHUB_WEBHOOK_SECRET_<owner>_<repo>`. **Since PR #82 the supervisor loads the repo-root `.env` itself** (non-overriding, same loader as `factory/main.ts`), so starting from a plain shell is fine; before that fix it was not, and the symptom was §Secret mismatch. Expected boot lines, in order:
+
+```
+[supervisor] loaded 7 variable(s) from .env (ambient values not overwritten)
+[supervisor] lalanikarim/drydock: webhook secret from GITHUB_WEBHOOK_SECRET_lalanikarim_drydock (value not logged)
+```
+
 
 Two more are **optional but should be set explicitly**, because their fallbacks are invisible rather than absent:
 
@@ -82,6 +90,8 @@ The adapter reads its routes file when it starts; the supervisor writes that fil
 
 **Fixed 2026-10-31 (#69, decision C3).** The supervisor now writes the routes file *before* spawning anything — atomically (temp + rename, so a reader never sees partial JSON) — and always overwrites on adapter start, so a leftover file can no longer survive. The adapter hashes the file at startup and re-hashes it on **every** webhook request; a changed file means the in-flight request is refused with 503 (audited), the adapter exits, and the supervisor restarts it against current policy. Both sides log the hash, so "which write does the running adapter not match?" is answerable from logs alone.
 
+**Known false positive (#81):** a cold start currently costs one adapter restart. The supervisor writes routes with no `target` (nothing is ready yet), the adapter records that hash, then the first factory becoming ready rewrites the file with its target — and the drift guard treats *any* change as policy drift, so it refuses requests (503) and exits for a restart that converges ~13 s later. It self-heals and GitHub retries, so publishing is safe; what it costs is an alarming line in every boot log plus a short window where deliveries depend on retry. The fix belongs in the adapter: classify a target-only change as a reload and keep hard drift for repo-set / secret / label / sender changes.
+
 What remains manual: **fleet-file changes** (adding/removing factories) still require a supervisor restart — the fleet file is read once at start. Registry changes (labels, allowlists) take effect on the next supervisor or factory restart. The startup-line check stays as cheap confirmation: it must list exactly the repos you expect, and the adapter's `routes-hash` should match the supervisor's last `wrote N route(s) … (hash …)` line.
 
 ## 3. Publish the listener, then prove what it discloses
@@ -92,6 +102,15 @@ Requirements on whatever sits in front — these follow from how the intake serv
 - **Request body forwarded unmodified.** Signature verification is an HMAC over the exact bytes GitHub sent; a proxy that rewrites, pretty-prints, or reorders JSON produces valid-looking requests that all fail with `invalid signature`.
 - **`POST /webhook/github` reachable**, method preserved, request body not buffered beyond the 1 MiB cap (a proxy-side cap set lower than GitHub's payloads silently drops work; set higher and our own cap does the refusing).
 - **4xx responses passed through**, so GitHub's delivery log shows real outcomes instead of a proxy-generated 200.
+
+With Tailscale Funnel (this machine's choice under A1) the command has to be detached — foreground `tailscale funnel <port>` holds the tunnel open and dies with the shell, which reads as "Available on the internet … Command aborted" and publishes nothing:
+
+```bash
+tailscale funnel --bg 9700      # https://<node>.<tailnet>.ts.net/ → http://127.0.0.1:9700
+curl -sS https://<node>.<tailnet>.ts.net/health   # {"status":"ok"} and nothing else
+```
+
+Requests from the hosting machine to its own published hostname may hairpin, so intermittent TLS resets there say nothing about the public path; GitHub's delivery log is the authority because GitHub connects from outside.
 
 Then verify from outside your own process:
 
@@ -110,6 +129,21 @@ gh api repos/lalanikarim/drydock/hooks/<hook-id>/deliveries --jq '.[0] | {delive
 ## 4. Register the webhook
 
 Events: **issues** only (all intake consumes; more events cost signature work and log volume for nothing). Secret must match `GITHUB_WEBHOOK_SECRET_lalanikarim_drydock`.
+
+This repo already has hook `703101252` (events `issues`) pointed at the funnel URL — inspect and update it rather than creating duplicates. Note that `gh api -f active=true` is rejected (`"true" is not a boolean`), so send real JSON; the payload file contains the secret, so keep it mode 600 and delete it when done:
+
+```bash
+gh api repos/lalanikarim/drydock/hooks --jq '.[] | {id, active, events, url: .config.url}'
+# build /tmp/hook.json from .env (active=true, events=["issues"], config.url=<funnel>/webhook/github,
+# config.content_type=json, config.secret=$GITHUB_WEBHOOK_SECRET_lalanikarim_drydock, insecure_ssl="0")
+gh api -X PATCH repos/lalanikarim/drydock/hooks/703101252 --input /tmp/hook.json && rm /tmp/hook.json
+```
+
+### Secret mismatch, and why it looks like GitHub's fault
+
+Symptom: every delivery is refused, the adapter logs `reason: "invalid signature"`, GitHub shows 403 — while both sides look correct in isolation. Observed here with the hook holding a secret from an earlier setup and the adapter having **no** secret at all (supervisor not loading `.env`), so it HMAC'd against the fleet file's placeholder text.
+
+Both halves are now enforced in code (PR #82): the supervisor loads `.env` before resolving secrets, and a placeholder-shaped secret is refused at boot instead of being silently used. To diagnose from scratch, compare three things — the ping result (200 ⇒ HMAC agrees), the adapter's refusal reason, and the boot line naming which source supplied the secret.
 
 ```bash
 gh api repos/lalanikarim/drydock/hooks -f active=true \
