@@ -81,7 +81,7 @@ export async function verifyWorkspace({ cwd, testCommand, timeoutSecs = VERIFICA
   const [cmd, ...args] = commandArgv(command);
   const isNodeTest = cmd === "node" && args.includes("--test");
   const collect = (out: string) => ({
-    ...(isNodeTest ? { total: lastCount(out, "# tests"), passCount: lastCount(out, "# pass"), failCount: lastCount(out, "# fail") } : {}),
+    ...(isNodeTest ? { total: lastCount(out, "tests"), passCount: lastCount(out, "pass"), failCount: lastCount(out, "fail") } : {}),
   });
 
   // A test runner must not inherit this harness's own runner state: node's test runner sees an
@@ -214,8 +214,10 @@ function tailOf(out: string, lines: number): string {
   return out.split("\n").filter((l) => l.trim() !== "").slice(-lines).join("\n");
 }
 
-/** Last `# <label> N` summary line of a `node --test` run (undefined if absent). */
+/** Last summary line of a `node --test` run, in either output dialect (undefined if absent). */
 function lastCount(out: string, label: string): number | undefined {
-  const matches = [...out.matchAll(new RegExp(`^${label} (\\d+)$`, "gm"))];
+  // Older node versions print TAP-style "# tests N"; newer ones default to the spec reporter's
+  // "\u2139 tests N". Accept both so the counts parse on either.
+  const matches = [...out.matchAll(new RegExp(`^(?:#|\\u2139) ${label} (\\d+)$`, "gm"))];
   return matches.length ? Number(matches.at(-1)![1]) : undefined;
 }
