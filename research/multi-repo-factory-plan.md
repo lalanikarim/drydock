@@ -725,3 +725,65 @@ routing text.
 - **No live end-to-end yet at PR time.** Unit and wiring coverage is complete (26 checks across two files);
   the label→adapter→instance→comment path gets exercised against real GitHub after merge, per this repo's
   standing rule that a fake proves your assumption, not the API.
+
+### 5.26 Restarting did not deliver capabilities — `root()` applies its agent options only at creation (2026-11-01, found live while verifying #65)
+
+The live test for refinement failed, and the failure was not in refinement. After merging #119, restarting
+the supervisor, and seeing `refinement enabled` plus `root capabilities synced` in the boot log, the running
+orchestrator answered a refinement request with:
+
+> "I don't have a `refine_issue` tool available in my current toolset." — listing exactly four tools.
+
+**Root cause, in the kernel.** `harness.root(ctx, { agent })` applies `agent` **only when the root
+conversation is created**. In pi-durable `harness.js` (`#create`): if a root conversation already exists it
+returns `ROOT_CONVERSATION_ID` immediately, *before* the `if (options.agent !== undefined) configure(...)`
+line. Every later boot silently discards the tool list, the instructions and the model ref it was handed.
+
+For this project that invalidates an assumption sitting under several shipped controls. "Policy applies at
+process start" was the stated reason capability removal was considered enforced — `autoMerge=false` hiding
+`merge_pr`, a newly registered tool becoming available, a re-pinned model after #54. For a long-lived root
+conversation none of that was re-asserted on restart; the root agent kept whatever it was born with. **A
+policy applied only when a database is first created is a fossil, not a policy.**
+
+**Fix: assert, then read back** (`factory/root-capabilities.ts`, called from `factory/main.ts` after the
+model-catalog check and before readiness is announced). The current agent change is configured on the root
+conversation every boot, then `conv.agent()` is asked what it will actually offer and the set is compared with
+the registry-derived list. A mismatch in **either** direction is fatal — a stale root still offering
+`merge_pr` after `autoMerge=false` is worse than one missing `refine_issue`, because the first runs with
+authority nobody chose and the second merely fails visibly. Zero tools is also fatal: an orchestrator with no
+tools cannot run a task, and "synced" would be a lie.
+
+Live confirmation of the fix, from the same store that had been refusing:
+
+```
+[factory] lalanikarim/drydock: root capabilities synced: delegate, open_draft_pr, pr_status, note_lesson, refine_issue
+```
+
+### 5.26.1 The second finding: a model refuses a tool it was demonstrably given
+
+Fixing the sync did **not** stop the refusals, which is how the real cause surfaced. To avoid arguing with
+self-reports, the instance's provider base URL was pointed at a logging proxy (`PI_AGENT_DIR` swap; the
+kernel builds its catalog from `~/.pi/agent/models.json`, where a declared provider beats env auto-
+registration — that is also why an `OPENAI_BASE_URL` override alone changed nothing). One request captured
+off the wire:
+
+```
+tools = ['delegate', 'open_draft_pr', 'pr_status', 'note_lesson', 'refine_issue']
+```
+
+`refine_issue` **was in the request**. The root agent refused anyway, three times, each refusal adding another
+"that tool does not exist" turn to its own context — after which it cited that history as evidence. A fresh
+conversation with the same extension called `refine_issue` on the first attempt and produced a brief on issue
+#120 within two minutes.
+
+So there are two independent failure modes, and only one of them had a code fix:
+
+| | symptom | cause | status |
+|---|---|---|---|
+| capability never arrives | tool absent from the model request | `root()` discards agent options for an existing root | **fixed** — asserted + read back every boot, fatal on mismatch |
+| capability arrives, is refused | tool present in the request, model declines to call it | its own earlier refusals dominate the transcript; instructions updated but the stale self-claim outweighed both schema and instruction | **open** — filed as an issue |
+
+The honest version of "we shipped a feature" here is that shipping was necessary but not sufficient: the
+feature was unreachable for a different reason than the one the tests described, and each layer — registry,
+route, boot log, task registration — reported success throughout. The only thing that caught it was driving
+the real path and then reading the actual bytes on the wire when the model's account contradicted mine.
