@@ -357,10 +357,16 @@ async function statusFleet(fleetPath: string): Promise<void> {
     console.log(`\nfailed-delivery sweep: ${sweep.reason === "never" ? "NEVER RECORDED" : sweep.reason.toUpperCase()} — run fleet/redeliver-failed.mjs with --state-file ${sweepPath}`);
     return;
   }
-  const st = sweep.state as { at: string; mode?: string; inspected?: number; undelivered?: number; queued?: number };
+  const st = sweep.state as { at: string; mode?: string; inspected?: number; undelivered?: number; queued?: number; since?: string | null; acknowledged?: number };
   const ageMin = Math.round((Date.now() - Date.parse(st.at)) / 60_000);
   const stale = ageMin > 60 ? " ⚠ older than 1h" : "";
-  console.log(`\nfailed-delivery sweep: ${ageMin} min ago (${st.mode ?? "?"}) — inspected ${st.inspected ?? "?"}, undelivered ${st.undelivered ?? "?"}, queued ${st.queued ?? 0}${stale}`);
+  // The window matters as much as the count: "undelivered 35" across all retained history is housekeeping,
+  // "undelivered 35 in the last hour" is an incident.
+  const window = st.since ? `since ${st.since}` : "all retained history";
+  // Acknowledged failures are excluded from the alarm but must stay on the line: "0 undelivered" after
+  // acknowledging 16 is a different claim than "0 undelivered" on a clean hook.
+  const acked = st.acknowledged ? `, ${st.acknowledged} acknowledged` : "";
+  console.log(`\nfailed-delivery sweep: ${ageMin} min ago (${st.mode ?? "?"}) — inspected ${st.inspected ?? "?"}, undelivered ${st.undelivered ?? "?"}, queued ${st.queued ?? 0}, ${window}${acked}${stale}`);
 }
 
 // CLI guard: importing this module (tests pull in checkRegistryPolicy) must not consume argv or

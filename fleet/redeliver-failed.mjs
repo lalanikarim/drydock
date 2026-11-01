@@ -27,14 +27,71 @@ import { dirname, resolve } from "node:path";
 
 const API = "https://api.github.com";
 
-/** Token resolution mirrors the factory's posture: env first, then the gh CLI helper. */
-export function resolveToken(env = process.env) {
+/**
+ * Token resolution mirrors the factory's posture: env first, then the gh CLI helper.
+ *
+ * The absolute-path candidates exist because launchd does not inherit a login shell's PATH. On a
+ * Homebrew machine `gh` lives in /opt/homebrew/bin, so a sweep that worked all afternoon in an
+ * interactive terminal would have failed with "no GitHub token" the moment it got scheduled — the
+ * failure mode is the environment, not the code (R12: run the real thing in the real environment).
+ * `run` is injectable so the fallback order is testable without shelling out.
+ */
+const GH_CANDIDATES = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+
+export function resolveToken(env = process.env, { run = execFileSync } = {}) {
   const t = (env.GITHUB_TOKEN || env.GH_TOKEN || "").trim();
   if (t) return t;
+  for (const gh of GH_CANDIDATES) {
+    try {
+      const token = String(run(gh, ["auth", "token"], { encoding: "utf8" }) ?? "").trim();
+      if (token) return token;
+    } catch {
+      // ENOENT here just means "not at this path"; the next candidate may exist.
+    }
+  }
+  return null;
+}
+
+/**
+ * `--since` accepts an absolute timestamp or a rolling window: `24h`, `90m`, `7d`, `30s`.
+ *
+ * The relative form exists for scheduled runs (#110). A plist cannot compute "yesterday", so an
+ * installed job without it either scans all retained history forever — reporting the same pre-existing
+ * failures every 15 minutes until nobody reads the log — or hardcodes a date that quietly rots. A
+ * rolling window keeps exit code 1 meaning "something is failing **now**", which is the only version of
+ * an alarm that stays useful.
+ */
+export function parseSince(value, { now = Date.now() } = {}) {
+  if (value === null || value === undefined || value === "") return null;
+  const v = String(value).trim();
+  const m = /^(\d+)([smhd])$/.exec(v);
+  if (!m) return v; // absolute timestamp — selectFailedDeliveries validates it
+  const unitSeconds = { s: 1, m: 60, h: 3600, d: 86400 };
+  return new Date(now - Number(m[1]) * unitSeconds[m[2]] * 1000).toISOString();
+}
+
+/**
+ * Read an acknowledgement list: one delivery id per line, `#` comments and blanks ignored.
+ *
+ * This exists because an alarm that cannot be acknowledged gets ignored. Sweeping a real deployment
+ * surfaces events a human already reviewed and deliberately chose not to re-drive (a `labeled` event for
+ * an issue closed hours ago). Without a way to say "seen, doing nothing" the job exits 1 forever and the
+ * next genuine loss is indistinguishable from yesterday's noise.
+ *
+ * A missing or unreadable file yields no acknowledgements rather than an error: the failure direction is
+ * deliberately towards alarming, never towards silence. Typos are reported so they surface in the log.
+ */
+export function readSkipList(path) {
+  if (!path) return { ids: [], warning: null };
   try {
-    return execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim() || null;
-  } catch {
-    return null;
+    const raw = readFileSync(path, "utf8");
+    const ids = raw
+      .split("\n")
+      .map((line) => line.replace(/#.*$/, "").trim())
+      .filter((line) => line.length > 0);
+    return { ids, warning: null };
+  } catch (e) {
+    return { ids: [], warning: `--skip-file ${path}: ${e.message} (treating as no acknowledgements)` };
   }
 }
 
@@ -157,7 +214,7 @@ export async function redeliver({ repo, hookId, deliveryId, token, fetchImpl = g
  * listing, including the zero-failure case — a sweep that found nothing is information, and "never
  * ran" must be distinguishable from "ran and was clean".
  */
-export function sweepStatePayload({ repo, hookId, mode, inspected, undelivered, queued = 0 }) {
+export function sweepStatePayload({ repo, hookId, mode, inspected, undelivered, queued = 0, since = null, acknowledged = 0 }) {
   return {
     at: new Date().toISOString(),
     repo,
@@ -166,6 +223,11 @@ export function sweepStatePayload({ repo, hookId, mode, inspected, undelivered, 
     inspected,
     undelivered,
     queued,
+    // Resolved window lower bound (null = all retained history). Without it, "undelivered 35" is
+    // ambiguous between "35 broke in the last quarter-hour" and "35 ancient records still on the list".
+    since,
+    // Failures excluded by an acknowledgement list — visible so "0 to act on" never looks like "nothing happened".
+    acknowledged,
   };
 }
 
@@ -200,7 +262,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   };
   const repo = opt("repo");
   const hookId = opt("hook");
-  const since = opt("since") ?? null;
+  const since = parseSince(opt("since"));
   // Surgical recovery: re-drive named ids only. Redelivering a whole window can resurrect work for
   // issues that were closed hours ago, so the default sweep is report-only and --apply is expected to
   // name what it touches. Comma-separated.
@@ -209,9 +271,12 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   // Optional breadcrumb for scheduling and `supervisor status` (#110). Not written by default: a tool
   // that silently creates state files on every invocation is how deployments accumulate mystery files.
   const stateFile = opt("state-file") ?? null;
+  // Acknowledgements: ids a human has already reviewed. Inline and/or a file the scheduler points at.
+  const skipArg = (opt("skip") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  const skipFile = opt("skip-file") ?? null;
 
   if (!repo || !hookId) {
-    log("usage: node fleet/redeliver-failed.mjs --repo owner/repo --hook <hook_id> [--since <ISO>] [--only <id,id>] [--apply]");
+    log("usage: node fleet/redeliver-failed.mjs --repo owner/repo --hook <hook_id> [--since <ISO|24h>] [--skip <id,id> | --skip-file <path>] [--only <id,id>] [--state-file <path>] [--apply]");
     return { code: 2, failed: [], applied: [] };
   }
   const token = resolveToken(env);
@@ -221,14 +286,22 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   }
 
   const all = await listDeliveries({ repo, hookId, token, fetchImpl });
-  let failed = selectFailedDeliveries(all, { since });
+  const { ids: skipIds, warning: skipWarning } = readSkipList(skipFile);
+  if (skipWarning) log(`warning: ${skipWarning}`);
+  const ack = [...new Set([...skipArg, ...skipIds.map(String)])];
+
+  const inWindow = selectFailedDeliveries(all, { since });
+  let failed = ack.length ? selectFailedDeliveries(all, { since, skip: ack }) : inWindow;
+  // Counted before --only narrows the list: --only selects work, acknowledgements remove it from the alarm.
+  const acknowledged = inWindow.length - failed.length;
+
   if (only.length) {
     const keep = new Set(only.map(String));
     const skipped = failed.filter((d) => !keep.has(String(d.id))).length;
     failed = failed.filter((d) => keep.has(String(d.id)));
     log(`--only: keeping ${failed.length} of ${failed.length + skipped} failure(s)`);
   }
-  log(`${all.length} delivery record(s) inspected; ${failed.length} not delivered${since ? ` since ${since}` : ""}`);
+  log(`${all.length} delivery record(s) inspected; ${failed.length} not delivered${since ? ` since ${since}` : ""}${acknowledged ? ` (${acknowledged} acknowledged, excluded)` : ""}`);
   for (const group of summarize(failed)) {
     log(`  ${group.reason}: ${group.count} (${group.events.join(", ")}) ids: ${group.ids.slice(0, 8).join(", ")}${group.ids.length > 8 ? " …" : ""}`);
   }
@@ -236,7 +309,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   const recordSweep = (mode, queued) => {
     if (!stateFile) return;
     try {
-      writeSweepState(stateFile, sweepStatePayload({ repo, hookId, mode, inspected: all.length, undelivered: failed.length, queued }));
+      writeSweepState(stateFile, sweepStatePayload({ repo, hookId, mode, inspected: all.length, undelivered: failed.length, queued, since, acknowledged }));
     } catch (e) {
       // A state file that cannot be written is worth knowing about but never fails the sweep itself.
       log(`warning: could not write --state-file ${stateFile}: ${e.message}`);

@@ -20,8 +20,10 @@
 
   * **Report-only.** No --apply. A scheduled sweep that acts can resurrect work for an issue closed hours
     ago; recovery stays a human decision made with `--only <id>`. The job's value is detection.
-  * **Exit code 1 when it finds something.** launchd does not care, but the log line does: grep the log
-    for "not delivered" and you get an honest history of every window in which events were being lost.
+  * **Exit code means something.** 0 = window clean, 1 = undelivered events needing attention, 2 = usage or
+    credential problem. launchd ignores it; the log and any mail wrapper do not. This was broken for a day
+    (main() returned a code nothing propagated), which is why the check asserts on process exit and not on a
+    return value.
 
   The token comes from the environment launchd gives the job; on this machine `gh auth token` is the
   resolution path (see resolveToken in fleet/redeliver-failed.mjs), so no secret is stored in the plist.
@@ -31,6 +33,8 @@
   <key>Label</key>
   <string>com.drydock.redeliver</string>
 
+  <!-- Absolute paths everywhere: launchd gives you no login shell, so neither PATH nor version-manager
+       shims exist here. Use `readlink -f "$(command -v node)"` for the real binary. -->
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
@@ -39,6 +43,18 @@
     <string>lalanikarim/drydock</string>
     <string>--hook</string>
     <string>__HOOK_ID__</string>
+
+    <!-- Rolling window. Without it the job reports ancient retained history forever and exit 1 stops
+         meaning "something is failing now". Accepts 24h / 90m / 7d / 30s or an absolute timestamp. -->
+    <string>--since</string>
+    <string>24h</string>
+
+    <!-- Acknowledge list: ids a human reviewed and chose not to re-drive (one per line, # comments).
+         Excluded from the exit code but still counted as `acknowledged` in the state file. Optional; a
+         missing file means no acknowledgements, never silence. -->
+    <string>--skip-file</string>
+    <string>/Users/__USER__/Projects/drydock/fleet/data/acknowledged-deliveries.txt</string>
+
     <string>--state-file</string>
     <string>/Users/__USER__/Projects/drydock/fleet/data/last-sweep.json</string>
   </array>
