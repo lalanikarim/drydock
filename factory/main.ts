@@ -183,6 +183,9 @@ async function main() {
     fixturesRepo: factoryCfg.repo,
     autoMerge: policy.autoMerge,
     requireVerification: policy.requireVerification,
+    // Refinement (#65) is registry policy like the two above, so the tool exists exactly when the route
+    // accepts a refinement trigger — no drift between "what can start this" and "what can it then do".
+    refine: policy.refine,
     pathScope: scopeOf(policy),
     gitAuth,
     modelRef,
@@ -194,13 +197,24 @@ async function main() {
     sandboxPolicy: { allowImages: [image], mountRoot: workRoot },
   };
   const ext = factoryPipeline(pipelineOpts);
-  const rootToolNames = policy.autoMerge
-    ? ["delegate", "open_draft_pr", "pr_status", "merge_pr", "note_lesson"]
-    : ["delegate", "open_draft_pr", "pr_status", "note_lesson"];
+  const rootToolNames = [
+    "delegate",
+    "open_draft_pr",
+    "pr_status",
+    ...(policy.autoMerge ? ["merge_pr"] : []),
+    "note_lesson",
+    ...(policy.refine ? ["refine_issue"] : []),
+  ] as string[];
   const rootTools = (ext.tools ?? []).filter((t) => rootToolNames.includes(t.name));
   if (!policy.autoMerge) {
     console.log(`[factory] ${repo}: registry policy autoMerge=false — merge_pr is not offered; runs stop at the draft PR for a human to merge`);
   }
+  // Refinement posture (#65), stated the same way: what a trigger can and cannot lead to.
+  console.log(
+    policy.refine
+      ? `[factory] ${repo}: refinement enabled — a \`${policy.refineLabel}\` label or \`/refine\` issue comment runs a read-only expansion pass that posts a comment and starts no work`
+      : `[factory] ${repo}: refinement disabled — only the eligibility label starts anything`,
+  );
   // Verification posture (#61, decision C1) logged the same way: what open_draft_pr will require.
   console.log(
     policy.requireVerification
@@ -224,7 +238,7 @@ async function main() {
     // wasn't registered ("unanswered / no_model", 2026-10-30). The repo config's modelId now decides,
     // for the orchestrator as well as for worker/reviewer tasks.
     rootAgent: {
-      instructions: orchestratorInstructions({ autoMerge: policy.autoMerge }),
+      instructions: orchestratorInstructions({ autoMerge: policy.autoMerge, refine: policy.refine }),
       tools: rootTools,
       model: { provider: modelRef.provider, modelId: modelRef.modelId },
     },

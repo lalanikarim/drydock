@@ -89,7 +89,7 @@ export function writeRoutesFile(routesFile: string, routes: unknown): string {
 export function buildRoutes(
   factories: FactoryEntry[],
   bases: Map<string, string>,
-  registry: { repos: Array<{ repo: string; eligibilityLabel: string; prFeedback?: boolean }> },
+  registry: { repos: Array<{ repo: string; eligibilityLabel: string; prFeedback?: boolean; refine?: boolean; refineLabel?: string }> },
   env: NodeJS.ProcessEnv = process.env,
 ): Array<{
   repo: string;
@@ -99,6 +99,8 @@ export function buildRoutes(
   allowedSenders?: string[];
   eligibilityLabel: string;
   prFeedback?: boolean;
+  refine?: boolean;
+  refineLabel?: string;
 }> {
   return factories.map((f) => {
     const entry = registry.repos.find((r) => r.repo === f.repo);
@@ -115,6 +117,8 @@ export function buildRoutes(
       // Only written when enabled, so a route that never opted in keeps the exact shape it had before
       // #67 (absent means disabled; the adapter treats missing as false).
       ...(entry.prFeedback ? { prFeedback: true } : {}),
+      // Same posture for refinement (#65): absent means off, and refineLabel travels only with it.
+      ...(entry.refine ? { refine: true, refineLabel: entry.refineLabel ?? "refine" } : {}),
     };
   });
 }

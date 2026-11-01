@@ -15,7 +15,19 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { startIntakeServer, loadRoutes, intakeRequestId, renderIntakeContent, classifyWebhookEvent, directiveFromEvent, RoutesDriftedError, type Route } from "./intake.ts";
+import {
+  startIntakeServer,
+  loadRoutes,
+  intakeRequestId,
+  renderIntakeContent,
+  renderRefineContent,
+  refineTriggerFromEvent,
+  classifyWebhookEvent,
+  directiveFromEvent,
+  RoutesDriftedError,
+  type Route,
+} from "./intake.ts";
+import { fetchIssueState } from "./gh-read.ts";
 import { authorizePrFeedback, fetchPrFacts, prNumberFromEvent, renderPrFeedbackContent, type PrFacts } from "./pr-feedback.ts";
 import { createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 
@@ -146,6 +158,8 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveR
  * Two shapes of task come out of one webhook endpoint (#67):
  *
  *   - a labeled issue  → the issue content the factory has always run;
+ *   - a refinement request (`refine` label or `/refine …` issue comment, #65) → a refine_issue task, after
+ *     the host confirms the issue is still open; it posts a comment and does nothing else;
  *   - a `/factory …` comment on an open PR → a rework task, but only after the host reads the PR's
  *     real state and authorizes it (open, and head branch we own). Comments are cheap to make and
  *     expensive to act on, so authorization runs against `gh pr view`, never against the payload.
@@ -156,7 +170,15 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveR
  */
 export function makeRouteDispatch(
   routes: Route[],
-  { fetchPr = fetchPrFacts, gitAuth }: { fetchPr?: (repo: string, prNumber: number, token: string) => Promise<PrFacts | null>; gitAuth?: GitAuth } = {},
+  {
+    fetchPr = fetchPrFacts,
+    fetchState = fetchIssueState,
+    gitAuth,
+  }: {
+    fetchPr?: (repo: string, prNumber: number, token: string) => Promise<PrFacts | null>;
+    fetchState?: (repo: string, issueNumber: number, token: string) => Promise<string | null>;
+    gitAuth?: GitAuth;
+  } = {},
 ) {
   const byRepo = new Map(routes.map((r) => [r.repo, r]));
   const auth: GitAuth = gitAuth ?? createGitAuth();
@@ -169,12 +191,26 @@ export function makeRouteDispatch(
     const verdict = classifyWebhookEvent(event, {
       eligibilityLabel: route.eligibilityLabel,
       prFeedback: route.prFeedback === true,
+      refine: route.refine === true,
+      refineLabel: route.refineLabel,
     });
     if (!verdict.accepted) return { accepted: false, reason: verdict.reason };
 
     let requestId: string;
     let content: string;
-    if (verdict.kind === "issue") {
+    if (verdict.kind === "refine") {
+      // Refinement reads and writes prose, so it still gets a liveness check: an event for an issue that
+      // closed while this was in flight would otherwise post a brief onto a dead thread.
+      const issueNumber = event?.issue?.number;
+      if (!Number.isInteger(issueNumber)) return { accepted: false, reason: "refinement event does not identify an issue" };
+      const authEnv = await gitAuthEnv(auth);
+      const state = await fetchState(repo, issueNumber, authEnv.GH_TOKEN ?? "");
+      if (state === null) return { accepted: false, reason: `issue #${issueNumber} not found in ${repo}` };
+      if (state !== "open") return { accepted: false, reason: `issue #${issueNumber} is ${state}, not open` };
+      const { trigger, guidance, sender } = refineTriggerFromEvent(event);
+      requestId = verdict.requestId;
+      content = renderRefineContent(event, { trigger, guidance, sender });
+    } else if (verdict.kind === "issue") {
       requestId = intakeRequestId(event);
       content = renderIntakeContent(event);
     } else {

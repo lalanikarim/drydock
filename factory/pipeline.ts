@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { defineExtension } from "@earendil-works/pi-durable";
 import { factoryWorkerTask, factoryDelegateTool } from "./worker.ts";
 import { factoryReviewerTask, makeReviewerRoleTools } from "./reviewer.ts";
+import { factoryRefineTask, refineIssueTool } from "./refine-task.ts";
 import { openDraftPrTool } from "./open-draft-pr.ts";
 import { mergePrTool, prStatusTool } from "./merge-gate.ts";
 import { noteLessonTool } from "./lessons.ts";
@@ -31,7 +32,13 @@ import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts"
  * impossible tends to find a way (bash has `gh pr merge`, and the worker's shell is one delegate
  * away). The instruction and the capability are derived from the same flag so they cannot drift.
  */
-export function orchestratorInstructions({ autoMerge = true }: { autoMerge?: boolean } = {}): string {
+export function orchestratorInstructions({ autoMerge = true, refine = false }: { autoMerge?: boolean; refine?: boolean } = {}): string {
+  // Routing rule first, because this agent keeps its implementation tools even when a request is not
+  // implementation work: an instruction that only describes refinement invites "and I should probably
+  // build it too". The prohibition is the first thing in the prompt for exactly that reason.
+  const step0 = refine
+    ? '0. If the request starts with "REFINEMENT REQUEST", it is NOT implementation work: call refine_issue with the issue number, trigger and sender given, report the comment URL it returns, and end your turn. Do not call delegate, open_draft_pr or merge_pr for such a request — a refinement produces a comment, and acting on it requires the eligibility label.'
+    : "";
   const step6 = autoMerge
     ? '6. Call pr_status with {"issueNumber": <n>} to read the PR\'s current headSha, then call merge_pr with {"issueNumber": <n>, "headSha": "<that sha>"}. The core approval hook blocks this call until a human approves its key, and that approval authorizes exactly the commit named in headSha — so never pass a sha you did not read from pr_status or open_draft_pr, and never retry with a different sha on your own. Do not retry while it is blocked: report that the merge is awaiting approval (include the headSha) and stop. If it returns { alreadyMerged: true }, the PR was merged out-of-band; note it and continue. If it reports HEAD MISMATCH, the branch was rewritten: do not re-approve anything yourself — report the new head sha and stop.'
     : '6. STOP here. This repository\'s policy does not allow the factory to merge, so you have no merge tool and must not attempt one by another route (no `gh pr merge`, no git push to the base branch). Report that the draft PR is ready for human review and end your turn.';
@@ -39,6 +46,7 @@ export function orchestratorInstructions({ autoMerge = true }: { autoMerge?: boo
   return [
     "You are the orchestrator of a software factory. You coordinate work on GitHub issues for this repository.",
     "",
+    ...(step0 ? [step0, ""] : []),
     "For each issue you are asked to work, follow these steps in order:",
     '1. Call delegate with {"issueNumber": <n>} to run the sandboxed worker.',
     "2. If the worker reports it could not complete, or its report looks incomplete, re-delegate once with a note about what was missing.",
@@ -91,6 +99,12 @@ export interface PipelineOptions {
    * on at boot and inspected after a run; one per factory process, keyed internally by issue.
    */
   refusalBudget?: RefusalBudget;
+  /**
+   * Registry policy (#65): register the refinement task and its `refine_issue` tool. Off by default —
+   * enabling it makes an issue label and an issue comment cost inference. The refiner reads the repo with
+   * the `read` tool only and its sole output is a comment posted host-side after parsing.
+   */
+  refine?: boolean;
 }
 
 export function factoryPipeline(opts: PipelineOptions) {
@@ -115,6 +129,9 @@ export function factoryPipeline(opts: PipelineOptions) {
     pathScope: opts.pathScope,
     gitAuth: auth,
   });
+  const refineTaskDef = opts.refine === true
+    ? factoryRefineTask({ workDir: opts.workDir, fixturesRepo: opts.fixturesRepo, gitAuth: auth, pathScope: opts.pathScope })
+    : null;
   const reviewerTaskDef = factoryReviewerTask({
     workDir: opts.workDir,
     fixturesRepo: opts.fixturesRepo,
@@ -151,7 +168,8 @@ export function factoryPipeline(opts: PipelineOptions) {
         : [mergePrTool({ fixturesRepo: opts.fixturesRepo, gitAuth: auth })]),
       noteLessonTool(lessonsFile),
       ...makeReviewerRoleTools({ workDir: opts.workDir, testCommand: opts.testCommand }),
+      ...(refineTaskDef ? [refineIssueTool({ taskDef: refineTaskDef, modelRef: opts.modelRef })] : []),
     ],
-    tasks: [workerTaskDef, reviewerTaskDef],
+    tasks: refineTaskDef ? [workerTaskDef, reviewerTaskDef, refineTaskDef] : [workerTaskDef, reviewerTaskDef],
   });
 }
