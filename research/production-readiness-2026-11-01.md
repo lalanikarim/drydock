@@ -1,12 +1,19 @@
 # Production readiness assessment + session handoff — 2026-11-01
 
+> **Updated 2026-11-02.** Shipped since compilation: **P0-3 closed** (process-group ownership, bounded shutdown,
+> child-side orphan watchdog — #130), **runtime config moved outside the source tree** to `$DRYDOCK_CONFIG_DIR`
+> (#129, see §5.28 of the plan: `testCommand` was inside drydock's own path allowlist), **engram onboarded** as a
+> managed repo (#128), and the Tailscale funnel recovered (a delivery sweep found nothing needing redelivery). A
+> deploy has since been performed with no `kill -9`. Sections marked DONE keep their original findings — they are
+> why the fix looks the way it does.
+
 **Purpose:** start a fresh session from one file. Everything below was verified by running commands on
 2026-11-01, not recalled. Re-verify anything marked ⚠️ before acting on it; the fleet is a live process and
 changes between sessions.
 
 Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1–§5.27),
 `research/decision-log.md` (risks R1–R13), `research/work-queue.md` (ranked items),
-`fleet/enable-self-work.md` (operator runbook, §1–§8).
+`fleet/enable-self-work.md` (operator runbook, §1–§10).
 
 ---
 
@@ -70,8 +77,11 @@ Last PASS was 105 commits and ~29 merged PRs ago. Gates: `gates/g{0..5}-*.mjs`, 
 `gates/m2-isolation.mjs`, `gates/m4-budget.mjs`. G1/G4 mutate fixtures → need explicit sign-off. Expect new
 findings; budget for them rather than treating a red gate as surprise noise.
 
-### P0-3 · Deploy path: `SIGTERM` ignored — ~half a day
-Two reproductions on 2026-11-01: routine restart alive after **>8 s** (bound is 3 s), and after exhausting the
+### P0-3 · Deploy path: `SIGTERM` ignored — **DONE (2026-11-02, #130)**
+
+Closed by `fleet/proc-group.ts` (children `detached`, each leading its own process group; teardown enumerates via `pgrep -g`, escalates `TERM → KILL`, reports survivors), `fleet/shutdown-coordinator.ts` (first signal graceful + bounded timer, **second signal exits immediately and `SIGKILL`s what is left**, give-up exits non-zero), and `factory/parent-watchdog.ts` (the child stops itself when its supervisor disappears — the only half that survives `SIGKILL` of the supervisor). Verified on the live fleet: a routine `SIGTERM` produced `terminating 3 child process group(s)`, all children closed, lock released and `:9700` free within ~12 s, no survivors; restart clean. Running this also exposed that an orphaned-and-self-closed instance left **no log trace at all** (its stdout is a pipe into the dead supervisor), hence `factory-instances/<repo>/orphan-events.log`. Detail: plan §5.28-era notes and PR #130.
+
+*Original finding, kept because it explains the design:* Two reproductions on 2026-11-01: routine restart alive after **>8 s** (bound is 3 s), and after exhausting the
 child-restart budget alive after **>24 s** (six checks) while still serving `/health`. Both deploys required
 `kill -9`; recovery was safe only because lock reclaim worked (`reclaimed stale supervisor lock (previous pid N
 is not running); held by pid M`). Hypothesis in issue #110: the bounded-exit timer is armed once and a second
@@ -166,10 +176,16 @@ feature is unreachable.** Drive the real path; when a model's account contradict
 
 ## 8. Operating notes for the next session (things that cost time to learn)
 
-- **Restart recipe:** `kill -TERM $(cat fleet/data/routes.json.lock)`; if still alive after ~5 s, `kill -9`
-  (P0-3), then **check for orphaned children** — `ps -eo pid,ppid,etime,command | grep factory/main.ts` and kill
-  anything at `ppid 1` (#125, two harnesses on one store) — then start and confirm the three boot lines +
-  `/health`. Verify exactly one supervisor by lock owner and exactly one instance child by `PPID`.
+- **Restart recipe:** `kill -TERM $(cat fleet/data/routes.json.lock)`; a second `SIGTERM` means "now" (immediate
+  exit + `SIGKILL` to what is left) — that replaced the old advice of reaching for `kill -9`, which is what used to
+  create orphans. Still verify: no `factory/main.ts` remaining, `lsof -nP -i :9700` empty, lock file gone. Then
+  start and confirm the boot lines + `/health`. **If in doubt, read
+  `factory-instances/<repo>/orphan-events.log`** — it records an orphaning even when the supervisor log cannot
+  (the child's stdout is a pipe into the supervisor). Runbook §10 has the captured output.
+- **Runtime config lives outside the repository:** `$DRYDOCK_CONFIG_DIR/<owner>_<repo>.json`, default
+  `~/.drydock/configs/`. The supervisor refuses to start — naming every missing path, before taking the lock —
+  if a fleet repo has no config there. It is not in git, so a fresh machine needs it created (§1a of the runbook);
+  the reason is in plan §5.28.
 - **Never run two supervisors** — they rewrite the shared routes file with different per-route tokens and every
   in-flight adapter refuses deliveries (#107). The lock does this job; don't disable it to "just try something".
 - **Poll intervals ≤30 s, never sleep >30 s at a time.**
@@ -198,7 +214,8 @@ feature is unreachable.** Drive the real path; when a model's account contradict
 
 1. #122 (design decision first: fresh conversation per task kind vs reset endpoint) → implement → verify live on
    this instance, including a real `/refine` that reaches the tool through intake.
-2. P0-3 shutdown fix + a deploy that needs no `kill -9`.
+2. ~~P0-3 shutdown fix + a deploy that needs no `kill -9`.~~ **Done 2026-11-02** (#130; the deploy was performed
+   and captured — see P0-3 above).
 3. P0-4 backup procedure + one executed restore drill.
 4. P0-2 full battery on current `main`, fixtures included, with sign-off for G1/G4 mutations.
 5. Then P1: second real repo onboarded behind protected `main`, exposure posture written down, #64 closed on an
