@@ -285,13 +285,23 @@ First run against this deployment, 2026-11-01: **72 delivery records inspected, 
 
 The decision #110 was waiting on, made: **launchd, not cron**. A laptop sleeps, and `cron` skips the jobs it would have run during sleep without ever catching up — which is precisely the window in which webhook deliveries fail. `StartInterval` resumes on wake, and `KeepAlive=false` keeps each run a short-lived process instead of another daemon to supervise.
 
+**Installed on this machine (2026-11-01):** label `com.drydock.redeliver`, every 900s + at load, `--since 24h --skip-file fleet/data/acknowledged-deliveries.txt --state-file fleet/data/last-sweep.json`, report-only, log at `~/Library/Logs/drydock-redeliver.log`.
+
 ```bash
 cp fleet/launchd/com.drydock.redeliver.plist.example ~/Library/LaunchAgents/com.drydock.redeliver.plist
-# edit the __PLACEHOLDER__s: user paths, hook id, interval (default 900s = 15 min)
-launchctl load ~/Library/LaunchAgents/com.drydock.redeliver.plist
-launchctl start com.drydock.redeliver    # run once, now
-tail -f ~/Library/Logs/drydock-redeliver.log
+# edit the __PLACEHOLDER__s: node path, repo paths, hook id, interval (default 900s = 15 min)
+plutil -lint ~/Library/LaunchAgents/com.drydock.redeliver.plist   # a typo'd plist fails silently otherwise
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drydock.redeliver.plist
+launchctl kickstart -k gui/$(id -u)/com.drydock.redeliver        # run once, now
+launchctl print gui/$(id -u)/com.drydock.redeliver | grep -E "state|last exit code"
+tail -20 ~/Library/Logs/drydock-redeliver.log
+launchctl bootout gui/$(id -u)/com.drydock.redeliver             # stop
 ```
+
+Two things that only show up under launchd, both found by installing it rather than by reading docs:
+
+- **No login-shell PATH.** `gh` on a Homebrew machine lives in `/opt/homebrew/bin`, so resolving the token by bare name worked all afternoon interactively and would have failed the moment the job got scheduled. `resolveToken` now tries `gh`, `/opt/homebrew/bin/gh`, `/usr/local/bin/gh`.
+- **`ProgramArguments` needs absolute paths**, including for node itself — use the real binary (`readlink -f "$(command -v node)"`), not a shim that depends on shell environment.
 
 The template is deliberately **report-only** — no `--apply`. A job that acts on a schedule can resurrect work for an issue closed hours ago, so detection is automated and recovery stays a human call with `--only`. It **exits 1 when it finds something**, which is what makes the log greppable and mail useful. That claim was false for exactly one day: `main()` returned `{code: 1}` while the CLI wrapper exited only on a thrown error, so every invocation — including one that had just reported 35 undelivered events — left status 0. Fixed by `runCli()`, which maps the verdict onto `process.exit` (checks: findings→1, clean→0, usage→2, thrown listing→2). Lesson for any gate that trusts an exit code: confirm something actually sets it.
 
@@ -300,17 +310,42 @@ Then check freshness without remembering the tool exists:
 ```bash
 node --experimental-strip-types fleet/supervisor.ts status fleet/fleet.local.json
 # …
-# failed-delivery sweep: 12 min ago (dry-run) — inspected 74, undelivered 0, queued 0
+# failed-delivery sweep: 4 min ago (dry-run) — inspected 81, undelivered 0, queued 0, since 2026-10-31T09:22:17.675Z, 16 acknowledged
 # failed-delivery sweep: NEVER RECORDED — run fleet/redeliver-failed.mjs with --state-file …/last-sweep.json
 ```
 
 `⚠ older than 1h` marks a stale sweep. "Never recorded" is printed as loudly as the others on purpose: before this, an unrun recovery tool and a healthy system looked identical.
 
-Verifying exactly one supervisor is running (the churn that started #107):
+#### The window and the acknowledge list (why exit code 1 has to be steerable)
+
+The installed job passes **`--since 24h`**. A plist cannot compute "yesterday", so without a rolling window a scheduled sweep either reports the same ancient failures forever — or hardcodes a date that rots. `--since` takes `24h` / `90m` / `7d` / `30s` or an absolute timestamp, resolved at run time, and the resolved lower bound is written to the state file so "undelivered 16" can be read as *16 in this window* rather than *16 ever*.
+
+Then the real problem appeared: **16 events were genuinely undelivered and genuinely needed no action** — ping checks, funnel-down connect failures during listener republishing, and 502/503s from supervisor restart windows. A weekly-always-red alarm is an ignored alarm, so acknowledgement is a first-class input:
 
 ```bash
-ps -eo pid,command | grep -c "[s]upervisor.ts run"   # must print 1
-cat fleet/data/routes.json.lock                       # the pid that holds it
+node fleet/redeliver-failed.mjs --repo … --hook … --since 24h \
+  --skip-file fleet/data/acknowledged-deliveries.txt   # one id per line, # comments allowed
+```
+
+Acknowledged ids are excluded from the exit code **but still counted** in the state file and on `status` (`16 acknowledged`). That distinction is the point: acknowledging is a recorded decision, not a way to make the record look like a clean hook. A missing or unreadable skip file yields *no* acknowledgements plus a warning — the failure direction is always towards alarming, never towards silence.
+
+What acknowledgement does **not** give you: GitHub redacts delivery request payloads, so a failed record shows event type and failure reason but **not the issue number**. The actionable question is therefore not "which event was lost" but *"does an open issue sit carrying the eligibility label without having been dispatched?"* — check with:
+
+```bash
+gh issue list -R lalanikarim/drydock --state open --json number,labels \
+  --jq '.[] | select([.labels[].name] | index("build")) | "#\(.number)"'
+```
+
+Empty output is what clean looks like. When the 16 were reviewed, both `build` issues (#105 shipped as PR #106, #97 closed as superseded) were already closed, which is why that file carries rationale per id rather than bare ids.
+
+Verifying exactly one supervisor is running (the churn that started #107):
+
+**Trust the lock, not `ps`.** A `grep -c` over `ps` output counts any shell whose command line mentions the supervisor — including the `nohup … &` wrapper that launched it, which stayed alive next to a healthy instance and reported "2" while exactly one supervisor existed:
+
+```bash
+cat fleet/data/routes.json.lock                                    # authoritative: the pid holding it
+ps -p "$(cat fleet/data/routes.json.lock)" -o pid,lstart,command    # that process, in full
+pgrep -fl "node .*fleet/supervisor.ts run"                          # node processes only, no wrappers
 ```
 
 A second supervisor now refuses to start and names the live pid rather than rewriting the shared routes file; if the lock is stale after a crash it is reclaimed automatically, and if it is unparsable the new process refuses until a human looks at it.
