@@ -17,6 +17,7 @@ import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope 
 import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { RefusalBudget, terminalRefusalPayload, type RefusalSignal } from "./refusal-budget.ts";
+import { buildPrReport, classifyPush, type PrReportFacts } from "./pr-report.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -33,6 +34,28 @@ async function diffStat(ws: string, branch: string): Promise<string> {
   } catch {
     return "(diff stat unavailable)";
   }
+}
+
+export interface OpenPrInfo {
+  number: number;
+  /** Empty string only when the host API gave no url; kept required so callers never pass undefined onward. */
+  url: string;
+  isDraft?: boolean;
+  headRefOid?: string | null;
+}
+
+/** The open PR for this branch, if any — and crucially its current head sha, which is how "did this
+ *  run change anything" gets answered from host state instead of from what the model reports (#96). */
+async function ghFindOpenPr(repo: string, branch: string, env: NodeJS.ProcessEnv): Promise<OpenPrInfo | null> {
+  const out = await sh("gh", ["pr", "list", "--repo", repo, "--state", "open", "--head", branch, "--json", "number,url,isDraft,headRefOid"], { env });
+  const list = JSON.parse(out || "[]");
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const first = list[0] as Partial<OpenPrInfo>;
+  return { number: Number(first.number), url: String(first.url ?? ""), isDraft: first.isDraft, headRefOid: first.headRefOid ?? null };
+}
+
+async function ghPostPrComment(repo: string, prNumber: number, body: string, env: NodeJS.ProcessEnv): Promise<void> {
+  await sh("gh", ["api", `repos/${repo}/issues/${prNumber}/comments`, "-f", `body=${body}`], { env });
 }
 
 /** Latest delegate tool result in the orchestrator transcript = the worker's final
@@ -155,9 +178,19 @@ export interface OpenDraftPrOptions {
    * command or reviewer inference.
    */
   refusalBudget?: RefusalBudget;
+  /**
+   * PR-comment reporting hooks (#96). Injectable so the reply path is testable without GitHub; the
+   * defaults shell out to `gh` with this run's credential.
+   */
+  findOpenPr?: (branch: string, env: NodeJS.ProcessEnv) => Promise<OpenPrInfo | null>;
+  postPrComment?: (prNumber: number, body: string, env: NodeJS.ProcessEnv) => Promise<void>;
+  /** Where a failed report goes. Reporting is best-effort: it must never fail a run (#96). */
+  reportLog?: (message: string) => void;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget() }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m) }: OpenDraftPrOptions) {
+  const findPr = findOpenPr ?? ((branch: string, env: NodeJS.ProcessEnv) => ghFindOpenPr(fixturesRepo, branch, env));
+  const postComment = postPrComment ?? ((prNumber: number, body: string, env: NodeJS.ProcessEnv) => ghPostPrComment(fixturesRepo, prNumber, body, env));
   const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
   return defineTool({
     name: "open_draft_pr",
@@ -183,23 +216,42 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
        * tool returns goes through here, so `retryable` is never a thing the orchestrator has to infer
        * from prose (R11: the refusal text reached the model in full, six times, and changed nothing).
        */
-      const charged = (signal: RefusalSignal, base: Record<string, unknown>) => {
+      const charged = (signal: RefusalSignal, base: Record<string, unknown>): { text: string; rec: ReturnType<RefusalBudget["note"]> } => {
         const rec = refusalBudget.note(issueNumber, signal);
         const verdict: Record<string, unknown> = { ...base, retryable: rec.retryable, attempts: rec.total, identicalAttempts: rec.count };
         if (rec.terminal) {
-          return JSON.stringify({
-            ...verdict,
-            terminal: true,
-            runStopped: true,
-            stopReason: rec.stopReason,
-            hint: terminalRefusalPayload(rec).hint,
-          });
+          return { text: JSON.stringify({ ...verdict, terminal: true, runStopped: true, stopReason: rec.stopReason, hint: terminalRefusalPayload(rec).hint }), rec };
         }
-        return JSON.stringify(verdict);
+        return { text: JSON.stringify(verdict), rec };
       };
       // Resolved here (once per tool call) and reused for the PR calls below; an App token minted
       // for this run cannot expire inside it.
       const env = await gitAuthEnv(auth);
+
+      // Is there already an open PR for this branch? Read once, early: it decides whether a report is
+      // owed (#96), supplies the previous head sha for no-op detection, and is reused below instead of
+      // being queried twice. Best-effort — an unreadable PR list must not block a push.
+      let existingPr: OpenPrInfo | null = null;
+      try {
+        existingPr = await findPr(branch, env);
+      } catch {
+        existingPr = null;
+      }
+      /**
+       * Tell the humans on the PR what happened (or why nothing did). Only when a PR already exists:
+       * a first draft PR carries the evidence pack in its body, and pre-dispatch refusals post nothing
+       * at all — see factory/pr-report.ts for why that boundary is where it is.
+       */
+      const report = async (facts: Omit<PrReportFacts, "prNumber" | "branch" | "issueNumber">) => {
+        if (!existingPr?.number) return;
+        try {
+          // `summary` comes from the tool arguments so every report quotes what the run set out to do;
+          // an explicit facts.summary still wins.
+          await postComment(existingPr.number, buildPrReport({ prNumber: existingPr.number, branch, issueNumber, summary, ...facts }), env);
+        } catch (e) {
+          reportLog(`open_draft_pr: could not post the PR report for #${issueNumber}: ${(e as Error).message.split("\n")[0]}`);
+        }
+      };
 
       // Verify the worker actually committed on the branch (cheap; before
       // spending minutes on a review of nothing).
@@ -238,23 +290,26 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       }
       const scope = checkPathScope(changedFiles, pathScope);
       if (!scope.ok) {
-        return {
-          output: [{
-            type: "text" as const,
-            text: charged(
-              { class: "path_scope", offenders: scope.offenders, reason: "path scope violation" },
-              {
-                refused: true,
-                reason: "path scope violation — nothing was pushed or reviewed",
-                offenders: scope.offenders,
-                detail: formatScopeFailure(scope),
-                // retryable:false is the point (#100): policy is read at process start and lives in a
-                // file this run cannot write, so re-delegating the same task cannot change the answer.
-                hint: "This repo's pathAllowlist will not change during this run. Either produce the change without touching the offending paths (if the task truly requires them, it is not satisfiable here — say so), or have a human change pathAllowlist in factory/repo-registry.json and restart the factory.",
-              },
-            ),
-          }],
-        };
+        const { text, rec } = charged(
+          { class: "path_scope", offenders: scope.offenders, reason: "path scope violation" },
+          {
+            refused: true,
+            reason: "path scope violation — nothing was pushed or reviewed",
+            offenders: scope.offenders,
+            detail: formatScopeFailure(scope),
+            // retryable:false is the point (#100): policy is read at process start and lives in a
+            // file this run cannot write, so re-delegating the same task cannot change the answer.
+            hint: "This repo's pathAllowlist will not change during this run. Either produce the change without touching the offending paths (if the task truly requires them, it is not satisfiable here — say so), or have a human change pathAllowlist in factory/repo-registry.json and restart the factory.",
+          },
+        );
+        await report({
+          outcome: "refused",
+          previousHead: existingPr?.headRefOid ?? null,
+          newHead: null,
+          refusalReason: `path scope violation — refused files: ${scope.offenders.map((o) => `\`${o.file}\``).join(", ")}`,
+          runStopped: rec.terminal,
+        });
+        return { output: [{ type: "text" as const, text }] };
       }
 
       // Verification gate (#61, decision C1): run the repo's test command and refuse to push on a
@@ -265,20 +320,24 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       const tests = await verifyWorkspace({ cwd: ws, testCommand });
       const gate = verificationGate(tests, { requireVerification });
       if (gate.action === "refuse") {
-        return {
-          output: [{
-            type: "text" as const,
-            text: charged(
-              { class: "verification", reason: gate.reason },
-              {
-                refused: true,
-                reason: gate.reason,
-                verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, timedOut: tests.timedOut, tail: tests.tail },
-                hint: "Re-delegate the worker with the failing output named, then call open_draft_pr again. Nothing was pushed and no PR exists. Note that an identical red run twice means nothing changed between attempts — the budget stops the run at that point.",
-              },
-            ),
-          }],
-        };
+        const { text, rec } = charged(
+          { class: "verification", reason: gate.reason },
+          {
+            refused: true,
+            reason: gate.reason,
+            verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, timedOut: tests.timedOut, tail: tests.tail },
+            hint: "Re-delegate the worker with the failing output named, then call open_draft_pr again. Nothing was pushed and no PR exists. Note that an identical red run twice means nothing changed between attempts — the budget stops the run at that point.",
+          },
+        );
+        await report({
+          outcome: "refused",
+          previousHead: existingPr?.headRefOid ?? null,
+          newHead: null,
+          refusalReason: gate.reason,
+          verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, passed: tests.passed },
+          runStopped: rec.terminal,
+        });
+        return { output: [{ type: "text" as const, text }] };
       }
 
       // Structural gate (not prompt-dependent): run an independent read-only
@@ -295,9 +354,16 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       const verdict = (outcome?.status === "completed" ? (outcome.result as ReviewVerdict) : null) ?? null;
       if (!verdict || verdict.verdict !== "pass") {
         const reviewReason = verdict ? (verdict.concerns ?? []).join(" | ") || verdict.verdict : "review did not settle";
-        return {
-          output: [{ type: "text" as const, text: charged({ class: "review", reason: reviewReason }, { refused: true, review: verdict ?? { error: "review did not settle" } }) }],
-        };
+        const { text, rec } = charged({ class: "review", reason: reviewReason }, { refused: true, review: verdict ?? { error: "review did not settle" } });
+        await report({
+          outcome: "refused",
+          previousHead: existingPr?.headRefOid ?? null,
+          newHead: null,
+          refusalReason: `independent review did not pass: ${reviewReason}`,
+          reviewVerdict: verdict?.verdict ?? "did not settle",
+          runStopped: rec.terminal,
+        });
+        return { output: [{ type: "text" as const, text }] };
       }
 
       const diffStatText = await diffStat(ws, branch);
@@ -305,16 +371,9 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       const body = buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification });
       await pushBranch(ws, branch, env);
 
-      // Idempotency: reuse an open PR for this head branch if one exists.
-      let prJson: { number: number; url: string; isDraft?: boolean } | null = null;
-      try {
-        const existing = await sh("gh", [
-          "pr", "list", "--repo", fixturesRepo, "--state", "open",
-          "--head", branch, "--json", "number,url,isDraft",
-        ], { env });
-        const list = JSON.parse(existing || "[]");
-        if (list.length > 0) prJson = list[0];
-      } catch { /* gh not authenticated or no PRs — fall through to create */ }
+      // Idempotency: reuse the open PR found at the top of this call (never a second query — two
+      // reads of a mutable pointer inside one run is how #47's drift class got introduced).
+      const prJson: OpenPrInfo | null = existingPr;
 
       let prUrl: string;
       if (prJson) {
@@ -328,6 +387,19 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
           "--head", branch, "--title", title, "--body", body,
         ], { env });
         prUrl = out.split("\n").pop()!.trim();
+      }
+
+      // The rework report (#96): a human who asked for something on the PR gets exactly one answer,
+      // including the case where the answer is "nothing changed" — previously invisible.
+      if (prJson) {
+        await report({
+          outcome: classifyPush(prJson.headRefOid ?? null, head),
+          previousHead: prJson.headRefOid ?? null,
+          newHead: head,
+          summary,
+          verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, passed: tests.passed },
+          reviewVerdict: verdict.verdict,
+        });
       }
 
       return {

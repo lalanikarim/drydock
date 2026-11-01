@@ -267,6 +267,9 @@ node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --si
 
 # re-drive named deliveries only (preferred once the window holds real work)
 node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --only 3851475922366504960 --apply
+
+# leave a breadcrumb `supervisor status` can read (this is what the scheduled job does)
+node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --state-file fleet/data/last-sweep.json
 ```
 
 What the output means:
@@ -277,6 +280,31 @@ What the output means:
 - **Delivery ids are 19 digits.** They exceed `Number.MAX_SAFE_INTEGER`, so anything that parses the delivery log with plain `JSON.parse` rounds them and then addresses a record that does not exist. The tool quotes oversized ids before parsing (`safeParse`) for exactly that reason; don't reimplement it with `jq -r .id` piped through a JS number either.
 
 First run against this deployment, 2026-11-01: **72 delivery records inspected, 34 not delivered since 2026-10-31** — 18 connection failures (funnel down), 5×`503`, 4×`502`, 4 connect failures, 3×`403` (the secret-mismatch window). Every one of those was an event the factory never saw, and nothing in any log said so. Treat that number as a baseline to drive toward zero, not as reassuring history.
+
+### Scheduling it (#110)
+
+The decision #110 was waiting on, made: **launchd, not cron**. A laptop sleeps, and `cron` skips the jobs it would have run during sleep without ever catching up — which is precisely the window in which webhook deliveries fail. `StartInterval` resumes on wake, and `KeepAlive=false` keeps each run a short-lived process instead of another daemon to supervise.
+
+```bash
+cp fleet/launchd/com.drydock.redeliver.plist.example ~/Library/LaunchAgents/com.drydock.redeliver.plist
+# edit the __PLACEHOLDER__s: user paths, hook id, interval (default 900s = 15 min)
+launchctl load ~/Library/LaunchAgents/com.drydock.redeliver.plist
+launchctl start com.drydock.redeliver    # run once, now
+tail -f ~/Library/Logs/drydock-redeliver.log
+```
+
+The template is deliberately **report-only** — no `--apply`. A job that acts on a schedule can resurrect work for an issue closed hours ago, so detection is automated and recovery stays a human call with `--only`. It exits 1 when it finds something, which shows up in the log as a line you can grep.
+
+Then check freshness without remembering the tool exists:
+
+```bash
+node --experimental-strip-types fleet/supervisor.ts status fleet/fleet.local.json
+# …
+# failed-delivery sweep: 12 min ago (dry-run) — inspected 74, undelivered 0, queued 0
+# failed-delivery sweep: NEVER RECORDED — run fleet/redeliver-failed.mjs with --state-file …/last-sweep.json
+```
+
+`⚠ older than 1h` marks a stale sweep. "Never recorded" is printed as loudly as the others on purpose: before this, an unrun recovery tool and a healthy system looked identical.
 
 Verifying exactly one supervisor is running (the churn that started #107):
 

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Failed-delivery sweep as a launchd job (#110). TEMPLATE — copy it, fill in every
+  __PLACEHOLDER__, and install:
+
+    cp fleet/launchd/com.drydock.redeliver.plist.example \
+       ~/Library/LaunchAgents/com.drydock.redeliver.plist
+    # edit: repo, hook id, paths, interval
+    launchctl load ~/Library/LaunchAgents/com.drydock.redeliver.plist
+    launchctl start com.drydock.redeliver          # run once, now
+    tail -f /Users/__USER__/Library/Logs/drydock-redeliver.log
+    launchctl unload ~/Library/LaunchAgents/com.drydock.redeliver.plist   # stop
+
+  Why launchd and not cron (the decision #110 was waiting on): a laptop sleeps. `cron` skips the jobs it
+  would have run during sleep and never catches up, which is precisely the window in which webhook
+  deliveries fail. launchd's StartInterval timer resumes when the machine wakes, and KeepAlive=false
+  means each interval is one short-lived process rather than a daemon to supervise.
+
+  Two properties chosen on purpose:
+
+  * **Report-only.** No --apply. A scheduled sweep that acts can resurrect work for an issue closed hours
+    ago; recovery stays a human decision made with `--only <id>`. The job's value is detection.
+  * **Exit code 1 when it finds something.** launchd does not care, but the log line does: grep the log
+    for "not delivered" and you get an honest history of every window in which events were being lost.
+
+  The token comes from the environment launchd gives the job; on this machine `gh auth token` is the
+  resolution path (see resolveToken in fleet/redeliver-failed.mjs), so no secret is stored in the plist.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.drydock.redeliver</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/__USER__/Projects/drydock/fleet/redeliver-failed.mjs</string>
+    <string>--repo</string>
+    <string>lalanikarim/drydock</string>
+    <string>--hook</string>
+    <string>__HOOK_ID__</string>
+    <string>--state-file</string>
+    <string>/Users/__USER__/Projects/drydock/fleet/data/last-sweep.json</string>
+  </array>
+
+  <!-- 900s = 15 minutes. Each run is one authenticated API call per page of delivery history; the
+       window of silent loss grows with the interval, so this is a cost/detection trade, not a default
+       to leave at an hour. -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <!-- Fire immediately on load so the first state file appears without waiting 15 minutes. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/__USER__/Projects/drydock</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/__USER__/Library/Logs/drydock-redeliver.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/__USER__/Library/Logs/drydock-redeliver.log</string>
+
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
