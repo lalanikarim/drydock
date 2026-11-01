@@ -51,7 +51,7 @@ test("protectedPaths extend, never shrink, the unconditional set", () => {
 });
 
 test("registry path-scope fields are validated, not coerced", () => {
-  const base = { repo: "octo/thing", configFile: "factory/config/x.json" };
+  const base = { repo: "octo/thing" };
   // An empty allowlist would silently forbid every change — that has to be a loud mistake.
   assert.throws(() => validateRegistry({ repos: [{ ...base, pathAllowlist: [] }] }), /must not be an empty array/);
   assert.throws(() => validateRegistry({ repos: [{ ...base, pathAllowlist: ["/etc/passwd"] }] }), /repo-relative without traversal/);

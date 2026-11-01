@@ -293,11 +293,11 @@ node --experimental-strip-types gates/g2-worker-quality.mjs --regression        
 
 | File | Holds | Checked in? | Failure mode if wrong |
 |---|---|---|---|
-| `factory/config/<owner>_<repo>.json` | per-repo **runtime** config: model provider, `testCommand`, `setupCommand`, sandbox image, budgets | yes | a run fails or uses the wrong model |
+| `factory/config/<owner>_<repo>.json` | per-repo **runtime** config: model provider, `testCommand`, `setupCommand`, sandbox image, budgets | ~~yes~~ → **no**, superseded by §5.28 | a run fails or uses the wrong model |
 | `fleet/fleet.example.json` (per deployment) | **deployment**: one entry per running factory + its webhook secret + instance token; supervisor rewrites the derived routes file | no (secrets) | nothing starts |
 | `factory/repo-registry.json` | **policy**: which repos are managed, `eligibilityLabel`, `autoMerge`, `oracleBoot` | yes | something gets merged that should not have been |
 
-Separating policy from deployment is the point: the registry contains no secrets, so it can be reviewed like code, and "is anything else auto-merging?" is a one-screen question instead of a grep across per-repo files. Two rules make it fail closed (`test/repo-registry.test.mjs`, 12 checks): a **disabled entry may not declare `autoMerge=true`** (a leftover grant on a repo someone disabled is a surprise for whoever re-enables it), and an **enabled entry requires `configFile`**, whose existence is checked at load. Unknown fields are rejected — `{automerge: true}` must not silently mean "not set".
+Separating policy from deployment is the point: the registry contains no secrets, so it can be reviewed like code, and "is anything else auto-merging?" is a one-screen question instead of a grep across per-repo files. Two rules make it fail closed (`test/repo-registry.test.mjs`, 12 checks): a **disabled entry may not declare `autoMerge=true`** (a leftover grant on a repo someone disabled is a surprise for whoever re-enables it), and an **enabled entry requires runtime config** — then by a `configFile` pointer checked at load, now by naming convention in `$DRYDOCK_CONFIG_DIR` (§5.28). Unknown fields are rejected — `{automerge: true}` must not silently mean "not set".
 
 **Oracles are now per-repo.** Each probe exports `repo`, and each registry entry declares `oracleBoot` with explicit port discovery, because the two fixtures genuinely differ: fixture-1 binds port 0 and logs `127.0.0.1:<bound>`, while fixture-2 reads `PORT` and logs **the requested value** — meaningless when we ask for 0. So `portFrom` is either `"stdout"` (parse the log) or `"env"` (we reserve a free port, export it, and wait for the socket to accept). A probe whose `repo` does not match the repo being judged is refused rather than run: an invoice oracle against the jobs service would judge nothing, and might accidentally "pass".
 
@@ -857,3 +857,22 @@ whose remaining sub-item is exactly this class of shutdown defect.
 - **One channel, one chat.** Deliberate: multi-recipient routing is a policy question this repo has no
   requirement for yet, and `Notifier` is one function so a second transport is additive.
 - **Notifications are not a control.** They announce outcomes; nothing about them gates or authorises anything.
+
+### 5.28 Runtime config moves out of the source tree (2026-11-02)
+
+`factory/config/<owner>_<repo>.json` is gone. Per-repo runtime config — `testCommand`, `setupCommand`, model pin, sandbox image, budgets — now lives at **`$DRYDOCK_CONFIG_DIR/<owner>_<repo>.json`**, default `~/.drydock/configs/`. The registry keeps every policy field and loses exactly one: `configFile`.
+
+**Why (a path-scope hole, not tidiness).** §5.27's notification work surfaced this while checking whether the factory could be its own subject. It can, and worse than "it would be noisy": `testCommand` is executed to decide whether a branch may be pushed, and while that value lived at `factory/config/…` it sat inside drydock's own allowlist (`factory/`). A self-run could open a draft PR that changed the command used to verify itself. Not hypothetical — the factory opened PR #120 from exactly such an issue, and its brief proposed editing `fleet/enable-self-work.md`, which is also in scope.
+
+The threat in one line: *the file that says how a repo is verified was inside the set of files a run is allowed to change.* The path allowlist is the boundary that makes "draft PR, human merges" sufficient; a run editing its own grader crosses it while still obeying every gate — and the draft-PR control only holds if what it proposes is what was tested.
+
+**Design choices:**
+
+- **Convention replaces the pointer.** `<owner>_<repo>.json` in one directory (`configSlug`), so policy cannot point anywhere else. The old key is rejected with a migration message naming the new location — an anonymous `unknown registry field` would send someone into git history.
+- **Policy load and deployment readiness are separate calls.** `loadRegistry()` validates anywhere (CI, fresh clone); `missingRuntimeConfigs()` answers "does this machine have what the enabled entries need" and is called by the supervisor **before** it takes the lock or writes routes — one message naming every path, rather than children that boot, die, and respawn behind live routes.
+- **`--config` still wins**, then `$DRYDOCK_CONFIG_DIR`, then the default. A registry-supplied name must stay inside that directory (absolute paths and `..` refused).
+- **`_comment`/`_notes` are the only inert keys.** A file outside the repository has no diff to explain it, so configs explain themselves — but a blanket "leading underscore is ignored" would let `_testCommand` sit there doing nothing, which is precisely the R6 bug (`Boolean("false")`-class: *I set it and it did nothing*). Both are tested.
+
+**What this does not change.** Human merge stays the real control; `instancesRoot`, worktrees, logs and the Engram store remain deployment state under `factory-instances/`. §5.27's "one bot, one registry" fix is untouched — this closes the *config* half of that exposure, the notification half was already shipped.
+
+**Evidence.** `test/config-location.test.mjs` (new): asserts nothing named `<owner>_<repo>.json` exists under `factory/`, that the default dir is outside the checkout, that resolution never returns a path inside it, and that the three entrypoints import the shared resolver instead of naming the old location. Suite: **329 pass / 0 fail**. Live negative test: starting the supervisor with an empty `DRYDOCK_CONFIG_DIR` refuses before spawning anything; with the real dir both instances boot and `/health` answers (§ runbook).

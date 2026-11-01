@@ -54,7 +54,6 @@ test("the orchestrator is told about refine_issue exactly when it exists", () =>
 
 const regEntry = (over = {}) => ({
   repo: "octo/repo",
-  configFile: "factory/config/x.json",
   oracleBoot: { command: "node", args: ["s.js", "0"], portFrom: "env", envPortVar: "PORT" },
   ...over,
 });

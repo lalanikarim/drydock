@@ -12,8 +12,9 @@
 // {
 //   "adapter":  { "port": 9700, "routesFile": "data/routes.json", "logPath": "data/intake-adapter.jsonl" },
 //   "factories": [
-//     { "repo": "owner/name", "config": "factory/config/owner-name.json",
+//     { "repo": "owner/name", "config": "$DRYDOCK_CONFIG_DIR/owner_name.json",
 //       "instancesRoot": "factory-instances", "token": "<32-hex>" }
+//   "config" is optional: omitting it resolves the conventional path in the config dir, outside this repo.
 //   ]
 // }
 //
@@ -33,9 +34,10 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
-import { loadRegistry, requireEnabledRepo } from "../factory/repo-registry.ts";
+import { loadRegistry, missingRuntimeConfigs, requireEnabledRepo } from "../factory/repo-registry.ts";
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 import { readSweepState } from "./redeliver-failed.mjs";
+import { defaultConfigPathFor } from "../factory/factory-config.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -176,6 +178,18 @@ function rel(fleetPath: string, p: string): string {
 async function runFleet(fleetPath: string): Promise<void> {
   const fleet = loadFleet(fleetPath);
 
+  // Pre-flight (#127-era config-out-of-tree): every repo in this fleet needs runtime config in
+  // $DRYDOCK_CONFIG_DIR. Checked before the lock and before any route is written, so a fresh machine gets one
+  // message naming every path it must create — instead of children that boot, fail, and respawn on a
+  // five-second loop while routes point at ports that die.
+  const missingCfgs = missingRuntimeConfigs(loadRegistry(), { repos: fleet.factories.map((f) => f.repo) });
+  if (missingCfgs.length > 0) {
+    console.error(`[supervisor] missing runtime config for ${missingCfgs.length} repo(s) in this fleet:`);
+    for (const m of missingCfgs) console.error(`[supervisor]   ${m.repo} → ${m.path}`);
+    console.error("[supervisor] copy factory/config.example.json to each path and set models + testCommand; nothing was started.");
+    process.exit(1);
+  }
+
   // Single-instance guard (#107), taken BEFORE the routes file is written. Two supervisors are not two
   // factories: each mints its own per-route instance token and rewrites the shared routes file, so they
   // take turns invalidating each other's adapter, and every delivery refused during that window is gone
@@ -221,7 +235,10 @@ async function runFleet(fleetPath: string): Promise<void> {
       shuttingDown = true;
       return;
     }
-    const configPath = f.config ? rel(fleetPath, f.config) : join(REPO_ROOT, "factory", "config", `${f.repo.replace("/", "_")}.json`);
+    // Omitting "config" in the fleet file is now the normal case: the instance resolves the conventional
+    // path itself ($DRYDOCK_CONFIG_DIR/<owner>_<repo>.json). Explicit paths remain for a deployment that
+    // keeps config somewhere unusual — but never inside the source tree, which is what this change removed.
+    const configPath = f.config ? rel(fleetPath, f.config) : defaultConfigPathFor(f.repo);
     const token = f.token ?? randomBytes(16).toString("hex");
     const env: NodeJS.ProcessEnv = {
       ...process.env,

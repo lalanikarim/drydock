@@ -1,0 +1,14 @@
+{
+  "_comment": "TEMPLATE ONLY — never loaded. Copy to $DRYDOCK_CONFIG_DIR/<owner>_<repo>.json (default ~/.drydock/configs) and edit. Runtime config lives outside this repository on purpose: testCommand is executed to decide whether a branch may be pushed, and while it lived under factory/ it was inside drydock's own path allowlist. Fields: repo must equal the registry entry; modelId may be \"auto\"; commands run as argv and shell metacharacters are rejected.",
+  "repo": "owner/name",
+  "models": {
+    "provider": "example-provider",
+    "modelId": "example-org/example-model"
+  },
+  "testCommand": "node --test",
+  "setupCommand": "npm ci",
+  "budgets": {
+    "wallSecsPerIssue": 2400,
+    "maxReviewRetries": 2
+  }
+}

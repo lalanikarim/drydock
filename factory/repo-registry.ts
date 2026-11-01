@@ -9,18 +9,24 @@
 // Three config artifacts exist and they are deliberately separate, because their failure modes and
 // secrecy differ:
 //
-//   factory/config/<owner>_<repo>.json  per-repo RUNTIME config (model, test command, sandbox image)
+//   $DRYDOCK_CONFIG_DIR/<owner>_<repo>.json  per-repo RUNTIME config (model, test command, sandbox image).
+//                                    OUTSIDE this repository and outside any path scope — see
+//                                    factory/factory-config.ts for why. Resolved by naming convention,
+//                                    which is why registry entries no longer carry a configFile path.
 //   fleet/fleet.example.json            per-DEPLOYMENT supervision file: one entry per running
 //                                       factory plus its webhook secret and instance token. Contains
 //                                       secrets, is environment-specific, and is not checked in.
 //   factory/repo-registry.json (here)   POLICY: what we allow, independent of what happens to be
 //                                       running. No secrets, so it can be reviewed like code.
 //
-// The registry points at the runtime file via configFile rather than absorbing it, so "what is in
-// the fleet" stays answerable without globbing. It does NOT yet generate the supervisor's file —
-// which means nothing today prevents a deployment from running a factory the policy marks disabled.
-// That gap is called out here rather than left implicit; closing it means deriving routes from this
-// registry and refusing to start an entry that is not enabled.
+// The registry lists repos, not paths: the runtime file for `owner/name` is `<owner>_<name>.json` in the
+// config dir. A pointer field here used to say where the runtime config lived, which meant two things could
+// disagree about it (the registry and whoever spawned the instance) and both be defensible. "What is in the
+// fleet" stays answerable without globbing because the name is derived from this list.
+//
+// It does NOT yet generate the supervisor's file — which means nothing today prevents a deployment from
+// running a factory the policy marks disabled. That gap is called out here rather than left implicit;
+// closing it means deriving routes from this registry and refusing to start an entry that is not enabled.
 //
 // Why autoMerge is here rather than in the per-repo config: it is the one setting whose failure
 // mode is destroying something irreplaceable. Fixtures are disposable; drydock holds the research
@@ -34,6 +40,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PathScope } from "./path-scope.ts";
+import { CONFIG_DIR_ENV, configDir, configSlug } from "./factory-config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_REGISTRY_PATH = join(HERE, "repo-registry.json");
@@ -86,9 +93,8 @@ export interface RepoEntry {
   refine: boolean;
   /** Label that requests refinement. Must differ from eligibilityLabel (enforced at load). */
   refineLabel: string;
-  /** Path to the per-repo factory config, relative to the drydock repo root. Null only for a
-   * disabled entry (enabling a repo without runtime config is a validation error). */
-  configFile: string | null;
+  /** Human-facing note carried alongside the entry; never read for enforcement. */
+  note?: string;
   oracleBoot: OracleBoot | null;
   /**
    * Prefixes a pipeline run may change; null = any non-protected path. See factory/path-scope.ts.
@@ -209,7 +215,16 @@ export function validateRegistry(raw: unknown): Registry {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`registry.repos[${i}] must be an object`);
     const r = entry as Record<string, unknown>;
     for (const key of Object.keys(r)) {
-      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "note"].includes(key)) {
+      if (key === "configFile") {
+        // Named rather than left as "unknown field": this is a schema change every existing checkout hits,
+        // and a message that says what replaced it is shorter than the debugging session that doesn't.
+        // Uses the array index, not `repo` — that binding is initialized after this loop runs.
+        throw new Error(
+          `registry.repos[${i}]: configFile was removed. Runtime config is resolved by convention at ` +
+            `$${CONFIG_DIR_ENV}/<owner>_<repo>.json (default ~/.drydock/configs) — move the file there and delete the key.`,
+        );
+      }
+      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "note"].includes(key)) {
         throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
@@ -225,15 +240,7 @@ export function validateRegistry(raw: unknown): Registry {
     // whoever re-enables it — make them state it again instead.
     if (!enabled && autoMerge) throw new Error(`${repo}: disabled registry entry must not declare autoMerge=true`);
 
-    let configFile: string | null = null;
-    if (r.configFile !== undefined && r.configFile !== null) {
-      if (typeof r.configFile !== "string" || !r.configFile.trim()) throw new Error(`${repo}: configFile must be a non-empty string or null`);
-      if (isAbsolute(r.configFile) || normalize(r.configFile).startsWith("..")) {
-        throw new Error(`${repo}: configFile must be a repo-relative path, got: ${r.configFile}`);
-      }
-      configFile = r.configFile;
-    }
-    if (enabled && !configFile) throw new Error(`${repo}: enabled registry entry requires configFile`);
+
 
     const eligibilityLabel = typeof r.eligibilityLabel === "string" && r.eligibilityLabel.trim()
       ? r.eligibilityLabel.trim()
@@ -258,7 +265,6 @@ export function validateRegistry(raw: unknown): Registry {
       enabled,
       autoMerge,
       eligibilityLabel,
-      configFile,
       oracleBoot: validateOracleBoot(r.oracleBoot, repo),
       pathAllowlist: validatePathList(r.pathAllowlist, `${repo}: pathAllowlist`, { allowNull: true }),
       protectedPaths: validatePathList(r.protectedPaths, `${repo}: protectedPaths`) ?? [],
@@ -273,7 +279,14 @@ export function validateRegistry(raw: unknown): Registry {
   return { defaults, repos };
 }
 
-/** Load and validate the registry, checking that each enabled entry's configFile exists. */
+/**
+ * Load and validate the registry — policy only. Whether this machine actually has runtime config for those
+ * repos is a deployment question and is answered by `missingRuntimeConfigs()`, not here.
+ *
+ * Why they are separate: reading policy works anywhere (CI, a fresh clone, a laptop mid-setup), and half the
+ * tooling that reads the registry — status, gates, this file's own tests — has no business failing because a
+ * config dir is absent. Starting a factory for such a repo is a different claim, and that one must fail loudly.
+ */
 export function loadRegistry(path: string = DEFAULT_REGISTRY_PATH): Registry {
   let raw: unknown;
   try {
@@ -281,14 +294,21 @@ export function loadRegistry(path: string = DEFAULT_REGISTRY_PATH): Registry {
   } catch (e) {
     throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}`);
   }
-  const registry = validateRegistry(raw);
-  const root = resolve(dirname(path), ".."); // repo-registry.json lives in <root>/factory/
-  for (const entry of registry.repos) {
-    if (entry.enabled && entry.configFile && !existsSync(join(root, entry.configFile))) {
-      throw new Error(`${entry.repo}: configFile ${entry.configFile} does not exist (resolved to ${join(root, entry.configFile)})`);
-    }
-  }
-  return registry;
+  return validateRegistry(raw);
+}
+
+/**
+ * Enabled registry entries with no runtime config in `dir` (default `$DRYDOCK_CONFIG_DIR`).
+ *
+ * Returns the paths it looked for rather than throwing, so a caller can report every missing file at once —
+ * "fix this one, then discover the next" is a poor way to bring a fleet up.
+ */
+export function missingRuntimeConfigs(registry: Registry, { dir = configDir(), repos }: { dir?: string; repos?: string[] } = {}): Array<{ repo: string; path: string }> {
+  const want = repos ? registry.repos.filter((r) => repos.includes(r.repo)) : registry.repos;
+  return want
+    .filter((r) => r.enabled)
+    .map((r) => ({ repo: r.repo, path: join(dir, `${configSlug(r.repo)}.json`) }))
+    .filter(({ path }) => !existsSync(path));
 }
 
 export function registryRepoNames(registry: Registry): string[] {

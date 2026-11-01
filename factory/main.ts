@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { instanceGatesConfig } from "./gate-policy.ts";
 // Both symbols come from the kernel's declared public surface (app/src/core.ts), not internal modules.
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
-import { loadFactoryConfig } from "./factory-config.ts";
+import { CONFIG_DIR_ENV, loadFactoryConfig, resolveFactoryConfigPath } from "./factory-config.ts";
 import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
@@ -96,7 +96,18 @@ async function main() {
   // removes merge_pr from the tool list entirely so honoring it is not something a caller can forget.
   const policy = requireEnabledRepo(loadRegistry(), repo);
 
-  const factoryCfg = loadFactoryConfig(configPath ?? join(__dirname, "config", `${repo.replace("/", "_")}.json`));
+  // Runtime config lives outside the repository (factory/factory-config.ts explains why: `testCommand` used to
+  // sit inside drydock's own path allowlist). Explicit --config wins; otherwise $DRYDOCK_CONFIG_DIR/
+  // <owner>_<repo>.json. Nothing resolves into the source tree.
+  const resolvedConfigPath = resolveFactoryConfigPath(repo, { explicit: configPath });
+  if (!existsSync(resolvedConfigPath)) {
+    console.error(
+      `[factory] no runtime config for ${repo} at ${resolvedConfigPath}. Copy factory/config.example.json there ` +
+        `(or pass --config <path>). Set ${CONFIG_DIR_ENV} to move the directory.`,
+    );
+    process.exit(1);
+  }
+  const factoryCfg = loadFactoryConfig(resolvedConfigPath);
   if (factoryCfg.repo !== repo) {
     console.error(`[factory] config at ${configPath} declares repo ${factoryCfg.repo}, but was started for ${repo}`);
     process.exit(1);
@@ -105,22 +116,24 @@ async function main() {
   // production leaves it unset (repo-root factory-instances/).
   const root = join(process.env.FACTORY_INSTANCES_ROOT ?? join(__dirname, "..", "factory-instances"), repo.replace("/", "_"));
   const dataDir = join(root, "engram-data");
-  const configDir = join(root, "config");
+  // The instance's OWN config dir under factory-instances/<repo>/ (gates.json, models.json) — not to be
+  // confused with $DRYDOCK_CONFIG_DIR, which holds the per-repo runtime config outside the repository.
+  const instanceConfigDir = join(root, "config");
   const workRoot = join(root, "work");
-  for (const d of [dataDir, configDir, workRoot]) mkdirSync(d, { recursive: true });
+  for (const d of [dataDir, instanceConfigDir, workRoot]) mkdirSync(d, { recursive: true });
 
   // Factory-owned gate policy (see factory/gate-policy.ts for why merge_pr is prompt-tiered
   // and bash declares containment:"sandbox"). Written verbatim from the shared object so the
   // boot test and production cannot drift.
-  const gatesPath = join(configDir, "gates.json");
+  const gatesPath = join(instanceConfigDir, "gates.json");
   writeFileSync(gatesPath, JSON.stringify(instanceGatesConfig(), null, 2));
 
   const image = factoryCfg.sandboxImage ?? process.env.FACTORY_SANDBOX_IMAGE ?? "factory-sandbox:latest";
-  // Per-instance declarative files (gates.json) are read from configDir —
+  // Per-instance declarative files (gates.json) are read from the instance config dir —
   // honored since engram #48 (current pin: kernel v0.2.0).
   const config = loadConfig({
     dataDir,
-    configDir,
+    configDir: instanceConfigDir,
     workRoot,
     sandbox: {
       image,
@@ -134,7 +147,7 @@ async function main() {
   // Optional per-repo model catalog override for the CORE's own default
   // (config/models.json); the factory pipeline uses the explicit ref from the
   // repo config.
-  const modelsPath = join(configDir, "models.json");
+  const modelsPath = join(instanceConfigDir, "models.json");
   const modelsConfig = existsSync(modelsPath) ? JSON.parse(readFileSync(modelsPath, "utf8")) : undefined;
 
   // Resolve the model ref here (not inline) so readiness can be gated on it below.

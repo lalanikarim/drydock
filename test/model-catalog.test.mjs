@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { catalogModelIds, isModelAvailable, unavailableModelError, defaultMismatchWarning } from "../factory/model-catalog.ts";
+import { configDir } from "../factory/factory-config.ts";
 
 const PINNED = "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF";
 const ref = { provider: "aurora", modelId: PINNED };
@@ -50,13 +51,25 @@ test("the failure message names both sides and the file that decides", () => {
   assert.match(msg, /models\.json/, "points at the file whose provider entry wins");
 });
 
-test("every repo config pins an explicit model id — no \"auto\"", () => {
+test("every repo config pins an explicit model id — no \"auto\"", (t) => {
   // Measurement baselines (81–145K vs 119–220K tokens) are model-specific; a factory that silently
   // follows whatever the inference box happens to have loaded cannot produce comparable numbers, and
   // coupling "loaded" to "catalogued" is what broke runs on 2026-10-30.
-  const dir = join(import.meta.dirname, "..", "factory", "config");
-  const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-  assert.ok(files.length >= 3, `expected the three repo configs, saw: ${files.join(", ")}`);
+  // Runtime config is deployment-side now ($DRYDOCK_CONFIG_DIR, outside the tree), so this inspects whatever
+  // exists on this machine — and says so when there is nothing. "Checked zero files" reported as a pass is
+  // exactly the R10 failure mode (not collected looks identical to passing).
+  const dir = configDir();
+  let files;
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    t.skip(`no config dir at ${dir} — nothing pinned on this host`);
+    return;
+  }
+  if (files.length === 0) {
+    t.skip(`no runtime configs in ${dir} (deployment files; absent on a CI runner)`);
+    return;
+  }
   for (const f of files) {
     const cfg = JSON.parse(readFileSync(join(dir, f), "utf8"));
     if (!cfg.models) continue;
