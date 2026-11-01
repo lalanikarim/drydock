@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, readdirSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { main, readSweepState, sweepStatePayload, writeSweepState } = await import("../fleet/redeliver-failed.mjs");
+const { main, readSweepState, runCli, sweepStatePayload, writeSweepState } = await import("../fleet/redeliver-failed.mjs");
 
 test("payload is plain JSON with string ids and an ISO timestamp", () => {
   const p = sweepStatePayload({ repo: "o/r", hookId: 703101252, mode: "dry-run", inspected: 72, undelivered: 34, queued: 0 });
@@ -96,6 +96,30 @@ test("a clean sweep is recorded too — 'never ran' must differ from 'ran and wa
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The exit code is the whole point of scheduling this job, and it used to never leave main().
+test("runCli propagates the verdict as a process exit code", async () => {
+  const dirty = [{ id: 2, status: "timeout", response_code: null, event: "issues", delivered_at: "2026-11-01T00:01:00Z" }];
+  const clean = [{ id: 1, status: "OK", response_code: 200, event: "issues", delivered_at: "2026-11-01T00:00:00Z" }];
+
+  const codeOf = async (argv, rows) => {
+    let exited = null;
+    await runCli({ argv, env: { GH_TOKEN: "t" }, fetchImpl: fakeFetch(rows), log: () => {}, exit: (c) => { exited = c; } });
+    return exited;
+  };
+
+  assert.equal(await codeOf(baseArgs, dirty), 1, "findings must be visible to launchd/mail as a non-zero exit");
+  assert.equal(await codeOf(baseArgs, clean), 0, "a clean sweep is not an error");
+  assert.equal(await codeOf([], dirty), 2, "missing --repo/--hook is a usage error, not a silent success");
+});
+
+test("runCli turns a thrown listing failure into exit 2 rather than an unhandled rejection", async () => {
+  let exited = null;
+  const boom = async () => { throw new Error("connect ECONNREFUSED"); };
+  const result = await runCli({ argv: baseArgs, env: { GH_TOKEN: "t" }, fetchImpl: boom, log: () => {}, exit: (c) => { exited = c; } });
+  assert.equal(exited, 2);
+  assert.equal(result.code, 2);
 });
 
 test("no --state-file means no file is written (opt-in state, not ambient)", async () => {

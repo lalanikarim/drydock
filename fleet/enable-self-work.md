@@ -277,7 +277,7 @@ What the output means:
 - **A policy refusal is never listed.** Those answer 2xx, GitHub records them as `OK`, and re-driving them would replay something we rejected on purpose. The sweep only ever sees infrastructure failures (`timeout`, `failed to connect to host`, `Invalid HTTP Response: 50x`).
 - **`HTTP 202 queued` is not delivered.** Check again next run; the second run's report is the confirmation.
 - **Re-driving an already-consumed issue is safe.** Intake deduplicates on `requestId` (`issue-<n>`), so a redelivered `labeled` event for work that already ran does not start a second worker. Re-driving a `ping` or any non-eligible event is inert — it lands as `not an eligible event`.
-- **Delivery ids are 19 digits.** They exceed `Number.MAX_SAFE_INTEGER`, so anything that parses the delivery log with plain `JSON.parse` rounds them and then addresses a record that does not exist. The tool quotes oversized ids before parsing (`safeParse`) for exactly that reason; don't reimplement it with `jq -r .id` piped through a JS number either.
+- **Delivery ids are 19 digits, and jq cannot be trusted with them either.** They exceed `Number.MAX_SAFE_INTEGER`, so anything that parses the delivery log as JSON numbers rounds them and then addresses a record that does not exist. Not hypothetical — observed on this hook: `gh api … --jq '.[0].id'` prints `3851559675096989696` where the response's own digits are `3851559675096989700`, because jq parses numbers as float64 and `tostring` cannot undo it. The tool quotes oversized ids before parsing (`safeParse`) for exactly that reason; don't reimplement it with `jq -r .id`, `Number(id)`, or a column typed `int`.
 
 First run against this deployment, 2026-11-01: **72 delivery records inspected, 34 not delivered since 2026-10-31** — 18 connection failures (funnel down), 5×`503`, 4×`502`, 4 connect failures, 3×`403` (the secret-mismatch window). Every one of those was an event the factory never saw, and nothing in any log said so. Treat that number as a baseline to drive toward zero, not as reassuring history.
 
@@ -293,7 +293,7 @@ launchctl start com.drydock.redeliver    # run once, now
 tail -f ~/Library/Logs/drydock-redeliver.log
 ```
 
-The template is deliberately **report-only** — no `--apply`. A job that acts on a schedule can resurrect work for an issue closed hours ago, so detection is automated and recovery stays a human call with `--only`. It exits 1 when it finds something, which shows up in the log as a line you can grep.
+The template is deliberately **report-only** — no `--apply`. A job that acts on a schedule can resurrect work for an issue closed hours ago, so detection is automated and recovery stays a human call with `--only`. It **exits 1 when it finds something**, which is what makes the log greppable and mail useful. That claim was false for exactly one day: `main()` returned `{code: 1}` while the CLI wrapper exited only on a thrown error, so every invocation — including one that had just reported 35 undelivered events — left status 0. Fixed by `runCli()`, which maps the verdict onto `process.exit` (checks: findings→1, clean→0, usage→2, thrown listing→2). Lesson for any gate that trusts an exit code: confirm something actually sets it.
 
 Then check freshness without remembering the tool exists:
 
