@@ -132,7 +132,15 @@ for (; page <= 30; page += 1) {
 const truncated = page > 30;
 
 // Read probes against the repos the factory cares about — read-only, no side effects.
-const targets = ["lalanikarim/drydock", "lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2"];
+/**
+ * Probe every repository policy says is managed — read from `factory/repo-registry.json`, not frozen here.
+ *
+ * A hardcoded trio meant that onboarding a repo required editing this probe, and forgetting left it
+ * reporting the old world: "Managed repos" would list three while the registry named four, next to a
+ * policy comparison that DID read the registry. Two different answers in one report is how a probe stops
+ * being evidence. The trio stays as a floor so a registry read failure still probes what matters.
+ */
+const targets = [...new Set(["lalanikarim/drydock", "lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", ...managedRepoNames()])];
 const reads = {};
 for (const full of targets) {
   const issues = await gh(`/repos/${full}/issues?per_page=1`, { token: installToken, accept: "application.github+json" });
