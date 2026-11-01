@@ -16,6 +16,7 @@ import { defineTool, type Context, type ToolExecutionApi, type ToolTask } from "
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
 import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
+import { RefusalBudget, terminalRefusalPayload, type RefusalSignal } from "./refusal-budget.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -147,9 +148,16 @@ export interface OpenDraftPrOptions {
    * vendored kernel pin is a human decision and must not be changeable by omission.
    */
   pathScope?: PathScope;
+  /**
+   * Retry budget for refusals (#100). One instance per factory process, shared with the pipeline so
+   * the stop state is per-issue rather than per-tool-call. A path-scope refusal is terminal on its
+   * second identical occurrence; from then on this tool refuses immediately, before any clone, test
+   * command or reviewer inference.
+   */
+  refusalBudget?: RefusalBudget;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget() }: OpenDraftPrOptions) {
   const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
   return defineTool({
     name: "open_draft_pr",
@@ -162,8 +170,33 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
     }),
     replay: "unsafe", // external side effects (push + PR create); idempotent by head branch
     execute: async ({ issueNumber, title, summary }, api, ctx) => {
+      // Stopped runs are refused before anything expensive or side-effecting happens — no token
+      // mint, no clone recovery, no diff, no reviewer. This is the difference between "the prompt
+      // asked nicely" and a budget (#100: six full worker+review cycles on one impossible task).
+      if (refusalBudget.isStopped(issueNumber)) {
+        return { output: [{ type: "text" as const, text: JSON.stringify(terminalRefusalPayload(refusalBudget.stopRecord(issueNumber)!)) }] };
+      }
       const ws = join(workDir, `issue-${issueNumber}`);
       const branch = `agent/issue-${issueNumber}`;
+      /**
+       * Charge one refusal to the budget and merge the verdict into the payload. Every refusal this
+       * tool returns goes through here, so `retryable` is never a thing the orchestrator has to infer
+       * from prose (R11: the refusal text reached the model in full, six times, and changed nothing).
+       */
+      const charged = (signal: RefusalSignal, base: Record<string, unknown>) => {
+        const rec = refusalBudget.note(issueNumber, signal);
+        const verdict: Record<string, unknown> = { ...base, retryable: rec.retryable, attempts: rec.total, identicalAttempts: rec.count };
+        if (rec.terminal) {
+          return JSON.stringify({
+            ...verdict,
+            terminal: true,
+            runStopped: true,
+            stopReason: rec.stopReason,
+            hint: terminalRefusalPayload(rec).hint,
+          });
+        }
+        return JSON.stringify(verdict);
+      };
       // Resolved here (once per tool call) and reused for the PR calls below; an App token minted
       // for this run cannot expire inside it.
       const env = await gitAuthEnv(auth);
@@ -196,8 +229,11 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
         changedFiles = (await sh("git", ["-C", ws, "diff", "--name-only", `${base}..${branch}`])).split("\n").filter(Boolean);
       } catch (e) {
         // Fail closed: no diff basis means no scope verdict, and pushing unchecked is the unsafe option.
+        // Infrastructure, not policy: a missing merge base is usually a broken/stale workspace, and a
+        // retry may genuinely fix it. Charged to the ledger but never to the budget — a transient
+        // fault must not consume the attempts of the real task behind it.
         return {
-          output: [{ type: "text" as const, text: JSON.stringify({ refused: true, reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]}); refusing to push unchecked` }) }],
+          output: [{ type: "text" as const, text: charged({ class: "infrastructure", reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]})` }, { refused: true, reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]}); refusing to push unchecked`, counted: false }) }],
         };
       }
       const scope = checkPathScope(changedFiles, pathScope);
@@ -205,13 +241,18 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
         return {
           output: [{
             type: "text" as const,
-            text: JSON.stringify({
-              refused: true,
-              reason: "path scope violation — nothing was pushed or reviewed",
-              offenders: scope.offenders,
-              detail: formatScopeFailure(scope),
-              hint: "Re-delegate with the offending paths named as out of scope, or have a human change this repo's pathAllowlist in factory/repo-registry.json.",
-            }),
+            text: charged(
+              { class: "path_scope", offenders: scope.offenders, reason: "path scope violation" },
+              {
+                refused: true,
+                reason: "path scope violation — nothing was pushed or reviewed",
+                offenders: scope.offenders,
+                detail: formatScopeFailure(scope),
+                // retryable:false is the point (#100): policy is read at process start and lives in a
+                // file this run cannot write, so re-delegating the same task cannot change the answer.
+                hint: "This repo's pathAllowlist will not change during this run. Either produce the change without touching the offending paths (if the task truly requires them, it is not satisfiable here — say so), or have a human change pathAllowlist in factory/repo-registry.json and restart the factory.",
+              },
+            ),
           }],
         };
       }
@@ -227,12 +268,15 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
         return {
           output: [{
             type: "text" as const,
-            text: JSON.stringify({
-              refused: true,
-              reason: gate.reason,
-              verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, timedOut: tests.timedOut, tail: tests.tail },
-              hint: "Re-delegate the worker with the failing output named, then call open_draft_pr again. Nothing was pushed and no PR exists.",
-            }),
+            text: charged(
+              { class: "verification", reason: gate.reason },
+              {
+                refused: true,
+                reason: gate.reason,
+                verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, timedOut: tests.timedOut, tail: tests.tail },
+                hint: "Re-delegate the worker with the failing output named, then call open_draft_pr again. Nothing was pushed and no PR exists. Note that an identical red run twice means nothing changed between attempts — the budget stops the run at that point.",
+              },
+            ),
           }],
         };
       }
@@ -250,8 +294,9 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       const outcome = settled.state.outcome;
       const verdict = (outcome?.status === "completed" ? (outcome.result as ReviewVerdict) : null) ?? null;
       if (!verdict || verdict.verdict !== "pass") {
+        const reviewReason = verdict ? (verdict.concerns ?? []).join(" | ") || verdict.verdict : "review did not settle";
         return {
-          output: [{ type: "text" as const, text: JSON.stringify({ refused: true, review: verdict ?? { error: "review did not settle" } }) }],
+          output: [{ type: "text" as const, text: charged({ class: "review", reason: reviewReason }, { refused: true, review: verdict ?? { error: "review did not settle" } }) }],
         };
       }
 

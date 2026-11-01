@@ -19,6 +19,7 @@ import { factoryReviewerTask, makeReviewerRoleTools } from "./reviewer.ts";
 import { openDraftPrTool } from "./open-draft-pr.ts";
 import { mergePrTool, prStatusTool } from "./merge-gate.ts";
 import { noteLessonTool } from "./lessons.ts";
+import { RefusalBudget } from "./refusal-budget.ts";
 import type { PathScope } from "./path-scope.ts";
 import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
@@ -43,6 +44,7 @@ export function orchestratorInstructions({ autoMerge = true }: { autoMerge?: boo
     "2. If the worker reports it could not complete, or its report looks incomplete, re-delegate once with a note about what was missing.",
     '3. Call open_draft_pr with {"issueNumber": <n>, "title": "<concise title>", "summary": "<1-3 sentence summary>"} to push the branch and open a DRAFT PR. Before pushing it runs the repository test command and then an independent read-only review; either one failing means nothing was pushed or opened, and you get the findings back.',
     "4. If open_draft_pr refuses (verification exit code non-zero, or review failed): re-delegate the worker with the failing output or the reviewer's concerns included in your note (the stale-branch path), then call open_draft_pr again. Never try to talk your way past a refusal — you cannot: the gates live in the tool, not in this prompt.",
+    '4b. Read `retryable` on every refusal. When it is false (a path scope violation) the repository\'s policy cannot change during this run, so re-delegating the same task produces the identical refusal: instead report that the task is unsatisfiable under the current path scope and name the offending paths. If a refusal comes back with `terminal: true` / `runStopped: true`, stop working on that issue completely — further calls return the same terminal payload without doing any work — and say plainly that a human must either widen this repo\'s pathAllowlist or rewrite the issue.',
     '5. When open_draft_pr succeeds, it returns { prUrl, isDraft: true }. Summarize the PR for the user.',
     step6,
     step7,
@@ -84,6 +86,11 @@ export interface PipelineOptions {
    * PR body then discloses that nothing was verified. Read from the registry by factory/main.ts.
    */
   requireVerification?: boolean;
+  /**
+   * Retry budget for refusals (#100). Created by factory/main.ts so the same object can be reported
+   * on at boot and inspected after a run; one per factory process, keyed internally by issue.
+   */
+  refusalBudget?: RefusalBudget;
 }
 
 export function factoryPipeline(opts: PipelineOptions) {
@@ -93,6 +100,8 @@ export function factoryPipeline(opts: PipelineOptions) {
   // No token at all → fall back to environment resolution (the pre-B1-rev behavior); an explicit
   // empty string is not the same as "unset" here.
   const auth: GitAuth = opts.gitAuth ?? (opts.ghToken ? gitAuthFromToken(opts.ghToken) : createGitAuth());
+  // Shared across the extension: the stop state belongs to the issue, not to a tool instance.
+  const refusalBudget = opts.refusalBudget ?? new RefusalBudget();
   const image = opts.image ?? process.env.FACTORY_SANDBOX_IMAGE ?? "factory-sandbox:latest";
   const workerTaskDef = factoryWorkerTask({
     workDir: opts.workDir,
@@ -129,6 +138,7 @@ export function factoryPipeline(opts: PipelineOptions) {
         testCommand: opts.testCommand,
         requireVerification: opts.requireVerification,
         pathScope: opts.pathScope,
+        refusalBudget,
       }),
       // Read-only PR state, registered for every repo including autoMerge=false ones: merge_pr needs
       // the current head sha (#47 byte-scoped approval) and the orchestrator must be able to read it

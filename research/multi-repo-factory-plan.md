@@ -575,3 +575,30 @@ Plus two that only appear once you think about loops and envelopes: **bots are r
 **Honest limits.** The factory does not reply on the PR — the human reads the pushed diff and the run log, so feedback-loop visibility is still thin (open follow-up). And the delimiter sanitization added here covers the comment path; the older issue-body path has the same theoretical weakness and was left alone rather than changed under a different issue's cover.
 
 10 checks in `test/pr-feedback.test.mjs`, 6 in `test/route-dispatch.test.mjs`, 6 in `test/worker-rework.test.mjs` and 8 new intake assertions cover this, including the injection cases and "nothing reaches the instance when authorization fails".
+
+### 5.22 The refusal budget — a permanent refusal must cost one cycle, not six (2026-11-01, #100)
+
+**The incident.** Issue #99 was a README-only task whose honest completion required registering a test file in `package.json`. `package.json` is outside drydock's `pathAllowlist`, so `open_draft_pr` refused — the control working exactly as designed. The orchestrator re-delegated. **Six full worker+review cycles ran and every one ended in the identical refusal**, stopped only by a human reading the durable store.
+
+**Why "the model should have stopped" is not the finding.** The refusal text, including its `hint`, reached the root agent in full six times and changed nothing; the worker never saw it at all, so each attempt started with identical incentives. Three layers behaved correctly (scope gate, reviewer, verification) and the composition was an unbounded loop — recorded as R11.
+
+**What shipped** (`factory/refusal-budget.ts`, shared per factory process through `factoryPipeline`):
+
+| refusal class | retryable | counted toward the budget | why |
+|---|---|---|---|
+| `path_scope` | **false** | yes | policy is read at process start and lives in a file the run cannot write — it cannot change mid-run |
+| `verification` | true | yes | a red suite is fixable; an *identical* red suite twice proves nothing changed |
+| `review` | true | yes | same reasoning, keyed on the reviewer's concerns |
+| `infrastructure` | true | **no** | a workspace that cannot compute a merge base is a fault, and charging it would spend the budget of the real task behind it |
+
+Two ceilings, because one is gameable: **2 identical refusals** (same signature) or **4 counted refusals total** per issue stops the run. The total cap exists specifically so a worker varying its offender set — `package.json`, then `.npmrc`, then `tsconfig.json` — cannot dodge the identical-signature rule, which is exactly what a retry loop with only one counter invites.
+
+**Enforcement, not advice.** Once stopped, `open_draft_pr` refuses at the top of `execute()`: no token mint, no clone, no diff, no test command, no reviewer. The integration check proves it by deleting the workspace out from under a stopped run and asserting the terminal payload arrives anyway — without the short-circuit that call returns "no local branch … and no remote branch to recover" and would have gone hunting origin again. Counts freeze after a stop, so a caller that ignores `terminal: true` cannot inflate its own record.
+
+**Every refusal now carries the classification in the payload** (`retryable`, `attempts`, `identicalAttempts`, and on the stop path `terminal`/`runStopped`/`stopReason` plus a hint naming the human way out), and the orchestrator prompt gained step 4b: read `retryable`; when it is false, report unsatisfiability instead of re-delegating; when `terminal`/`runStopped`, stop touching that issue. The run-level surface #100 asked for exists too — terminal events log as they happen, and the instance prints a refusal ledger at shutdown (counts by class plus which runs were stopped), because "how many refusals did this instance absorb" previously required SQL.
+
+**Two defects the tests caught, both in the same family as R6:** the first draft keyed identical-signature counts **globally**, so one issue's failures could stop a different issue's run; and an infrastructure record omitted `terminal` entirely, which reads as `undefined` to a caller checking `=== false`. Both are pinned by checks now.
+
+**Honest limits.** The budget is per-process memory: a restart clears it, deliberately, since restarting is a human act and a durable stop would outlive that intent (dispatch dedupe across restarts is intake's `requestId`, a different mechanism). It also cannot tell an unsatisfiable task from a merely hard one — it only knows that a refusal repeated. A task that needs a widened allowlist still needs the human to widen it; what changed is that asking now costs two cycles instead of six, and says so out loud.
+
+12 checks in `test/refusal-budget.test.mjs` (classification, signature normalization, both ceilings, per-issue isolation, infrastructure never charged, frozen counts after a stop, payload contents, constructor validation) and 5 in `test/refusal-stop-short.test.mjs` drive the real tool against scratch git repositories with no model and no token.
