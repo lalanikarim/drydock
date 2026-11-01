@@ -10,6 +10,23 @@ This is a **research/documentation repository**, not a code project. The deliver
 - **Date-stamp research.** Each report carries a compilation date; refresh the date when content is materially updated.
 - **Keep verdicts honest.** Separate verified facts from estimates, and state risks explicitly — including cases where the conclusion is "not feasible yet."
 
+## Testing — a fake proves your assumption, not the API
+
+Four defects were committed green in one week with a passing suite behind each. The pattern never varies: an injected double answered exactly what I assumed the remote would answer.
+
+| defect | what the fake said | what the real thing said |
+|---|---|---|
+| commit identity from `GET /user` (#98) | 200 + a bot user, for every credential kind | **403** — an App installation token cannot read `/user` without user-read permission |
+| enumerated `npm test` (R10, #102) | the list *was* the suite | one suite existed, passed when run directly, and ran in **no CI job at all** |
+| webhook delivery sweep (#107, #109) | `page=2` is fine; ids are numbers | **422** — that endpoint rejects `page` and paginates by `Link` cursor; delivery ids are 19 digits and round through `JSON.parse`, so selecting one by id matched nothing |
+
+So, for code that touches anything this repo does not control — the GitHub API, an HTTP endpoint we host, a subprocess contract:
+
+- **Run it once for real before calling it done**, and put that evidence in the PR: a command and its output, not "should work". Cheap forms: one live call from a scratch script, a step in `gates/github-app-check.mjs`, a signed request against the published listener.
+- Assert on **observable effects** (a record changed, a header present, a count moved) rather than that a stub was called with arguments.
+- Where a fake is unavoidable, make it **hostile in the direction reality is**: refuse what reality refuses (`403` on `/user`, `422` on `page=`), and keep precision-sensitive values as strings end to end.
+- A green suite over an assumed contract is a claim about your test, not about production. Corollary for gates that trust an exit code: **verify what the command collected** — "not collected" and "passing" are the same color (R6b, R10).
+
 ## Research workflow
 
 1. Search/read primary sources (vendor docs, engineering blogs, GitHub repos) before writing or editing claims.
