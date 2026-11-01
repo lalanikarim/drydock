@@ -98,11 +98,21 @@ are not).
 
 ## 4. P1 — before "multi-repo production"
 
-- **Second real repo onboarded.** M1/M2/M4 passed on purpose-built fixtures (`factory-fixture`,
-  `factory-fixture-2`), but drydock is the only repo doing real self-work. Fixtures prove mechanics, not
-  usefulness.
-- **#78 condition:** App installation reaches 3 unmanaged repos because engram is intended to join as a managed
-  repo. Before first dispatch to engram: protect its `main`.
+- **Second real repo wired; still nothing dispatched there.** M1/M2/M4 passed on purpose-built fixtures
+  (`factory-fixture`, `factory-fixture-2`), and drydock remains the only repo that has done real self-work.
+  Fixtures prove mechanics, not usefulness. engram is now managed (below) — what is missing is one labeled issue
+  taken end to end there, with its own verification run.
+- **engram is a managed repo (#78 narrowed, 2026-11-01).** The registry carries `lalanikarim/engram`
+  (`enabled:true`, `autoMerge:false`, eligibility label `build`, `poc/lib/` protected because drydock vendors the
+  kernel and a run must not break the pin discipline), with a fleet entry, a per-repo webhook secret in `.env`,
+  and a webhook (706043067, events `issues` + `issue_comment`) on the same funnel. The first-dispatch
+  precondition is met: engram's `main` has branch protection — verified live via
+  `gh api repos/lalanikarim/engram/branches/main/protection` (`unit-suite` required and strict,
+  `enforce_admins: true`, force-push and deletions off) — and `gates/github-app-check.mjs`, which now derives its
+  managed list from the registry, reads engram with an installation token (issues/pulls 200).
+  **#78 stays open with a narrower residual: `lalanikarim/collective` and `lalanikarim/modelarena` are still
+  reachable-but-unmanaged.** Also unresolved by onboarding: #41 was "hold until engram is a managed repo", so it
+  is now internal work rather than an upstream PR.
 - **Fixture protection posture (queue 8b):** both fixtures have **no branch protection at all** and
   `autoMerge: true`. Decide: protect them, or mark them permanently disposable.
 - **Listener exposure (P2, queue item 7):** funnel currently stays published between bursts by operator

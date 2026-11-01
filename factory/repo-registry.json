@@ -1,5 +1,5 @@
 {
-  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Runtime config stays in factory/config/<owner>_<repo>.json; the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true \u2014 see research/multi-repo-factory-plan.md \u00a75.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md \u00a75.11.",
+  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Runtime config stays in factory/config/<owner>_<repo>.json; the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true — see research/multi-repo-factory-plan.md §5.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md §5.11.",
   "defaults": {
     "eligibilityLabel": "agent",
     "autoMerge": true,
@@ -60,7 +60,27 @@
       "eligibilityLabel": "build",
       "prFeedback": true,
       "refine": true,
-      "note": "N3 dogfood target, ENABLED and PUBLISHED (fleet entry plus a public HTTPS front per fleet/enable-self-work.md). Nothing starts a run by itself: an eligible event from an allowlisted sender is required - the `build` label on an issue, or a `/factory` comment on an open factory PR. Runs are also started deliberately against this checkout via gates/self-run-task.mjs. autoMerge is false permanently \u2014 drydock runs stop at the draft PR for a human to merge (\u00a75.11). pathAllowlist deliberately excludes gates/ so a self-run cannot edit the oracles that judge it, and gates/probes/ is additionally protected. README.md and AGENTS.md are writable by decision E1 (2026-10-31): self-work documents itself, including its own operating rules, because the file is advisory while the enforcement points live outside the workspace \u2014 this registry and the reviewer. An AGENTS.md edit only changes future behaviour once a human merges it. prFeedback is enabled (#67): when a listener is published per fleet/enable-self-work.md, a \"/factory \u2026\" comment from an allowlisted sender on an OPEN pull request reworks that PR \u2014 restricted by host-side checks to the factory's own agent/issue-<n> branches, never a human branch, and it still ends at a draft push with verification and review intact. refine is enabled (#65): the `refine` label on an issue, or a `/refine <guidance>` comment on an issue, runs a read-only expansion pass (`read` tool only, remote scrubbed) whose sole output is a comment on that issue — it starts no work and grants nothing, because acting still requires the `build` label plus path scope, verification and review. Issue #99 (six cycles spent on an impossible ticket) is the cost this step exists to avoid."
+      "note": "N3 dogfood target, ENABLED and PUBLISHED (fleet entry plus a public HTTPS front per fleet/enable-self-work.md). Nothing starts a run by itself: an eligible event from an allowlisted sender is required - the `build` label on an issue, or a `/factory` comment on an open factory PR. Runs are also started deliberately against this checkout via gates/self-run-task.mjs. autoMerge is false permanently — drydock runs stop at the draft PR for a human to merge (§5.11). pathAllowlist deliberately excludes gates/ so a self-run cannot edit the oracles that judge it, and gates/probes/ is additionally protected. README.md and AGENTS.md are writable by decision E1 (2026-10-31): self-work documents itself, including its own operating rules, because the file is advisory while the enforcement points live outside the workspace — this registry and the reviewer. An AGENTS.md edit only changes future behaviour once a human merges it. prFeedback is enabled (#67): when a listener is published per fleet/enable-self-work.md, a \"/factory …\" comment from an allowlisted sender on an OPEN pull request reworks that PR — restricted by host-side checks to the factory's own agent/issue-<n> branches, never a human branch, and it still ends at a draft push with verification and review intact. refine is enabled (#65): the `refine` label on an issue, or a `/refine <guidance>` comment on an issue, runs a read-only expansion pass (`read` tool only, remote scrubbed) whose sole output is a comment on that issue — it starts no work and grants nothing, because acting still requires the `build` label plus path scope, verification and review. Issue #99 (six cycles spent on an impossible ticket) is the cost this step exists to avoid."
+    },
+    {
+      "repo": "lalanikarim/engram",
+      "enabled": true,
+      "autoMerge": false,
+      "configFile": "factory/config/lalanikarim_engram.json",
+      "pathAllowlist": [
+        "app/src/",
+        "app/test/",
+        "poc/",
+        "docs/",
+        "README.md",
+        "AGENTS.md",
+        "package.json"
+      ],
+      "protectedPaths": [
+        "poc/lib/"
+      ],
+      "eligibilityLabel": "build",
+      "note": "Kernel repo managed by the factory. testCommand uses test:unit (pure-logic subset) because the sealed sandbox has network=none and the full suite needs a live model endpoint — see engram#66. poc/lib/ is protected because drydock vendors it and a factory run must not break the pin discipline. autoMerge false: stops at draft PR for human merge."
     }
   ]
 }

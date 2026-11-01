@@ -119,7 +119,9 @@ test("lookup helpers fail with the registry contents in the message", () => {
 
 test("factory/repo-registry.json loads and describes the expected registry", () => {
   const registry = loadRegistry();
-  assert.deepEqual(registryRepoNames(registry), ["lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", "lalanikarim/drydock"]);
+  // The snapshot is deliberate: adding a repo to policy must be visible here, because this list is the
+  // difference between "the factory may act on this repository" and it is not.
+  assert.deepEqual(registryRepoNames(registry), ["lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", "lalanikarim/drydock", "lalanikarim/engram"]);
   const fx1 = requireEnabledRepo(registry, "lalanikarim/factory-fixture");
   assert.equal(fx1.oracleBoot.portFrom, "stdout", "fixture-1 logs the port it bound");
   const fx2 = requireEnabledRepo(registry, "lalanikarim/factory-fixture-2");
@@ -140,6 +142,21 @@ test("drydock is enabled for self-work and can never auto-merge", () => {
   // Self-grading: the oracles live under gates/, which a self-run must not be able to edit.
   assert.ok(!drydock.pathAllowlist.includes("gates/"), "a self-run may not edit the gates that judge it");
   assert.ok(drydock.protectedPaths.includes("gates/probes/"), "the oracles stay protected even if gates/ were ever allowlisted");
+});
+
+test("engram is managed but can never auto-merge, and the vendored pin stays protected", () => {
+  // Onboarding engram closes most of #78: it was reachable-but-unmanaged, which left "the App could write
+  // an unprotected kernel main" as a residual. Managed is only safer than reachable if the posture below
+  // holds, so it is pinned rather than trusted to the JSON reading well.
+  const registry = loadRegistry();
+  const engram = requireEnabledRepo(registry, "lalanikarim/engram");
+  assert.equal(engram.autoMerge, false, "the kernel repo stops at a draft PR for human merge");
+  assert.notEqual(engram.eligibilityLabel, "agent", "engram's own backlog is not factory work by default");
+  // drydock vendors the kernel at vendor/engram; a run that broke poc/lib/ would desync the pin discipline.
+  assert.ok(engram.protectedPaths.includes("poc/lib/"), "the vendored kernel surface must stay protected");
+  assert.ok(!engram.pathAllowlist.includes("vendor/"), "a managed repo may not widen its own vendor tree");
+  // #78's precondition for the first dispatch here: branch protection on main, verified live.
+  // Runbook: `gh api repos/lalanikarim/engram/branches/main/protection` must answer, not 404.
 });
 
 test("verification is required by default and waiving it is explicit (#61 / decision C1)", () => {
