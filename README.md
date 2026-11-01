@@ -13,6 +13,10 @@ Research repository on **coding agent software factories** — how autonomous co
 | [`research/poc-plan-factory.md`](research/poc-plan-factory.md) · [HTML](research/poc-plan-factory.html) | PoC plan + results: the "issue → reviewed PR" loop on Pi Durable — all phases complete (G0–G5 passed, measured) |
 | [`research/multi-repo-factory-plan.md`](research/multi-repo-factory-plan.md) | Next-phase plan: managing multiple repos simultaneously — Target 1 (N factories) spec with gates M1–M4, Target 2 (single orchestrator over M repos) as a gated follow-up with a funding decision rule |
 
+## The implementation
+
+[`factory/`](factory/) contains the pipeline itself: an **intake** that receives GitHub issues, a **sandboxed worker** that implements a fix in an isolated environment, an **independent reviewer** that evaluates the diff against the issue, and a **merge gate** that only lets a PR through once review passes. [`fleet/`](fleet/) layers a **supervisor** process on top of one or more factory instances and provides a **multi-repo adapter** so a single fleet can route tickets to the correct repository's pipeline. See [fleet/enable-self-work.md](fleet/enable-self-work.md) for how to bring the fleet up, and §5 of [research/multi-repo-factory-plan.md](research/multi-repo-factory-plan.md#5-migration-to-engram-core-drop-poc-wiring-for-a-proper-composition) for the design decisions behind the current architecture. A pull request like this one can be sent back for rework by commenting `/factory rebase` or `/factory instruct <what to change>`; only allowlisted human senders may do so. This is a research deployment running on local models against one author's own repositories — not a hosted product, and nothing here is packaged for other users.
+
 ## Key findings
 
 **What a software factory is.** A managed system for producing software with repeatable inputs (tickets, alerts, webhooks), standardized tooling and isolated runtimes, measurable output, and retained context. The factory is the *process around* the agents: intake → runtime → implementation → independent review → verification → human approval at merge. Agents run unattended; humans own the merge.
