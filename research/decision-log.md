@@ -226,6 +226,8 @@ Concrete enough to check against `research/work-queue.md`: every in-flight item 
 | R8 | ~~App credential configured but not consumed~~ — **CLOSED**: `factory/github-auth.ts` resolves and uses it; boot verifies the exchange before ready | closed by queue 3b | Boot prints `git credential: GitHub App 5557270 (installation 177271737)` + `installation token exchange verified`; the keychain warning is gone from this path |
 | R4 | ~~Stale policy accepted between fleet change and restart~~ | **#69 closed** (this PR) | Supervisor writes fresh routes before spawn (atomic, always overwrite); adapter re-hashes per request and exits on drift. Residual: fleet-file changes still need a supervisor restart (fleet is read once at start) — documented in the runbook |
 | R5 | ~~Re-verification of a draft PR after rework relies on the same worker-run command~~ | **closed** by C1 + C2-rev | Verification now runs host-side at push time (not inside the worker's sandbox), and CI runs the same suite on the resulting PR head independently of the factory. Byte-scoped approval (#47) means an approval names the commit that was tested |
+| R10 | ~~Enumerated `npm test` silently skipped suites~~ — **CLOSED by #102**: discovery is structural and a guard fails on an empty or partial match | C1/C2-rev trust an exit code, so the suite list is load-bearing | The list had dropped `test/git-identity.test.mjs`: it passed when run directly and appeared in no CI job, which is part of how the #87 regression (#98) shipped green. Lesson generalizes R6(b): **a gate that trusts a command must also verify what that command collects** — "not collected" and "passing" are the same color. `test/suite-discovery.test.mjs` asserts pattern-based discovery, disk-vs-collected set equality, and non-zero collection |
+| R11 | A self-task can be **unsatisfiable by construction** while every individual control behaves correctly, and the run has no budget to notice | path scope + enumerated suites + no retry cap (#100) | Issue #99: worker adds a test → registering it needs `package.json` → allowlist refuses → root agent re-delegates → six full worker+review cycles on an identical refusal, stopped by hand. Three separate layers behaved; only the composition was wrong. Mitigations landed: #102 (the trap), #103 (worker is told its scope up front). Still open in #100: refusal budget and `retryable: false`, so a permanent refusal terminates a run instead of funding it |
 | R6 | Two latent fail-open coercions found while implementing C1 — both now fixed, kept here as the lesson | registry validation | (a) `Boolean("false") === true`, so a JSON typo like `"autoMerge": "false"` would have **granted** merge rights; safety flags are now type-checked. (b) A nested `node --test` inheriting `NODE_TEST_CONTEXT` skips every file and exits 0 — a green verification with zero tests behind it; the child env is stripped and zero collected tests is treated as failure. Both were found by testing, not review: suspect this class of bug in any flag coerced with `Boolean()` or any gate that trusts an exit code alone |
 
 ---
@@ -248,3 +250,49 @@ Queue item 6 executed: `fleet/fleet.local.json` → supervisor → adapter on `1
 
 Authorship distinguishes factory PRs from human ones, which was the stated precondition for revisiting required reviews. The constraint that shapes the choice: GitHub branch protection cannot condition review requirements on PR author, so "one approving review, except bot PRs" isn't expressible — enabling reviews applies to human PRs too (approvable by the human for bot-authored work, which is exactly the pairing E3 anticipated). Left as the operator's call rather than changed unilaterally.
 
+---
+
+## 2026-11-01 — wiring `#67` live, and the first self-task that could not succeed
+
+Three-step plan for the PR-comment feedback loop: restart supervisor/adapter from `main` (picks up the `prFeedback` route field), add `issue_comment` to hook `703101252`, then drive a real `/factory` comment end to end. Steps 1–2 succeeded; step 3 exposed two structural defects and one regression of mine.
+
+### The credential that cannot read itself (#87 follow-up, fixed in #98)
+
+The first issue dispatched after `#91` landed faulted in workspace preparation: `GET /user returned HTTP 403`. **An App installation token cannot read `/user`** unless the App holds user read permission, and `drydock-factory` has none — so deriving the commit identity from that endpoint was wrong for exactly the credential this deployment uses. Fourteen unit checks passed because every fake answered `/user` successfully: the test double encoded my assumption instead of GitHub's behaviour.
+
+Fix (#98, merged): keep `GET /user` (correct for PATs) and fall back to app metadata — App slug from `GITHUB_APP_SLUG` or `/app` via the App JWT, then the public `/users/<slug>[bot]` for the numeric id. Boot now logs `commit identity: drydock-factory[bot] <350801583+…@users.noreply.github.com>` so the condition is visible at startup rather than 40 minutes into a run — **warn, not exit**, deliberately unlike the token-exchange check which stays fatal: a transient API failure should not keep the factory down, while a credential that does not work must never be announced as ready. And `gates/github-app-check.mjs` gained a live identity step, because the layer that injects fetches is structurally incapable of catching this class of bug:
+
+```
+IDENTITY: GET /user with an installation token -> HTTP 403 (401/403 expected unless the App holds user read)
+IDENTITY: commits will be authored by drydock-factory[bot] <350801583+drydock-factory[bot]@users.noreply.github.com>
+```
+
+### `issue_comment` intake verified against the live listener (zero inference cost)
+
+Before spending a run, the comment path was probed with signed deliveries through the public HTTPS front. Each refusal happened at the intended layer:
+
+| Probe | Result | Layer proven |
+|---|---|---|
+| `/factory rebase` naming an unreadable PR | `200 accepted:false` then `refused after state check: cannot read PR #99999 … refusing without verified state` | route accepts comment events → PR state read with the App credential → **no** POST to the instance |
+| comment without `/factory` | `200` `comment does not start with /factory` | parse gate, before any state read |
+| sender is the App's own bot | `403 sender not allowlisted` | allowlist fires before the bot guard (both are correct; ordering matters for the comment-triggered loop this guard exists to prevent) |
+| drydock signature naming another repo | `403 cross-repo naming` | the signature is still per-repo authorization for comment events too |
+
+### A task that could not be completed, discovered by running it (#100, #101)
+
+The replacement issue (README-only change) produced six worker cycles, each ending in:
+
+```
+{"refused":true,"reason":"path scope violation — nothing was pushed or reviewed",
+ "offenders":[{"file":"package.json","why":"outside this repo's allowlist (…)"}]}
+```
+
+Cause: `package.json`'s test script **enumerated every suite by name**, so adding a test required editing a file the allowlist deliberately forbids (`scripts.test` *is* the verification gate — an agent that can edit it can pass the gate by deleting the tests). The task was unsatisfiable by construction; nothing pushed, ~six cycles of inference spent.
+
+Two findings, both recorded as risks above: **R10** — the enumeration had already dropped `test/git-identity.test.mjs` from every CI run (discovery now structural, 177 → 194 checks, guard asserts collection); **R11** — correct controls composed into an infinite retry loop, because a permanent refusal is indistinguishable from a transient failure and there is no budget. Fixes: #102 (glob discovery + guard), #103 (worker is told its scope before working, including "declining for scope reasons is a correct outcome"). Retry budget remains open in #100.
+
+**Process note, kept because it is the interesting part:** the root agent read the refusal five times and re-delegated anyway, reasoning correctly each time ("the worker keeps modifying package.json even though I've explicitly told it not to") about a constraint it could not see and a fix it was never given. Verbose reasoning is not a substitute for a budget, and neither is a substitute for telling the actor its boundary.
+
+### Still open from this session
+
+`/factory` comment on a real factory-authored draft PR (the last unverified half of #67) requires a successful self-run, which requires #102 and #103 merged. Hook `703101252` now subscribes to `issues` + `issue_comment`; supervisor/adapter run from `main` with `prFeedback: true` in the route table.
