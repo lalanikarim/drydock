@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -25,14 +25,23 @@ function spawnDummySupervisor() {
   return spawnInProcessGroup(execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "ignore", "inherit"] });
 }
 
-/** A child running the *real* watchdog, reporting what it decides on stdout as JSON lines. */
-function spawnWatchedChild({ supervisorPid, dir }) {
-  const script = join(dir, "watched-child.mjs");
-  writeFileSync(
-    script,
-    `import { startParentWatchdog, SUPERVISOR_PID_ENV } from ${JSON.stringify(WATCHDOG_TS)};
-const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-out({ ev: "ready", pid: process.pid, ppid: process.ppid, supervised: process.env[SUPERVISOR_PID_ENV] ?? null });
+/**
+ * A child running the *real* watchdog, reporting what it decides on stdout as JSON lines. With WATCH_DURABLE
+ * set it mirrors those events into that file — the only channel that survives a supervisor dying with the pipe,
+ * which is what the "supervisor owns the pipes" test needs in order to observe anything at all.
+ */
+const WATCHED_CHILD_SOURCE = `
+import { appendFileSync } from "node:fs";
+import { startParentWatchdog, SUPERVISOR_PID_ENV } from ${JSON.stringify(WATCHDOG_TS)};
+const durable = process.env.WATCH_DURABLE || null;
+// Exactly production's shape: the child's own log line goes to stdout and nowhere else — which is a pipe into a
+// supervisor that may already be dead. The mark() helper exists only for the startup marker, so the durable
+// of WHY the child exited can come from one place: the watchdog's own durable sink. A test that let the fixture
+// write it would pass with that sink removed (it did, once) and prove nothing.
+const out = (o) => { process.stdout.write(JSON.stringify(o) + "\\n"); };
+const mark = (o) => { if (durable) { try { appendFileSync(durable, JSON.stringify(o) + "\\n"); } catch {} } };
+mark({ ev: "ready", pid: process.pid, ppid: process.ppid, supervised: process.env[SUPERVISOR_PID_ENV] ?? null });
+out({ ev: "ready", pid: process.pid });
 let closing = false;
 const close = (why) => { if (closing) return; closing = true; out({ ev: "closing", why }); process.exit(0); };
 process.on("SIGTERM", () => close("sigterm"));
@@ -41,11 +50,15 @@ startParentWatchdog({
   label: "watched-child",
   intervalMs: 100,
   firstCheckDelayMs: 150,
+  durableLogPath: durable ?? undefined,
   onOrphaned: (info) => close("orphaned:" + info.reason),
 });
 setInterval(() => {}, 1000);
-`,
-  );
+`;
+
+function spawnWatchedChild({ supervisorPid, dir }) {
+  const script = join(dir, "watched-child.mjs");
+  writeFileSync(script, WATCHED_CHILD_SOURCE);
   return spawnInProcessGroup(execPath, [script], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ...(supervisorPid ? { [SUPERVISOR_PID_ENV]: String(supervisorPid) } : {}) },
@@ -200,6 +213,114 @@ test("REAL PROCESSES: SIGKILLing the supervisor leaves no served-by-nobody child
   assert.equal(timedOut, false, `orphaned child was still serving after 6s. Output: ${output}`);
   assert.match(output, /"ev":"closing","why":"orphaned:/, `child exited without naming orphaning as the reason: ${output}`);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("a broken stdout pipe cannot abort the orphan shutdown — the durable copy is what survives", async () => {
+  // The hostile version of reality. When a supervisor dies it takes the child's stdout pipe with it, so the one
+  // line explaining "an instance nobody dispatched" is written into nothing and console.log raises EPIPE. If
+  // that exception escaped, teardown would stop mid-close — durable store still open, no exit, no record. So:
+  // log throws like a dead pipe, and shutdown must still run, with a record somewhere the pipe cannot reach.
+  const dir = workdir();
+  const durable = join(dir, "orphan-events.log");
+  let orphaned = null;
+  const stop = startParentWatchdog({
+    supervisorPid: 4242,
+    label: "watched",
+    durableLogPath: durable,
+    log: () => {
+      throw new Error("EPIPE: broken pipe — write end of a supervisor that no longer exists");
+    },
+    ppidFn: () => 1,
+    isAlive: () => false,
+    intervalMs: 5,
+    firstCheckDelayMs: 0,
+    onOrphaned: (info) => {
+      orphaned = info;
+    },
+  });
+  try {
+    const deadline = Date.now() + 2_000;
+    while (!orphaned && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(orphaned, "watchdog never fired while stdout was throwing — the exception aborted detection");
+    assert.equal(orphaned.reason, "reparented-to-init");
+    const text = readFileSync(durable, "utf8");
+    assert.match(text, /orphaned \(reparented-to-init\)/, "durable record missing the reason");
+    assert.match(text, /Runbook/, "durable record must carry the operator action, not just the fact");
+  } finally {
+    stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL PROCESSES: when the supervisor that OWNS THE PIPES dies, the child still notices and records it", async () => {
+  // The shape reality actually has — and the one this suite originally missed. The test above keeps the pipe
+  // alive (the test process is still reading), so it proved orphan *detection* while a live `kill -9` of the
+  // real supervisor left no trace whatsoever: the child's stdout was a pipe into a process that no longer
+  // exists, and its one explanatory line went there. Here the supervisor is the child's own parent and creates
+  // the pipes, so its death closes them. Assertions are on observable effects only: the child stops, and an
+  // event file that does not depend on the pipe says why.
+  const dir = workdir();
+  try {
+    const durable = join(dir, "orphan-events.log");
+    const childScript = join(dir, "watched-child.mjs");
+    writeFileSync(childScript, WATCHED_CHILD_SOURCE);
+
+    const supSource = [
+      'import { spawn } from "node:child_process";',
+      "const child = spawn(process.execPath, [CHILD_SCRIPT], {",
+      '  stdio: ["ignore", "pipe", "pipe"], // fresh pipes whose reader is THIS process',
+      "  env: { ...process.env, SUP_PID_ENV: String(process.pid), WATCH_DURABLE: __DURABLE__ },",
+      "});",
+      "child.stdout.resume();",
+      "child.stderr.resume();",
+      'process.stdout.write(String(child.pid) + "\\n");',
+      'setTimeout(() => process.kill(process.pid, "SIGKILL"), 400); // no handler runs; the pipes die here',
+      "",
+    ]
+      .join("\n")
+      .replace("CHILD_SCRIPT", JSON.stringify(childScript))
+      .replace("SUP_PID_ENV", JSON.stringify(SUPERVISOR_PID_ENV))
+      .replace("__DURABLE__", JSON.stringify(durable));
+    const supScript = join(dir, "mini-supervisor.mjs");
+    writeFileSync(supScript, supSource);
+
+    const sup = spawnInProcessGroup(execPath, [supScript], { stdio: ["ignore", "pipe", "pipe"] });
+    let childPid = 0;
+    sup.stdout.setEncoding("utf8");
+    sup.stdout.on("data", (d) => {
+      const n = Number(String(d).trim());
+      if (n > 0) childPid = n;
+    });
+
+    // The supervisor dies by itself at 400 ms; wait for it to be gone.
+    await Promise.race([once(sup, "exit"), new Promise((r) => setTimeout(r, 5_000))]);
+    assert.ok(childPid > 0, "mini-supervisor never reported its child's pid");
+
+    const deadline = Date.now() + 10_000;
+    let text = "";
+    let stillServing = true;
+    while (Date.now() < deadline) {
+      try {
+        text = readFileSync(durable, "utf8");
+      } catch {
+        text = "";
+      }
+      if (/orphaned/.test(text) && !alive(childPid)) {
+        stillServing = false;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    assert.equal(stillServing, false, `child pid ${childPid} was still serving 10s after its supervisor died`);
+    assert.match(text, /"ev":"ready"/, "child never marked itself up");
+    // The wording below is the watchdog's, written through its durable sink — the fixture cannot produce it.
+    assert.match(text, /orphaned \(reparented-to-init\)/, "no durable record of the orphaning: invisible once the pipe dies (#125)");
+
+    sup.kill("SIGKILL");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("REAL PROCESSES: no FACTORY_SUPERVISOR_PID means no watchdog — manual runs are untouched", async () => {

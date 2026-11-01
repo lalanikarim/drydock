@@ -294,6 +294,8 @@ if (isMain) {
     stopWatchdog = startParentWatchdog({
       supervisorPid: process.env[SUPERVISOR_PID_ENV],
       label: "adapter",
+      // Same reason as the factory child: a line logged into a pipe whose reader is gone is not a record.
+      durableLogPath: `${logPath}.orphan-events`,
       onOrphaned: () => {
         stopWatchdog();
         shutdown("orphaned");

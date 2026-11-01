@@ -458,7 +458,7 @@ cat fleet/data/routes.json.lock                                      # the one s
 ps -eo pid,ppid,etime,command | grep "factory/main.ts" | grep -v grep # children with parents
 ```
 
-Any `factory/main.ts` whose `PPID` is `1` — or anything other than the lock owner — is an orphan: `kill -TERM`
+Any `factory/main.ts` whose `PPID` is `1` — or anything other than the lock owner — is an orphan (and check `factory-instances/<repo>/orphan-events.log`, which now records the event even when the supervisor log cannot): `kill -TERM`
 it (children honour `SIGTERM`; it is supervisors that don't, #110) and confirm exactly one remains. The count
 alone is not evidence; the `PPID` column is what distinguishes a live child from an orphan.
 
@@ -540,17 +540,29 @@ Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses
 
 **Order:** stop the supervisor — `kill -TERM $(cat fleet/data/routes.json.lock)`, since that file holds the live supervisor pid. Children are in the supervisor's process group and are asked to exit before it returns.
 
-**What a clean stop looks like:**
+**What a clean stop looks like** (captured from a real supervisor run, not hand-written):
 
 ```
-[supervisor] SIGTERM — shutting down (send again to exit immediately)
-[factory:<repo>] [parent-watchdog] supervisor pid N exited; closing …
-[supervisor] child <repo> exited (code=0, signal=none)
-[supervisor] adapter exited (code=0)
-[supervisor] routes file updated: 0 live factories
+[supervisor] shutting down (received SIGTERM)
+[supervisor] terminating 2 child process group(s): factory:lalanikarim/drydock, adapter
+[factory:lalanikarim/drydock] [factory] SIGTERM — closing lalanikarim/drydock
+[adapter] adapter: SIGTERM — closing
 ```
 
-The `parent-watchdog` line is the one that matters. Children watch their parent and close themselves when it disappears, so a supervisor killed with `SIGKILL` still leaves no harness running: within ~2 s each child notices (`getppid() === 1` after launchd reparents it), closes the core, exits, and its worktree stops being written to.
+After it: the lock file is gone, `lsof -nP -i :9700` is empty, and no `factory/main.ts` remains. Children are started `detached`, each leading its own process group, which is why the supervisor can terminate the *group* rather than hope one pid covers a harness and whatever it spawned.
+
+**A second `SIGTERM` exits immediately** and `SIGKILL`s whatever is left — the old behavior was to swallow repeated signals, which is why deploys historically ended in `kill -9` anyway (and that is what produced the orphans in #125).
+
+**If the supervisor is `SIGKILL`ed**, each child notices within ~2 s (`ppid === 1`, or the recorded supervisor pid no longer existing), closes the core, and exits — so no harness is left serving an Engram store nobody dispatched. That teardown also checkpointed sqlite in testing (`agent.sqlite-wal`/`-shm` disappear on a clean close and survive a crash), which is how you can tell after the fact which kind of death happened.
+
+**Where that event is recorded — read this when the log is empty.** A child's stdout is a pipe *into the supervisor*, so when the supervisor dies the pipe dies with it and the explanatory line has nowhere to go: an orphaned instance closing cleanly can leave zero trace in the supervisor log. It therefore appends the same line to a file the dead pipe cannot reach:
+
+```bash
+cat factory-instances/lalanikarim_drydock/orphan-events.log
+# 2026-11-01T17:47:18.470Z [factory lalanikarim/drydock] orphaned (reparented-to-init): supervisor pid 4452 is gone, my ppid is 1 — exiting rather than serving unmanaged (#127). Runbook §7: check for other instances on this store.
+```
+
+A non-empty `orphan-events.log` means the safety net fired at least once: something was serving work with no supervisor, then stopped. Check whether another instance is on that store (`pgrep -fl factory/main.ts`) before restarting, and treat a growing file as a sign the supervisor keeps dying.
 
 **Verify, don't assume:**
 

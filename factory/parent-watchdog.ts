@@ -14,6 +14,8 @@
 // loyal to, and killing itself when its shell exits would be surprising at best. So absence of the variable
 // means "not armed", never "armed with an unknown pid".
 
+import { appendFileSync } from "node:fs";
+
 /** Who we think our supervisor is. Invalid/absent/self-referential values mean "not armed". */
 export function parseSupervisorPid(raw: string | number | null | undefined, selfPid: number = process.pid): number | null {
   const value = typeof raw === "number" ? raw : Number(String(raw ?? "").trim());
@@ -67,6 +69,14 @@ export interface ParentWatchdogOptions {
   onOrphaned: (info: { reason: OrphanReason; ppid: number; supervisorPid: number }) => void | Promise<void>;
   intervalMs?: number;
   /**
+   * Append the orphan line here as well as logging it (best effort). This exists because of a live finding:
+   * the supervisor pipes a child's stdout, so when the supervisor dies the pipe dies with it and the one log
+   * line explaining "an instance nobody dispatched" is written into a broken pipe and lost. Observed on a real
+   * SIGKILL — the child closed its store cleanly (sqlite `-wal`/`-shm` were checkpointed away) and produced no
+   * trace at all. A durable copy in the instance directory is what makes the event visible after the fact.
+   */
+  durableLogPath?: string;
+  /**
    * Grace before the first check. Without it a child can observe its own startup race — or, worse, tear
    * itself down while the supervisor's `SIGTERM` is still being handled gracefully two seconds away.
    */
@@ -101,10 +111,24 @@ export function startParentWatchdog(opts: ParentWatchdogOptions): () => void {
     fired = true;
     if (timer) clearInterval(timer);
     // Loud and on one line, because this is the log line that explains an instance nobody dispatched.
-    log(
+    const line =
       `[${opts.label}] orphaned (${reason}): supervisor pid ${supervisorPid} is gone, my ppid is ${ppidFn()} — ` +
-        `exiting rather than serving unmanaged (#127). Runbook §7: check for other instances on this store.`,
-    );
+      `exiting rather than serving unmanaged (#127). Runbook §7: check for other instances on this store.`;
+    // Both sinks are best-effort. A dead stdout pipe must never abort the shutdown below — writing to a pipe
+    // whose reader is gone raises EPIPE, and an exception thrown here would take the process down mid-teardown
+    // instead of letting it close its durable store.
+    try {
+      log(line);
+    } catch {
+      /* supervisor died with the pipe; the durable copy is the record */
+    }
+    if (opts.durableLogPath) {
+      try {
+        appendFileSync(opts.durableLogPath, `${new Date().toISOString()} ${line}\n`);
+      } catch {
+        /* never let recording the event be the reason the event goes unhandled */
+      }
+    }
     try {
       await opts.onOrphaned({ reason, ppid: ppidFn(), supervisorPid });
     } catch (e) {

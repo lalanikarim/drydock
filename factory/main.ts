@@ -371,6 +371,9 @@ async function main() {
     stopWatchdog = startParentWatchdog({
       supervisorPid: process.env[SUPERVISOR_PID_ENV],
       label: `factory ${repo}`,
+      // The pipe to the supervisor dies with it, so this instance's own directory carries the record. Without
+      // it, an orphaned-and-self-closed instance leaves no trace at all — which is how #125 stayed invisible.
+      durableLogPath: join(root, "orphan-events.log"),
       onOrphaned: () => {
         stopWatchdog();
         shutdown("orphaned");
