@@ -787,3 +787,73 @@ The honest version of "we shipped a feature" here is that shipping was necessary
 feature was unreachable for a different reason than the one the tests described, and each layer — registry,
 route, boot log, task registration — reported success throughout. The only thing that caught it was driving
 the real path and then reading the actual bytes on the wire when the model's account contradicted mine.
+
+### 5.27 Operator notifications: telling a human at the moments silence costs something (2026-11-01, #64)
+
+Everything the factory does is already reported — PR comments, audit log, durable task state. All of it requires
+someone to go looking. The failure that motivated this was mundane: a draft PR sat unmerged for hours because
+nobody was at a terminal, and a run stopped by the refusal budget (#100) looked from outside exactly like a run
+still in progress.
+
+**Three events, chosen so each one is actionable at the moment it arrives** (`factory/notify-telegram.ts`):
+
+| event | why it earns a ping |
+|---|---|
+| `pr_opened` | work is ready for review; verification result and head sha ride along |
+| `run_stopped` | this issue will not produce anything on its own — the refusal budget closed it (#100) |
+| `refine_posted` | a brief exists for a human to read and decide on (#65) |
+
+Anything else belongs in the PR comment or the audit log. A notification channel that carries everything is
+read by nobody, so the module refuses to be a general-purpose logger: three event shapes, one line each.
+
+**Deployment-level, not repository policy.** Who to tell is configuration (`TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`); what is allowed stays exclusively in `factory/repo-registry.json`. Putting a notification
+flag in the registry would create a second place where behavior diverges per repo without any safety meaning.
+
+**Three properties this module owns:**
+
+1. **It can never break a run.** Every call site wraps it; every internal failure is logged and dropped. A dead
+   bot token must not fail a pull request that passed verification and review. `notifySafe` keeps even the null
+   check inside the `try`, because it is awaited on the path that returns a refusal to the orchestrator.
+2. **The token never reaches a log line or error string.** The Telegram API takes the bot token in the URL
+   path, so any naive fetch error can echo it. Every value leaving the module goes through a redactor — tested
+   by asserting the token is absent from a failure detail that was built from an error message containing it.
+3. **Retry connection errors and 429/5xx; never other 4xx.** Node's `fetch` on this host resets connections
+   where `curl` succeeds with the same body (observed while verifying credentials, 2026-11-01), so
+   `ECONNRESET` is expected, not exceptional. A 400 (bad token, blocked bot) fails identically forever and is
+   returned immediately — retrying that turns an outage into a storm against the API. 429 honours
+   `retry_after` from the payload rather than burning the attempt budget.
+
+Duplicate suppression is per event key in a 10-minute window: a retried code path cannot spam the same line,
+while a different issue is a different event.
+
+### 5.27.1 What running it found (both defects were invisible to reasoning)
+
+- **A missing destructure.** `notify` was added to `OpenDraftPrOptions` and used in the body, but not pulled
+  out of the parameter list — so `notifySafe` threw `ReferenceError: notify is not defined`. The wiring test
+  caught it as `expected exactly one stopped-run notification, saw []`, which is precisely why that test drives
+  `openDraftPrTool().execute()` against a scratch repo with a real path-scope refusal instead of asserting on a
+  stub. A conditional assertion there (`if (seen.length > 0)`) would have shipped the bug; it was replaced with
+  an exact-count assertion the first time it ran.
+- **A temporal-dead-zone crash that stopped the fleet.** The notifier was declared *after* `pipelineOpts`
+  referenced it: `fatal: ReferenceError: Cannot access 'notifier' before initialization`. The instance exited
+  code 1, the supervisor restarted it ten times and gave up. Fail-closed behaved correctly — it refused to run
+  half-configured — but it is a reminder that "boot log says enabled" and "runtime can construct it" are
+  different claims. **Restart onto anything you intend to rely on.**
+
+Two pieces of the safety story proved themselves during recovery, both from earlier work: the single-instance
+lock (#108) refused the new supervisor with the offending pid while the old one lingered, and after `SIGKILL`
+it logged `reclaimed stale supervisor lock (previous pid 99491 is not running); held by pid 1247`. Separately:
+**a supervisor that has exhausted its restart budget ignored `SIGTERM` for over 24 seconds** — recorded on #110,
+whose remaining sub-item is exactly this class of shutdown defect.
+
+### 5.27.2 Honest limits
+
+- **Live at the transport level, not yet end-to-end.** A real message was delivered through this module
+  (`{"ok":true,"status":200,"attempts":1}` from `sendTelegramMessage`, rendered by `renderNotifyMessage`), and
+  the live instance logs `telegram notifications on (chat 675626)`. No production `pr_opened` or
+  `refine_posted` has fired yet — those need a completed run, and refinement is currently blocked on the root
+  conversation by #122. The trigger wiring for `run_stopped` is exercised in tests through the real tool path.
+- **One channel, one chat.** Deliberate: multi-recipient routing is a policy question this repo has no
+  requirement for yet, and `Notifier` is one function so a second transport is additive.
+- **Notifications are not a control.** They announce outcomes; nothing about them gates or authorises anything.

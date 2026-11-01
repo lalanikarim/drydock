@@ -18,6 +18,7 @@ import { verifyWorkspace, verificationGate, formatVerificationEvidence, type Ver
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { RefusalBudget, terminalRefusalPayload, type RefusalSignal } from "./refusal-budget.ts";
 import { buildPrReport, classifyPush, type PrReportFacts } from "./pr-report.ts";
+import type { Notifier } from "./notify-telegram.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -186,12 +187,29 @@ export interface OpenDraftPrOptions {
   postPrComment?: (prNumber: number, body: string, env: NodeJS.ProcessEnv) => Promise<void>;
   /** Where a failed report goes. Reporting is best-effort: it must never fail a run (#96). */
   reportLog?: (message: string) => void;
+  /**
+   * Operator notification (#64). Called after the fact — the PR already exists by then — and never allowed
+   * to change the tool's outcome. Undefined means no channel is configured.
+   */
+  notify?: Notifier;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m) }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m), notify }: OpenDraftPrOptions) {
   const findPr = findOpenPr ?? ((branch: string, env: NodeJS.ProcessEnv) => ghFindOpenPr(fixturesRepo, branch, env));
   const postComment = postPrComment ?? ((prNumber: number, body: string, env: NodeJS.ProcessEnv) => ghPostPrComment(fixturesRepo, prNumber, body, env));
   const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
+  // Notification is strictly downstream of reality (#64): the push happened, the PR exists, only then does
+  // anyone get told. Failures are logged and dropped — a dead bot token cannot unmerge a passing run.
+  const notifySafe = async (e: Parameters<Notifier>[0]): Promise<void> => {
+    // Everything, including the null check, is inside the try: this is awaited on the path that returns a
+    // refusal to the orchestrator, so a notification defect must not be able to surface as a tool error.
+    try {
+      if (!notify) return;
+      await notify(e);
+    } catch (err) {
+      reportLog(`telegram notification failed: ${String(err)}`);
+    }
+  };
   return defineTool({
     name: "open_draft_pr",
     description:
@@ -220,6 +238,8 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
         const rec = refusalBudget.note(issueNumber, signal);
         const verdict: Record<string, unknown> = { ...base, retryable: rec.retryable, attempts: rec.total, identicalAttempts: rec.count };
         if (rec.terminal) {
+          // The moment an operator wants to know about: this issue will not produce a PR on its own (#100).
+          void notifySafe({ kind: "run_stopped", repo: fixturesRepo, issueNumber, reason: rec.stopReason ?? "refusal budget exhausted" });
           return { text: JSON.stringify({ ...verdict, terminal: true, runStopped: true, stopReason: rec.stopReason, hint: terminalRefusalPayload(rec).hint }), rec };
         }
         return { text: JSON.stringify(verdict), rec };
@@ -401,6 +421,16 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
           reviewVerdict: verdict.verdict,
         });
       }
+
+      await notifySafe({
+        kind: "pr_opened",
+        repo: fixturesRepo,
+        issueNumber,
+        prNumber: prJson?.number ?? null,
+        prUrl,
+        head,
+        verification: { ran: tests.ran, passed: tests.passed, exitCode: tests.exitCode },
+      });
 
       return {
         output: [{

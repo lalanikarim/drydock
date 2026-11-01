@@ -21,6 +21,7 @@ import { openDraftPrTool } from "./open-draft-pr.ts";
 import { mergePrTool, prStatusTool } from "./merge-gate.ts";
 import { noteLessonTool } from "./lessons.ts";
 import { RefusalBudget } from "./refusal-budget.ts";
+import type { Notifier } from "./notify-telegram.ts";
 import type { PathScope } from "./path-scope.ts";
 import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 
@@ -100,6 +101,11 @@ export interface PipelineOptions {
    */
   refusalBudget?: RefusalBudget;
   /**
+   * Operator notification (#64). Undefined when the deployment has no channel configured. Optional and
+   * fire-and-forget by contract: a dead notification channel must not fail a run that passed verification.
+   */
+  notify?: Notifier;
+  /**
    * Registry policy (#65): register the refinement task and its `refine_issue` tool. Off by default —
    * enabling it makes an issue label and an issue comment cost inference. The refiner reads the repo with
    * the `read` tool only and its sole output is a comment posted host-side after parsing.
@@ -130,7 +136,7 @@ export function factoryPipeline(opts: PipelineOptions) {
     gitAuth: auth,
   });
   const refineTaskDef = opts.refine === true
-    ? factoryRefineTask({ workDir: opts.workDir, fixturesRepo: opts.fixturesRepo, gitAuth: auth, pathScope: opts.pathScope })
+    ? factoryRefineTask({ workDir: opts.workDir, fixturesRepo: opts.fixturesRepo, gitAuth: auth, pathScope: opts.pathScope, notify: opts.notify })
     : null;
   const reviewerTaskDef = factoryReviewerTask({
     workDir: opts.workDir,
@@ -156,6 +162,7 @@ export function factoryPipeline(opts: PipelineOptions) {
         requireVerification: opts.requireVerification,
         pathScope: opts.pathScope,
         refusalBudget,
+        notify: opts.notify,
       }),
       // Read-only PR state, registered for every repo including autoMerge=false ones: merge_pr needs
       // the current head sha (#47 byte-scoped approval) and the orchestrator must be able to read it

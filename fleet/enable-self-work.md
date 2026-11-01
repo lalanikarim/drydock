@@ -449,3 +449,49 @@ gh api -X PATCH repos/lalanikarim/drydock/hooks/703101252 -f active=false   # st
 Disabling self-work entirely is one line in the registry (`enabled: false`), which both the supervisor and `factory/main.ts` enforce before any child spawns — demonstrated live when the first self-run refused to start.
 
 **What stays published is a decision, not a default.** A funnel URL is an HTTPS listener on a laptop that anyone on the internet can post signed-looking requests to; the refusals above are what makes that tolerable, and they only hold while the secret stays secret and the loopback bind stays loopback. If self-work is driven in bursts rather than continuously, tear the funnel down between bursts and re-run `tailscale funnel --bg 9700` when needed — GitHub retries failed deliveries with backoff, but that is not a durable queue you should rely on: if the window matters, re-add the label once the listener is back (nothing was recorded while it was down, so the same issue dispatches cleanly — `requestId` only deduplicates against work that actually started).
+
+## 8. Operator notifications (Telegram, #64)
+
+Optional outbound pings so the factory does not have to be polled. Enabled by two variables in `.env`; with
+either missing the boot log says `notifications disabled` and nothing else changes.
+
+```
+TELEGRAM_BOT_TOKEN=...      # from @BotFather
+TELEGRAM_CHAT_ID=...        # your chat id, see .env.example for the getUpdates one-liner
+```
+
+Exactly three things are announced, because a channel that carries everything is read by nobody:
+
+| you get told when | the line contains |
+|---|---|
+| a draft PR opens (`pr_opened`) | issue, PR number, URL, verification result, head sha |
+| a run is stopped by the refusal budget (`run_stopped`) | issue and the reason it will not produce anything further |
+| a refinement brief is posted (`refine_posted`) | issue and the comment URL (#65) |
+
+Everything else stays where it already lives: PR comments, `fleet/data/intake-adapter.jsonl`, durable task
+state. Notifications are deployment configuration (who to tell), never repository policy (what is allowed) —
+`factory/repo-registry.json` remains the only place capability decisions are made.
+
+### Properties worth knowing before you rely on it
+
+- **It cannot fail a run.** Failures are logged (`telegram notification not delivered …`) and dropped. If a PR
+  is missing a ping, check that log line before suspecting the pipeline.
+- **The bot token never appears in a log line**, including inside error text — the Telegram API puts it in the
+  URL path, so naive fetch errors echo it. Redaction is asserted by tests.
+- **Connection resets are normal here and are retried** (this host answers Node's `fetch` with `ECONNRESET`
+  where `curl` succeeds). A `400` is not retried: a bad token or blocked bot fails identically forever.
+- **One message per event per 10 minutes.** A retried code path cannot spam you; a different issue is a
+  different event.
+
+### Verify the credentials any time, without running anything
+
+```bash
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... node --experimental-strip-types -e '
+const { sendTelegramMessage } = await import("./factory/notify-telegram.ts");
+console.log(JSON.stringify(await sendTelegramMessage("drydock notification channel check", {
+  token: process.env.TELEGRAM_BOT_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID, log: console.log,
+})));"
+```
+
+Expected: `{"ok":true,"status":200,"attempts":1}`. Deliberately sends a message — a notification feature whose
+delivery path is unverified is a notification feature you find out about by not hearing from it.
