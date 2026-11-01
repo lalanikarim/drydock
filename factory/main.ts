@@ -19,7 +19,8 @@ import { instanceGatesConfig } from "./gate-policy.ts";
 // Both symbols come from the kernel's declared public surface (app/src/core.ts), not internal modules.
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
 import { CONFIG_DIR_ENV, loadFactoryConfig, resolveFactoryConfigPath } from "./factory-config.ts";
-import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
+import { factoryPipeline, intakeToolNames, orchestratorInstructions, refinerInstructions } from "./pipeline.ts";
+import { createIntakeRoute } from "./intake-router.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
 import { createGitAuth } from "./github-auth.ts";
@@ -237,6 +238,27 @@ async function main() {
     ...(policy.refine ? ["refine_issue"] : []),
   ] as string[];
   const rootTools = (ext.tools ?? []).filter((t) => rootToolNames.includes(t.name));
+
+  // Per-kind capability envelopes for intake (#122). The names come from the same module that builds the
+  // tools, and the instructions from the same file as the policy flags, so an envelope cannot advertise a
+  // tool the extension does not register. Picked by name against `ext.tools` — if a tool is renamed here
+  // and not there, the count check below fails at boot instead of opening a conversation that reports
+  // itself unable (which is how #122 presented itself).
+  const pickTools = (names: string[]) => (ext.tools ?? []).filter((t) => names.includes(t.name));
+  const intakeNames = intakeToolNames({ autoMerge: policy.autoMerge, refine: policy.refine });
+  const orchestratorChange = {
+    instructions: orchestratorInstructions({ autoMerge: policy.autoMerge, refine: policy.refine }),
+    tools: pickTools(intakeNames.issue),
+  };
+  if (orchestratorChange.tools.length === 0) {
+    console.error(`[factory] fatal: ${repo}: intake orchestration resolved zero tools from names [${intakeNames.issue.join(", ")}] — pipeline and intake mapping disagree`);
+    process.exit(1);
+  }
+  const intakeAgents = {
+    issue: orchestratorChange,
+    "pr-feedback": orchestratorChange,
+    refine: { instructions: refinerInstructions(), tools: pickTools(intakeNames.refine) },
+  };
   if (!policy.autoMerge) {
     console.log(`[factory] ${repo}: registry policy autoMerge=false — merge_pr is not offered; runs stop at the draft PR for a human to merge`);
   }
@@ -263,10 +285,15 @@ async function main() {
   // what makes `autoMerge=false` and a newly shipped tool take effect on restart rather than only the one
   // time this instance's database was created.
   const rootAgentChange = {
-    instructions: orchestratorInstructions({ autoMerge: policy.autoMerge, refine: policy.refine }),
+    instructions: orchestratorChange.instructions,
     tools: rootTools,
     model: { provider: modelRef.provider, modelId: modelRef.modelId },
   };
+  // Intake posture stated at boot like every other posture here. What it says is what a human needs to
+  // predict behavior: which conversation a webhook lands in, and what that conversation can touch.
+  console.log(
+    `[factory] ${repo}: intake routing — issue/pr-feedback open an orchestration conversation per issue (${orchestratorChange.tools.length} tools), refine opens a refinement conversation per issue (${intakeAgents.refine.tools.length} tool(s)); the root conversation is no longer on the webhook path`,
+  );
 
   createCoreInstance({
     config,
@@ -279,6 +306,8 @@ async function main() {
     // wasn't registered ("unanswered / no_model", 2026-10-30). The repo config's modelId now decides,
     // for the orchestrator as well as for worker/reviewer tasks.
     rootAgent: rootAgentChange,
+    // The factory's own intake endpoint, behind the kernel's bearer auth (#122).
+    routes: [createIntakeRoute({ repo, agents: intakeAgents, modelRef })],
   }).then(async (instance) => {
     // Check the model against the catalog THIS instance actually built, before announcing readiness.
     // Announcing ready and then settling every task as "unanswered / no_model" is what made a config

@@ -57,7 +57,12 @@ test("a labeled issue dispatches the issue task it always did", async () => {
     assert.deepEqual(result, { submissionId: 11 });
     assert.equal(inst.hits.length, 1);
     assert.equal(inst.hits[0].authorization, "Bearer instance-token");
+    // #122: intake goes to the factory's own route, which scopes a conversation per (kind, subject).
+    // Posting this to the kernel's /tasks would put every issue in the fleet into one shared transcript.
+    assert.equal(inst.hits[0].url, "/factory/intake");
     const sent = JSON.parse(inst.hits[0].body);
+    assert.equal(sent.kind, "issue");
+    assert.equal(sent.subject, "#3", "the subject is what makes the conversation stable across redelivery");
     assert.equal(sent.requestId, "issue-3");
     assert.match(sent.content, /Work on GitHub issue number: 3/);
     assert.match(sent.content, /<untrusted>/);
@@ -76,7 +81,10 @@ test("an authorized PR comment dispatches a rework task carrying the verified fa
       fetchPr: async (repo, n, token) => { seen.push({ repo, n, token }); return FACTS; },
     })("o/a", commentEvent());
     assert.deepEqual(result, { submissionId: 11 });
+    assert.equal(inst.hits[0].url, "/factory/intake");
     const sent = JSON.parse(inst.hits[0].body);
+    assert.equal(sent.kind, "pr-feedback");
+    assert.equal(sent.subject, "#42");
     assert.equal(sent.requestId, "pr-42-c-7", "the task is scoped to the comment, so redelivery cannot double-run");
     assert.match(sent.content, /PR feedback request/);
     assert.match(sent.content, /head branch: agent\/issue-7 at a1b2c3d4e5f6/);
@@ -141,6 +149,7 @@ test("a missing route target is an error, not a silent drop", async () => {
   const routes = [{ repo: "o/a", secret: "s" }];
   await assert.rejects(
     () => makeRouteDispatch(routes, { gitAuth: gitAuthFromToken("ghs_x") })("o/a", issueEvent),
-    /no \/tasks target/,
+    /no instance target configured for o\/a/,
+    "the message names the repo and makes clear nothing was posted",
   );
 });
