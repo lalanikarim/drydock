@@ -4,7 +4,12 @@
 > child-side orphan watchdog — #130), **runtime config moved outside the source tree** to `$DRYDOCK_CONFIG_DIR`
 > (#129, see §5.28 of the plan: `testCommand` was inside drydock's own path allowlist), **engram onboarded** as a
 > managed repo (#128), and the Tailscale funnel recovered (a delivery sweep found nothing needing redelivery). A
-> deploy has since been performed with no `kill -9`. Sections marked DONE keep their original findings — they are
+> deploy has since been performed with no `kill -9`. **P0-1 (#122) shipped in review**: webhook intake no
+> longer shares one transcript — the adapter posts `{kind, subject, requestId, content}` to a factory-owned
+> `/factory/intake`, which opens a conversation per `(kind, subject)` with only that kind's tools (§5.29 of
+> the plan). The live end-to-end proof is still owed: it needs inference, and **`aurora.infinidigm:8888` was
+> unreachable** while this was authored (`ping: sendto: No route to host`) — which also means no factory work
+> can run at all until that endpoint answers. Sections marked DONE keep their original findings — they are
 > why the fix looks the way it does.
 
 **Purpose:** start a fresh session from one file. Everything below was verified by running commands on
@@ -52,7 +57,7 @@ proof · #120 (real doc work, specified by a refinement brief) · #78 deferred �
 
 ## 3. P0 — blockers before any "production" claim
 
-### P0-1 · #122 silent task loss (transcript poisoning) — ~1 day
+### P0-1 · #122 silent task loss (transcript poisoning) — DONE in review, live proof owed
 The root agent refused `refine_issue` three times while a wire capture proved the tool was in the request:
 
 ```
@@ -71,6 +76,20 @@ conversation recorded a contrary claim.
 conversation (matches this repo's capability-removal posture); or expose `Conversation.reset()`/compaction over
 HTTP (kernel API exists, app server has no route). **Do not** fix with more prompt text — the transcript
 produces the counter-example.
+
+**What shipped.** The first option, taken: `factory/intake-router.ts` adds `POST /factory/intake`, registered via
+`createCoreInstance({ routes })` so it sits behind the kernel's bearer gate, and the adapter posts
+`{ kind, subject, requestId, content }` there instead of to `/tasks`. The instance opens one conversation per
+`(kind, subject)` — `issue:#123`, `pr-feedback:#45`, `refine:#123` — created with exactly that kind's tools: a
+refinement conversation is born with `refine_issue` and nothing else, so no transcript it could ever have
+written contains "I don't have refine_issue". `(kind, subject)` rather than per-event because the kernel settles
+`requestId` *per conversation*; a stable conversation is what GitHub redelivery dedupe attaches to. Root keeps
+its re-asserted capabilities and remains what the gates and an operator on `/tasks` drive. Full reasoning, the
+residual crash window, and the verification status: §5.29 of the plan; operator-facing "where did my event go":
+runbook §6b.
+
+*Still owed:* one real `refine` label producing a brief from a one-tool conversation, on the deployed fleet. The
+real-kernel check for it (`factory/intake-boot.test.ts`) is written and skips without an inference endpoint.
 
 ### P0-2 · Re-run the nine-gate battery on current `main` — ~half a day wall time
 Last PASS was 105 commits and ~29 merged PRs ago. Gates: `gates/g{0..5}-*.mjs`, `gates/m1-two-repos.mjs`,

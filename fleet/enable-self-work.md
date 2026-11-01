@@ -330,7 +330,7 @@ Other refusals, all before any inference is spent: sender is a bot; the issue is
 dispatch and immediately before posting); `/refine` directive longer than 2000 characters (refused rather than
 truncated, because the directive *is* the request); repository has `refine: false`.
 
-### Gotcha found while verifying this live: capabilities and a long-lived root conversation
+### Gotcha found while verifying this live: capabilities and a long-lived root conversation (#122)
 
 Two separate things can make a refinement (or any newly shipped tool) unreachable, and they look identical
 from the outside — the boot log says the feature is enabled either way.
@@ -345,9 +345,45 @@ from the outside — the boot log says the feature is enabled either way.
    even with the tool present in the request (verified by capturing the outbound request through a logging
    proxy). Nothing in the transcript is proof of what the model was offered.
 
-Diagnostic when a task seems ignored: check the boot log for the capability line, then read the root
-conversation's newest assistant turn in the instance store. If it claims a tool is missing, do not trust it —
-compare against the request the endpoint actually received before changing any code.
+Diagnostic when a task seems ignored: check the boot log for the capability line, then read the conversation
+that event landed in (below). If it claims a tool is missing, do not trust it — compare against the request the
+endpoint actually received before changing any code.
+
+**What changed because of it (#122).** The root conversation used to be where every webhook event in the fleet
+landed, so one transcript carried every issue, every PR comment and every refinement ever handled. That is what
+made the second failure mode above self-reinforcing: a refusal written while working on issue A was evidence
+against a tool on issue B. Webhook intake no longer posts to root. The adapter calls the factory's own
+`POST /factory/intake` with `{ kind, subject, requestId, content }`, and the instance opens one conversation per
+`(kind, subject)` — `issue:#123`, `pr-feedback:#45`, `refine:#123` — created with exactly the tools that kind is
+allowed (`refine:*` gets `refine_issue` and nothing else; orchestration gets the orchestrator's set, minus
+`merge_pr` when policy says so). Root keeps its re-asserted capabilities and remains what the gates and an
+operator driving `/tasks` talk to.
+
+Two properties that are the reason for the split, both worth remembering when changing this path:
+
+- **Scope of poisoning.** A conversation can only be misled by its own history now, and a refinement
+  conversation has never contained a turn where `refine_issue` was absent.
+- **Exactly-once survives.** `requestId` settlement is *per conversation* in the kernel. That is why the key is
+  `(kind, subject)` and not one-conversation-per-event: GitHub redelivers, and a stable conversation is what lets
+  the core absorb the duplicate. The adapter must keep sending a stable `subject`.
+
+Where an event went:
+
+```bash
+# Named conversations, newest intake first
+# routes.json is a top-level list; the instance token is per route
+curl -s -H "Authorization: Bearer $(python3 -c "import json;print(json.load(open('fleet/data/routes.json'))[0]['token'])")" \
+  http://127.0.0.1:64926/conversations | python3 -c "import json,sys;[print(c['id'], c['name'], c['model']) for c in json.load(sys.stdin)['conversations'] if str(c['name']).startswith('intake')]"
+
+# The durable (kind,subject) → conversation map and the handled-request tail. The column is `record`
+# (verified against the live store: documents(id, kind, family, key_value, scope_kind, owner_id, …, record)).
+sqlite3 factory-instances/lalanikarim_drydock/engram-data/agent.sqlite \
+  "select substr(record,1,400) from documents where kind='factory.intake-ledger'"
+```
+
+The boot log states the posture once at startup: `intake routing — issue/pr-feedback open an orchestration
+conversation per issue (N tools), refine opens a refinement conversation per issue (1 tool); the root
+conversation is no longer on the webhook path`.
 
 ## 7. Failed deliveries are not retried — re-drive them yourself (#107)
 

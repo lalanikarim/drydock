@@ -154,7 +154,7 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveR
 }
 
 /**
- * Build a dispatch(repo, event) that forwards to the owning instance's /tasks.
+ * Build a dispatch(repo, event) that forwards to the owning instance's /factory/intake.
  *
  * Two shapes of task come out of one webhook endpoint (#67):
  *
@@ -168,6 +168,13 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveR
  * A policy refusal returns { accepted: false, reason } instead of throwing: the intake answers 2xx so
  * GitHub stops retrying something that will be refused identically forever, while a thrown error
  * still means "502, retry me". `fetchPrFacts` and `gitAuth` are injectable so tests never shell out.
+ *
+ * Why `/factory/intake` rather than the kernel's `/tasks` (#122): `/tasks` without a conversationId lands
+ * in the one long-lived root conversation, so every issue, PR and refinement in this fleet shared a single
+ * transcript — and a model that once wrote "I don't have that tool" reads its own sentence as evidence in
+ * every later turn. The intake route opens a conversation per (kind, subject) with only that kind's tools.
+ * `subject` is what makes it stable across GitHub redeliveries, which is what keeps the core's exactly-once
+ * `requestId` settlement working; `/tasks` remains for operators and the gates, which drive root on purpose.
  */
 export function makeRouteDispatch(
   routes: Route[],
@@ -185,7 +192,7 @@ export function makeRouteDispatch(
   const auth: GitAuth = gitAuth ?? createGitAuth();
   return async (repo: string, event: any) => {
     const route = byRepo.get(repo);
-    if (!route?.target) throw new Error(`no /tasks target configured for ${repo}`);
+    if (!route?.target) throw new Error(`no instance target configured for ${repo}`);
 
     // Same classifier the intake used to accept this delivery — re-derived rather than trusted from
     // the caller, so a dispatcher invoked by anything else still applies the same rules.
@@ -199,6 +206,9 @@ export function makeRouteDispatch(
 
     let requestId: string;
     let content: string;
+    // Conversation scope key on the instance side: one conversation per (kind, subject). Numbers are what
+    // GitHub guarantees to repeat for redeliveries of the same event, so they are what dedupe rides on.
+    let subject: string;
     if (verdict.kind === "refine") {
       // Refinement reads and writes prose, so it still gets a liveness check: an event for an issue that
       // closed while this was in flight would otherwise post a brief onto a dead thread.
@@ -210,9 +220,13 @@ export function makeRouteDispatch(
       if (state !== "open") return { accepted: false, reason: `issue #${issueNumber} is ${state}, not open` };
       const { trigger, guidance, sender } = refineTriggerFromEvent(event);
       requestId = verdict.requestId;
+      subject = `#${issueNumber}`;
       content = renderRefineContent(event, { trigger, guidance, sender });
     } else if (verdict.kind === "issue") {
       requestId = intakeRequestId(event);
+      const issueNumber = event?.issue?.number;
+      if (!Number.isInteger(issueNumber)) return { accepted: false, reason: "issue event does not identify an issue" };
+      subject = `#${issueNumber}`;
       content = renderIntakeContent(event);
     } else {
       const prNumber = prNumberFromEvent(event);
@@ -230,18 +244,19 @@ export function makeRouteDispatch(
         directive: directiveFromEvent(event),
         sender: event?.sender?.login ?? "unknown",
       });
+      subject = `#${prNumber}`;
     }
 
-    const res = await fetch(`${route.target.replace(/\/$/, "")}/tasks`, {
+    const res = await fetch(`${route.target.replace(/\/$/, "")}/factory/intake`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(route.token ? { authorization: `Bearer ${route.token}` } : {}),
       },
-      body: JSON.stringify({ requestId, content }),
+      body: JSON.stringify({ kind: verdict.kind, subject, requestId, content }),
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`factory for ${repo} rejected task (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    if (!res.ok) throw new Error(`factory for ${repo} rejected intake (HTTP ${res.status}): ${text.slice(0, 200)}`);
     return JSON.parse(text);
   };
 }
