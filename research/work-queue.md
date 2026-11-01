@@ -4,6 +4,11 @@ Refreshed against `main` after PRs #98–#111. The previous version of this file
 
 Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) · 🤖🧑 = I prepare, you execute the last step.
 
+> **Superseded on 2026-11-01 (evening) by [`production-readiness-2026-11-01.md`](production-readiness-2026-11-01.md)** —
+> current verified state, P0/P1/P2 tiers with effort estimates, the accepted definition of "production-ready", and
+> cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
+> newer document references by number (queue 7, 8b, 11, 13).
+
 ## Open now, ranked
 
 | # | Item | Owner | Depends on | Done when |
