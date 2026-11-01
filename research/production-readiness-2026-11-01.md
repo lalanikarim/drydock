@@ -78,6 +78,15 @@ is not running); held by pid M`). Hypothesis in issue #110: the bounded-exit tim
 signal has nothing to do — re-arm on every signal, and make "gave up restarting children" a bounded shutdown
 instead of a zombie that keeps accepting webhooks.
 
+**Consequence, filed as #125:** because `kill -9` is currently how deploys finish, **the supervisor's children are
+orphaned**. Found live on 2026-11-01: an instance from a `SIGKILL`ed supervisor still running an hour later at
+`ppid 1`, HTTP server up and `agent.sqlite` open, while `routes.json` pointed at its replacement — two harnesses
+over one durable store. `pragma quick_check` returned `ok`, so no damage was done, but that is luck-shaped: SQLite
+locks protect bytes, not invariants like "one process owns this issue's refusal budget". The #108 lock guards the
+supervisor role and routes file, **not** the per-repo store. Fix either by owning the process group (children die
+with the supervisor) or by a second lock at store granularity taken before the harness opens. Until then, every
+deploy must end with the orphan check in §8 of the runbook.
+
 ### P0-4 · No backup/restore story for the durable store — ~half a day + one real drill
 `factory-instances/<repo>/engram-data/agent.sqlite` **is** the factory: approvals, submissions, lessons,
 refusal budgets, task graph. Zero mentions of backup or restore anywhere in `fleet/*.md` or the plan. Needs: a
@@ -148,7 +157,9 @@ feature is unreachable.** Drive the real path; when a model's account contradict
 ## 8. Operating notes for the next session (things that cost time to learn)
 
 - **Restart recipe:** `kill -TERM $(cat fleet/data/routes.json.lock)`; if still alive after ~5 s, `kill -9`
-  (P0-3), then start and confirm the three boot lines + `/health`. Verify exactly one supervisor by lock owner.
+  (P0-3), then **check for orphaned children** — `ps -eo pid,ppid,etime,command | grep factory/main.ts` and kill
+  anything at `ppid 1` (#125, two harnesses on one store) — then start and confirm the three boot lines +
+  `/health`. Verify exactly one supervisor by lock owner and exactly one instance child by `PPID`.
 - **Never run two supervisors** — they rewrite the shared routes file with different per-route tokens and every
   in-flight adapter refuses deliveries (#107). The lock does this job; don't disable it to "just try something".
 - **Poll intervals ≤30 s, never sleep >30 s at a time.**

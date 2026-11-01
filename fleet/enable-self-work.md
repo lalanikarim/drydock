@@ -436,6 +436,21 @@ pgrep -fl "node .*fleet/supervisor.ts run"                          # node proce
 
 A second supervisor now refuses to start and names the live pid rather than rewriting the shared routes file; if the lock is stale after a crash it is reclaimed automatically, and if it is unparsable the new process refuses until a human looks at it.
 
+**Check for orphaned children too — the lock does not cover them (#125).** `SIGKILL`ing a supervisor leaves its
+per-repo instance processes running, reparented to launchd: HTTP server up, durable store open, invisible to
+`routes.json`. Two harnesses over one `agent.sqlite` is unsafe by construction even when the bytes survive
+(`pragma quick_check` said `ok` after an hour of exactly that), because in-memory state — refusal budgets,
+resolved capabilities, task graphs — diverges between them.
+
+```bash
+cat fleet/data/routes.json.lock                                      # the one supervisor
+ps -eo pid,ppid,etime,command | grep "factory/main.ts" | grep -v grep # children with parents
+```
+
+Any `factory/main.ts` whose `PPID` is `1` — or anything other than the lock owner — is an orphan: `kill -TERM`
+it (children honour `SIGTERM`; it is supervisors that don't, #110) and confirm exactly one remains. The count
+alone is not evidence; the `PPID` column is what distinguishes a live child from an orphan.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
