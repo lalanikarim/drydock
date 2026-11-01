@@ -317,8 +317,14 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
       }
 
       // Routes drift check FIRST: if the policy file changed since this adapter started, refuse on
-      // old authority and let the checker terminate us. GitHub retries the delivery; the supervisor
-      // brings the adapter back against the new file.
+      // old authority and let the checker terminate us.
+      //
+      // 503 is the honest status for "not while I am reconfiguring", but it buys no recovery: GitHub does
+      // NOT automatically redeliver failed deliveries
+      // (https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries), so this
+      // event is gone unless something re-drives it. Verified against the live hook log during #107: one
+      // attempt, status `Invalid HTTP Response: 503`, nothing after. The supervisor brings the adapter
+      // back against the new file; recovering *this* delivery is the redelivery sweep's job.
       if (routesDriftCheck) {
         try {
           routesDriftCheck();
