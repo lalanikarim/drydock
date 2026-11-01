@@ -50,6 +50,10 @@ export const REGISTRY_DEFAULTS = {
   requireVerification: true,
   // Comments on this repo's open PRs are NOT a trigger unless a repo opts in (#67).
   prFeedback: false,
+  // Refinement (#65) is opt-in for the same reason: it turns an issue label and an issue comment into an
+  // inference-costing trigger. Its only output is a comment on the issue.
+  refine: false,
+  refineLabel: "refine",
 };
 
 export interface OracleBoot {
@@ -74,6 +78,14 @@ export interface RepoEntry {
    * supervisor copies it onto the route so the adapter enforces exactly what the registry declares.
    */
   prFeedback: boolean;
+  /**
+   * Opt-in for refinement (#65): `<refineLabel>` on an issue, or a `/refine …` comment on an issue, runs a
+   * read-only expansion pass whose sole output is a comment. Never a path to implementation — that still
+   * requires `eligibilityLabel` and every gate behind it.
+   */
+  refine: boolean;
+  /** Label that requests refinement. Must differ from eligibilityLabel (enforced at load). */
+  refineLabel: string;
   /** Path to the per-repo factory config, relative to the drydock repo root. Null only for a
    * disabled entry (enabling a repo without runtime config is a validation error). */
   configFile: string | null;
@@ -179,7 +191,7 @@ export function validateRegistry(raw: unknown): Registry {
 
   const d = (obj.defaults ?? {}) as Record<string, unknown>;
   for (const key of Object.keys(d)) {
-    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification", "prFeedback"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
+    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification", "prFeedback", "refine", "refineLabel"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
   }
   const defaults = {
     eligibilityLabel: typeof d.eligibilityLabel === "string" && d.eligibilityLabel.trim() ? d.eligibilityLabel.trim() : REGISTRY_DEFAULTS.eligibilityLabel,
@@ -187,6 +199,8 @@ export function validateRegistry(raw: unknown): Registry {
     enabled: d.enabled === undefined ? REGISTRY_DEFAULTS.enabled : requireBoolean(d.enabled, "defaults.enabled"),
     requireVerification: d.requireVerification === undefined ? REGISTRY_DEFAULTS.requireVerification : requireBoolean(d.requireVerification, "defaults.requireVerification"),
     prFeedback: d.prFeedback === undefined ? REGISTRY_DEFAULTS.prFeedback : requireBoolean(d.prFeedback, "defaults.prFeedback"),
+    refine: d.refine === undefined ? REGISTRY_DEFAULTS.refine : requireBoolean(d.refine, "defaults.refine"),
+    refineLabel: typeof d.refineLabel === "string" && d.refineLabel.trim() ? d.refineLabel.trim() : REGISTRY_DEFAULTS.refineLabel,
   };
 
   if (!Array.isArray(obj.repos) || obj.repos.length === 0) throw new Error("registry.repos must be a non-empty array");
@@ -195,7 +209,7 @@ export function validateRegistry(raw: unknown): Registry {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`registry.repos[${i}] must be an object`);
     const r = entry as Record<string, unknown>;
     for (const key of Object.keys(r)) {
-      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "note"].includes(key)) {
+      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "configFile", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "note"].includes(key)) {
         throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
@@ -225,6 +239,20 @@ export function validateRegistry(raw: unknown): Registry {
       ? r.eligibilityLabel.trim()
       : defaults.eligibilityLabel;
 
+    const refineEnabled = r.refine === undefined ? defaults.refine : requireBoolean(r.refine, `${repo}: refine`);
+    // Present-but-blank is refused rather than defaulted: a policy field that silently becomes something
+    // else is how "I set it and it did nothing" debugging starts.
+    if (r.refineLabel !== undefined && r.refineLabel !== null && !(typeof r.refineLabel === "string" && r.refineLabel.trim())) {
+      throw new Error(`${repo}: refineLabel must be a non-empty string when present`);
+    }
+    const refineLabelValue = typeof r.refineLabel === "string" && r.refineLabel.trim() ? r.refineLabel.trim() : defaults.refineLabel;
+    // One gesture must not be able to mean both "expand this" and "go build it". Caught at load rather
+    // than left to the classifier's runtime guard, because a registry that says `refine: true` while the
+    // two labels collide is a misconfiguration someone should have to fix, not a feature quietly off.
+    if (refineEnabled && refineLabelValue === eligibilityLabel) {
+      throw new Error(`${repo}: refineLabel and eligibilityLabel must differ (both are "${eligibilityLabel}") — one label cannot mean both "refine this" and "implement this"`);
+    }
+
     return {
       repo,
       enabled,
@@ -236,6 +264,8 @@ export function validateRegistry(raw: unknown): Registry {
       protectedPaths: validatePathList(r.protectedPaths, `${repo}: protectedPaths`) ?? [],
       requireVerification: r.requireVerification === undefined ? defaults.requireVerification : requireBoolean(r.requireVerification, `${repo}: requireVerification`),
       prFeedback: r.prFeedback === undefined ? defaults.prFeedback : requireBoolean(r.prFeedback, `${repo}: prFeedback`),
+      refine: refineEnabled,
+      refineLabel: refineLabelValue,
       ...(typeof r.note === "string" ? { note: r.note } : {}),
     };
   });

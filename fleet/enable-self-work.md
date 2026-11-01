@@ -252,6 +252,73 @@ gh api -X PATCH repos/lalanikarim/drydock/hooks/<hook-id> -f name=webhook \
 
 **If a comment seems ignored,** read `data/intake-adapter.jsonl`: every delivery lands there with `accepted`, `reason` and (for refusals decided after reading PR state) `refused after state check: …`. A 200 with `accepted: false` is a policy decision; a 5xx is a broken listener or instance.
 
+## 6b. Asking for a refinement pass (`/refine`, #65)
+
+Where `/factory` reworks a pull request, `/refine` improves an **issue** — and starts no work. It exists
+because ticket quality, not model quality, decided the outcome of #99 (six worker+review cycles spent on a
+task that required a file the path scope forbids) versus #105 (same goal, written narrowly, merged in one
+pass).
+
+### Triggers
+
+| what you do | what happens |
+|---|---|
+| add the **`refine`** label to an issue | one refinement pass; brief posted as a comment |
+| comment **`/refine <guidance>`** on an issue | one pass per comment, with your guidance folded in |
+| comment **`/refine`** with nothing after it | a plain "expand this" pass — the common case |
+
+Both are opt-in per repository (`refine: true` in `factory/repo-registry.json`; label name configurable via
+`refineLabel`). The registry **refuses to load** if `refineLabel` equals `eligibilityLabel`: one gesture must
+never be able to mean both "expand this" and "go build it".
+
+The label exists on GitHub before first use, same as `build`:
+
+```bash
+gh api -l repos/lalanikarim/drydock/labels -f name=refine -f color=ededed \
+  -d '{"name":"refine","color":"ededed","description":"Ask the factory to expand this issue into an actionable brief (no work started)"}'
+```
+
+### What the refiner can and cannot do
+
+It gets **one tool: `read`**, against a host clone of the default branch with the remote URL scrubbed — so it
+can cite real files and cannot change a byte, push anything, comment, or label. It has no network. The brief
+is posted by the factory host after parsing succeeds, and only if the issue is still open at that moment.
+
+**A brief grants nothing.** Nothing consumes it automatically. To act on a refined issue you add the
+repository's eligibility label (`build` for drydock), and the change then passes path scope, verification and
+independent review like any other. That is what makes an expansion pass safe to allow on issues anyone can
+open: a bad refinement can mislead a reader, it cannot widen what a run may touch.
+
+### Reading the output
+
+The comment has a fixed shape — brief, goal, acceptance criteria, explicitly out of scope, verification, and
+optional follow-ups/questions — with a footer stating that nothing was changed. Two sections are load-bearing
+and are the reason to use this:
+
+- **OUT OF SCOPE** is never allowed to be empty. Most wasted cycles in #99 came from nobody having written
+  down what the task did *not* include.
+- **VERIFICATION** must name a command or manual check per criterion, so "done" is decidable before inference
+  starts.
+
+Adjacent work lands under **FOLLOW-UPS**: file it as its own issue if you want it, ignore it otherwise. The
+refiner is told not to write criteria requiring files outside the repo's `pathAllowlist`, and to say so under
+QUESTIONS instead — which is precisely the failure mode that cost #99 six attempts.
+
+### When no comment appears
+
+Deliberate silence means the brief did not parse (missing section, or an acceptance/verification list with no
+items) — a partial brief would read like an approved plan, so nothing is posted and the raw text stays in the
+task outcome for debugging:
+
+```bash
+sqlite3 factory-instances/lalanikarim_drydock/engram-data/agent.sqlite \
+  "select id, kind, substr(payload,1,300) from tasks where kind like '%refine%' order by id desc limit 3"
+```
+
+Other refusals, all before any inference is spent: sender is a bot; the issue is closed (checked twice — at
+dispatch and immediately before posting); `/refine` directive longer than 2000 characters (refused rather than
+truncated, because the directive *is* the request); repository has `refine: false`.
+
 ## 7. Failed deliveries are not retried — re-drive them yourself (#107)
 
 **Assumption that was wrong, and is now gone from the codebase:** that GitHub retries a failed webhook delivery. It does not — [Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries) states it twice. A 503 from an adapter mid-restart, a timeout while the laptop slept, a funnel blip: recorded once, never attempted again. Our own drift path answered 503 *because* of the old comment claiming that bought recovery; it buys nothing.

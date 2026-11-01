@@ -650,3 +650,78 @@ ended its own envelope mid-prompt and continued as trusted instruction text — 
 **What this does not claim.** Delimiters are a fence, not a sandbox: an issue body can still contain prose that reads like instructions ("ignore previous rules"), and a model may be talkable in ways no marker prevents. The controls that actually hold against a hostile issue are the ones with teeth — path scope, verification, review, `merge_pr` removed by policy, and now the refusal budget. This closes a structural escape from the envelope; it does not make the issue body trustworthy, and the factory should never have to trust it.
 
 7 checks in `test/untrusted-envelope.test.mjs`.
+
+### 5.25 Refinement: spend minutes on the ticket, not six worker cycles (2026-11-01, #65)
+
+**The evidence is this repo's own history.** Issue **#99** was dispatched as "document the implementation
+directories" and consumed **six full worker+review cycles** before a human stopped it: every attempt did the
+only thing the ticket allowed and hit the path-scope refusal, because doing it properly also wanted
+`package.json`. Issue **#105** was the same goal rewritten narrowly enough to succeed in one pass — PR #106
+merged to `main`. Same model, same gates, same repo. The variable was the ticket.
+
+Refinement makes that rewrite a repeatable step instead of a favor from whoever happens to notice.
+
+**Two triggers, both opt-in per repository** (`refine` in `factory/repo-registry.json`, default false, plus
+a configurable `refineLabel` defaulting to `"refine"`):
+
+| trigger | event | request id |
+|---|---|---|
+| `<refineLabel>` on an issue | `issues.labeled` | `issue-<n>-refine` — **one pass per issue** |
+| `/refine <guidance>` on an issue | `issue_comment.created` | `issue-<n>-refine-c-<commentId>` — one pass per comment |
+
+A label is deliberately deduped to a single pass: re-adding a label is more often an accident than a request
+for a second brief, and someone who wants another pass has `/refine`. Bots are refused on both paths (a bot
+requesting refinement is how a comment loop starts), and — mirroring #67 — the dispatcher **re-reads live
+state** with the factory credential and refuses if the issue is not `open`, because the payload is a snapshot
+of a moment that has already passed.
+
+**The refiner's capability is one tool.** The conversation is configured with `tools: ["read"]` against a
+host-prepared clone of the default branch whose **remote URL is scrubbed after cloning**, so no credential
+survives in `.git/config` inside a conversation that has a filesystem. No write, edit, bash, git, or
+labeling capability exists to be talked into. Posting happens host-side, after parsing, by code that never
+asks the model — and re-checks that the issue is still open immediately before writing, because a refinement
+takes minutes.
+
+**Parsing fails closed.** The comment is posted only if `BRIEF / GOAL / ACCEPTANCE / OUT OF SCOPE /
+VERIFICATION` all parse, with at least one acceptance criterion and one verification check. A malformed brief
+produces **no comment** and a failed outcome carrying the raw text for debugging. Half a brief is worse than
+none: a partial acceptance list reads like an approved plan. Section keys are matched at line start, because
+the prompt discusses "acceptance criteria" in prose and a substring parser would find them there.
+
+**Expansion is conservative by policy, enforced outside the prompt.** The rule given to the refiner is that
+the issue owns the intent: clarify, decompose, make testable — anything adjacent goes to `FOLLOW-UPS` for a
+human to file separately, never into acceptance criteria. What backs that prompt rule is a structural fact:
+**a brief grants nothing.** Nothing consumes it automatically; acting still requires the eligibility label
+plus path scope, verification, review, and (for drydock) no merge tool at all. So the failure mode of a bad
+or hostile refinement is a misleading comment, not a widened blast radius — the same accepted residual as
+R13, restated because this feature's entire product is text that reads like instructions.
+
+**Cost.** One bounded inference session per trigger (`wallSecsPerRefine` default 600s, well under the
+worker's), with read access to the repo so criteria are grounded in files rather than guesses.
+
+### 5.25.1 Found while wiring this: the orchestrator's own prompt was unsanitized (#95 gap)
+
+#95 sanitized issue bodies at fetch time and in worker/reviewer prompts. **`renderIntakeContent` — the text
+that becomes the orchestrator's first message — was still embedding `issue.title` and `issue.body` raw inside
+`<untrusted>`.** A body containing `</untrusted>` closed its own envelope there exactly as it would have in a
+worker prompt. Fixed by routing that renderer through the shared `wrapUntrusted`/`sanitizeUntrusted`, with a
+test asserting exactly two envelope boundaries and that the smuggled instruction cannot appear outside them.
+
+Worth recording as the general lesson: **a sanitizer added at one layer is not a property of the data.** Three
+of the four render sites were covered; the fourth was the one nobody thought to check because it is "just"
+routing text.
+
+### 5.25.2 Honest limits
+
+- **Intent binding is prompt-level.** Nothing structurally stops a refiner from writing criteria that drift
+  from what the author meant; a human reads the comment before acting, and the footer says in plain words that
+  nothing was changed and no capability attaches.
+- **Misrouting is possible in principle.** The orchestrator keeps `delegate`/`open_draft_pr` even for a
+  refinement request, so the instruction's first line is a prohibition (`REFINEMENT REQUEST … do nothing
+  else`) rather than a description. That is mitigation by prompt, not enforcement; the enforcement remains
+  that implementation output must pass every gate regardless of who asked.
+- **A brief can be confidently wrong.** Read access prevents invented filenames better than an instruction
+  does, but it cannot prevent a plausible misreading of code the refiner skimmed.
+- **No live end-to-end yet at PR time.** Unit and wiring coverage is complete (26 checks across two files);
+  the label→adapter→instance→comment path gets exercised against real GitHub after merge, per this repo's
+  standing rule that a fake proves your assumption, not the API.
