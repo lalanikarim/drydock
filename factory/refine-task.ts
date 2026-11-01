@@ -18,6 +18,7 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { configure, defineTask, defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
+import type { Notifier } from "./notify-telegram.ts";
 import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { gitAuthEnv, type GitAuth } from "./github-auth.ts";
@@ -131,9 +132,11 @@ export interface RefineTaskOptions {
   image?: string;
   sandboxPolicy?: any;
   pathScope?: PathScope;
+  /** Operator notification (#64), fired host-side after the brief is actually posted. */
+  notify?: Notifier;
 }
 
-export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerRefine = 600, pathScope }: RefineTaskOptions) {
+export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerRefine = 600, pathScope, notify }: RefineTaskOptions) {
   return defineTask({
     name: "factory.refine",
     version: 1,
@@ -257,6 +260,15 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
         const body = renderRefineComment(parsed.brief, { repo: fixturesRepo, issueNumber, trigger, sender });
         const url = await postRefineComment(fixturesRepo, issueNumber, body, token);
         console.error(`[factory.refine] posted refinement for #${issueNumber} -> ${url}`);
+        // Told only after the comment exists (#64), and never at the cost of the outcome: a failed
+        // notification leaves a completed refinement, not a failed one.
+        if (notify) {
+          try {
+            await notify({ kind: "refine_posted", repo: fixturesRepo, issueNumber, commentUrl: url });
+          } catch (e) {
+            console.error(`[factory.refine] notification failed for #${issueNumber}: ${String(e)}`);
+          }
+        }
         await runtime.commit(
           () => ({ status: "completing", outcome: { status: "completed", result: { posted: true, commentUrl: url, brief: parsed.brief } } }),
           ctx,

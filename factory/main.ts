@@ -26,6 +26,7 @@ import { createGitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
 import { loadRootEnv } from "./env-file.ts";
 import { RefusalBudget } from "./refusal-budget.ts";
+import { createNotifier } from "./notify-telegram.ts";
 import { syncRootCapabilities } from "./root-capabilities.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -178,6 +179,20 @@ async function main() {
   // answerable only by reading the durable store (that is how #99's six cycles were found).
   const refusalBudget = new RefusalBudget({ log: (m) => console.warn(`[factory] ${repo}: refusal budget — ${m}`) });
 
+  // Operator notification (#64): deployment-level, not repo policy — who to tell, not what is allowed. It is
+  // absent rather than no-oping when unconfigured, so "notifications disabled" stays a state in the log
+  // instead of a function that quietly did nothing.
+  const notifier = createNotifier({
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+    log: (line) => console.log(`[factory] ${repo}: ${line}`),
+  });
+  console.log(
+    notifier
+      ? `[factory] ${repo}: telegram notifications on (chat ${String(process.env.TELEGRAM_CHAT_ID).slice(-6)}) — draft PRs, stopped runs and refinement briefs`
+      : `[factory] ${repo}: notifications disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to be told when a draft PR opens or a run stops`,
+  );
+
   const pipelineOpts = {
     refusalBudget,
     workDir: workRoot,
@@ -187,6 +202,7 @@ async function main() {
     // Refinement (#65) is registry policy like the two above, so the tool exists exactly when the route
     // accepts a refinement trigger — no drift between "what can start this" and "what can it then do".
     refine: policy.refine,
+    notify: notifier,
     pathScope: scopeOf(policy),
     gitAuth,
     modelRef,
