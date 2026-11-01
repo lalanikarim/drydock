@@ -252,6 +252,41 @@ gh api -X PATCH repos/lalanikarim/drydock/hooks/<hook-id> -f name=webhook \
 
 **If a comment seems ignored,** read `data/intake-adapter.jsonl`: every delivery lands there with `accepted`, `reason` and (for refusals decided after reading PR state) `refused after state check: …`. A 200 with `accepted: false` is a policy decision; a 5xx is a broken listener or instance.
 
+## 7. Failed deliveries are not retried — re-drive them yourself (#107)
+
+**Assumption that was wrong, and is now gone from the codebase:** that GitHub retries a failed webhook delivery. It does not — [Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries) states it twice. A 503 from an adapter mid-restart, a timeout while the laptop slept, a funnel blip: recorded once, never attempted again. Our own drift path answered 503 *because* of the old comment claiming that bought recovery; it buys nothing.
+
+Run the sweep after any supervisor restart, and on a schedule otherwise:
+
+```bash
+# report only (default) — nothing is re-driven
+node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --since 2026-11-01T00:00:00Z
+
+# re-drive everything it found
+node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --since … --apply
+
+# re-drive named deliveries only (preferred once the window holds real work)
+node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --only 3851475922366504960 --apply
+```
+
+What the output means:
+
+- **A policy refusal is never listed.** Those answer 2xx, GitHub records them as `OK`, and re-driving them would replay something we rejected on purpose. The sweep only ever sees infrastructure failures (`timeout`, `failed to connect to host`, `Invalid HTTP Response: 50x`).
+- **`HTTP 202 queued` is not delivered.** Check again next run; the second run's report is the confirmation.
+- **Re-driving an already-consumed issue is safe.** Intake deduplicates on `requestId` (`issue-<n>`), so a redelivered `labeled` event for work that already ran does not start a second worker. Re-driving a `ping` or any non-eligible event is inert — it lands as `not an eligible event`.
+- **Delivery ids are 19 digits.** They exceed `Number.MAX_SAFE_INTEGER`, so anything that parses the delivery log with plain `JSON.parse` rounds them and then addresses a record that does not exist. The tool quotes oversized ids before parsing (`safeParse`) for exactly that reason; don't reimplement it with `jq -r .id` piped through a JS number either.
+
+First run against this deployment, 2026-11-01: **72 delivery records inspected, 34 not delivered since 2026-10-31** — 18 connection failures (funnel down), 5×`503`, 4×`502`, 4 connect failures, 3×`403` (the secret-mismatch window). Every one of those was an event the factory never saw, and nothing in any log said so. Treat that number as a baseline to drive toward zero, not as reassuring history.
+
+Verifying exactly one supervisor is running (the churn that started #107):
+
+```bash
+ps -eo pid,command | grep -c "[s]upervisor.ts run"   # must print 1
+cat fleet/data/routes.json.lock                       # the pid that holds it
+```
+
+A second supervisor now refuses to start and names the live pid rather than rewriting the shared routes file; if the lock is stale after a crash it is reclaimed automatically, and if it is unparsable the new process refuses until a human looks at it.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
