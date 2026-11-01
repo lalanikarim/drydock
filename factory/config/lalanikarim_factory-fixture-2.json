@@ -1,8 +1,0 @@
-{
-  "repo": "lalanikarim/factory-fixture-2",
-  "models": {
-    "provider": "aurora",
-    "modelId": "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
-  },
-  "testCommand": "node --test"
-}

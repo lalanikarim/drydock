@@ -73,16 +73,15 @@ test("a disabled entry still refuses to start, whatever the production registry 
   // decision: flipping the decision broke the test, and worse, deleting the test would have hidden
   // the enforcement. Now the disabled repo is synthetic, so the mechanism is pinned independently of
   // which repos we currently allow.
-  // loadRegistry resolves configFile against <dirname(registry)>/.., because a real registry lives at
-  // <root>/factory/repo-registry.json — so the fake has to sit in that layout, not just anywhere.
-  mkdirSync(join(workDir, "factory", "config"), { recursive: true });
-  writeFileSync(join(workDir, "factory", "config", "allowed_one.json"), JSON.stringify({ repo: "allowed/one", testCommand: "true" }));
+  // Policy load is now independent of deployment: the registry validates anywhere, and whether runtime config
+  // exists is a separate question (missingRuntimeConfigs). So a synthetic registry needs no sibling files.
+  mkdirSync(join(workDir, "factory"), { recursive: true });
   const file = join(workDir, "factory", "repo-registry.json");
   writeFileSync(
     file,
     JSON.stringify({
       repos: [
-        { repo: "allowed/one", enabled: true, autoMerge: false, configFile: "factory/config/allowed_one.json" },
+        { repo: "allowed/one", enabled: true, autoMerge: false },
         { repo: "paused/two", enabled: false, autoMerge: false, note: "registered but not running" },
       ],
     }),

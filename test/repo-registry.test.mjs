@@ -7,13 +7,15 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname;
-const { validateRegistry, loadRegistry, requireRepo, requireEnabledRepo, enabledRepos, registryRepoNames } = await import(
+const { validateRegistry, loadRegistry, requireRepo, requireEnabledRepo, enabledRepos, registryRepoNames, missingRuntimeConfigs } = await import(
   "../factory/repo-registry.ts"
 );
+const { configDir } = await import("../factory/factory-config.ts");
 const { loadProbes } = await import("../gates/behavior-probes.mjs");
 const { loadFactoryConfig } = await import("../factory/factory-config.ts");
 
@@ -22,7 +24,6 @@ const BOOT_ENV = { command: "node", args: ["src/server.js"], portFrom: "env", en
 
 const entry = (over = {}) => ({
   repo: "octo/thing",
-  configFile: "factory/config/x.json",
   oracleBoot: BOOT_STDOUT,
   ...over,
 });
@@ -52,14 +53,42 @@ test("a disabled repo must not carry a merge grant", () => {
     /disabled registry entry must not declare autoMerge/,
   );
   // The legitimate shape: disabled AND explicitly not auto-merging.
-  const registry = validateRegistry({ repos: [entry({ enabled: false, autoMerge: false, configFile: null })] });
+  const registry = validateRegistry({ repos: [entry({ enabled: false, autoMerge: false })] });
   assert.equal(registry.repos[0].enabled, false);
 });
 
-test("an enabled repo needs runtime config", () => {
-  assert.throws(() => validateRegistry({ repos: [entry({ configFile: null })] }), /requires configFile/);
-  assert.throws(() => validateRegistry({ repos: [entry({ configFile: "/etc/passwd" })] }), /repo-relative/);
-  assert.throws(() => validateRegistry({ repos: [entry({ configFile: "../outside.json" })] }), /repo-relative/);
+test("configFile is gone from the schema, and the error names what replaced it", () => {
+  // A pointer field in policy let two things disagree about where runtime config lives. Convention replaced
+  // it, so the old key must be rejected loudly with a migration message rather than as an anonymous
+  // "unknown field" someone has to go dig through git history to understand.
+  assert.throws(
+    () => validateRegistry({ repos: [entry({ configFile: "factory/config/x.json" })] }),
+    /configFile was removed[\s\S]*DRYDOCK_CONFIG_DIR/,
+  );
+});
+
+test("missingRuntimeConfigs names every enabled repo without config — and none that has it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "drydock-cfgdir-"));
+  try {
+    writeFileSync(
+      join(dir, "octo_thing.json"),
+      JSON.stringify({ repo: "octo/thing", models: { provider: "p", modelId: "m-model" }, testCommand: "node --test" }),
+    );
+    const registry = validateRegistry({ repos: [entry(), entry({ repo: "octo/two" })] });
+    const missing = missingRuntimeConfigs(registry, { dir });
+    assert.deepEqual(missing.map((m) => m.repo), ["octo/two"], "the configured repo must not be reported");
+    assert.equal(missing[0].path, join(dir, "octo_two.json"), "names the path to create, not just the repo");
+
+    // Disabled entries are policy statements, not deployments: they need no file.
+    const withDisabled = validateRegistry({ repos: [entry({ repo: "octo/off", enabled: false, autoMerge: false })] });
+    assert.deepEqual(missingRuntimeConfigs(withDisabled, { dir }), []);
+
+    // `repos` narrows to what a fleet actually wants to start, so a partial deployment is not blocked by an
+    // unrelated enabled entry.
+    assert.deepEqual(missingRuntimeConfigs(registry, { dir, repos: ["octo/thing"] }), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("unknown fields are rejected rather than ignored", () => {
@@ -183,15 +212,36 @@ test("no checked-in repo waives verification", () => {
   }
 });
 
-test("every registry entry's runtime config parses, including disabled repos", () => {
-  // A disabled entry is still checked in and reviewed; discovering that drydock's config has a bad
-  // field on the day we finally enable it is the worst possible time. loadRegistry checks existence,
-  // this checks content: it satisfies the runtime schema and agrees about repo identity.
+test("the checked-in config template validates and stays a template", () => {
+  // The template is the only config artifact in the tree now. It has to keep parsing as a shape (so a
+  // refactor of the schema cannot leave it describing a file nothing would accept), and it must stay
+  // obviously not-a-deployment: no real repo, no real model.
+  const cfg = loadFactoryConfig(join(ROOT, "factory", "config.example.json"));
+  assert.equal(cfg.repo, "owner/name", "template must not name a managed repo (a copy that forgets to change it boots as the wrong repo…)");
+  assert.ok(!/qwen|gpt|claude/i.test(cfg.models.modelId), `template pins a real model: ${cfg.models.modelId}`);
+});
+
+test("runtime configs on this machine parse and agree with the registry", (t) => {
+  // Deployment-side files, so they exist only where a fleet actually runs. CI has none — that is the point of
+  // moving them out — so this skips rather than pretending to have checked something.
+  const dir = configDir();
   const registry = loadRegistry();
-  for (const entry of registry.repos) {
-    if (!entry.configFile) continue;
-    const cfg = loadFactoryConfig(join(ROOT, entry.configFile));
-    assert.equal(cfg.repo, entry.repo, `${entry.configFile} declares ${cfg.repo}, registry says ${entry.repo}`);
+  const present = registry.repos.filter((r) => {
+    try {
+      readFileSync(join(dir, `${r.repo.replace("/", "_")}.json`), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (present.length === 0) {
+    t.skip(`no runtime configs in ${dir} (deployment files; absent on a CI runner)`);
+    return;
+  }
+  for (const entry of present) {
+    const path = join(dir, `${entry.repo.replace("/", "_")}.json`);
+    const cfg = loadFactoryConfig(path);
+    assert.equal(cfg.repo, entry.repo, `${path} declares ${cfg.repo}, registry says ${entry.repo}`);
     assert.ok(cfg.testCommand.length > 0, `${entry.repo} must declare how it is tested`);
   }
 });

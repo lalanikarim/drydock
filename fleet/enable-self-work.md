@@ -57,9 +57,21 @@ node gates/github-app-check.mjs                    # identity, grants, reach-vs-
 node gates/github-app-check.mjs --probe-push <owner/repo>   # optional: create+delete a ref to prove contents:write
 ```
 
-## 1. Fleet file (deployment, not checked in)
+## 1. Deployment files (not checked in)
 
-Create `fleet/fleet.local.json`. Keep the real secret in the environment — the supervisor prefers `GITHUB_WEBHOOK_SECRET_<owner>_<repo>` over the file value — and copy the shape from `fleet/fleet.example.json`:
+**1a. Per-repo runtime config — `$DRYDOCK_CONFIG_DIR`, outside the repository.** One file per managed repo, named `<owner>_<repo>.json`, default directory `~/.drydock/configs/`. Copy `factory/config.example.json` (the shape reference; it is never loaded) and set at least `models` and `testCommand`:
+
+```bash
+mkdir -p ~/.drydock/configs
+cp factory/config.example.json ~/.drydock/configs/lalanikarim_drydock.json
+$EDITOR ~/.drydock/configs/lalanikarim_drydock.json   # repo, models.provider, models.modelId, testCommand
+```
+
+**This is not a style preference.** `testCommand` is executed to decide whether a branch may be pushed. While these files lived at `factory/config/…` they were inside drydock's own path allowlist (`factory/`), so a self-run could have changed the command used to verify itself — see [`research/multi-repo-factory-plan.md`](../research/multi-repo-factory-plan.md) §5.28. Keep the directory outside any path scope a run can write, and treat it like `.env`: real values, never committed.
+
+Set `DRYDOCK_CONFIG_DIR` in `.env` to relocate it (a second machine, a CI box). The supervisor checks this **before** it takes the lock or writes routes: a missing file is one message naming every path, and nothing starts — children that boot, die, and respawn behind live routes is the failure this prevents.
+
+**1b. Fleet file — `fleet/fleet.local.json`.** Keep the real secret in the environment (the supervisor prefers `GITHUB_WEBHOOK_SECRET_<owner>_<repo>` over the file value) and copy the shape from `fleet/fleet.example.json`. Note there is no `config` key: runtime config is found by naming convention, which is the point — policy cannot point at a file inside the tree.
 
 ```json
 {
@@ -68,7 +80,6 @@ Create `fleet/fleet.local.json`. Keep the real secret in the environment — the
     {
       "repo": "lalanikarim/drydock",
       "secret": "placeholder-read-from-env",
-      "config": "../factory/config/lalanikarim_drydock.json",
       "instancesRoot": "../factory-instances",
       "allowedSenders": ["lalanikarim"]
     }
@@ -510,3 +521,45 @@ console.log(JSON.stringify(await sendTelegramMessage("drydock notification chann
 
 Expected: `{"ok":true,"status":200,"attempts":1}`. Deliberately sends a message — a notification feature whose
 delivery path is unverified is a notification feature you find out about by not hearing from it.
+
+## 9. Pre-flight checklist (a fresh machine, or before a demo)
+
+| # | Check | Command | Passes when |
+|---|---|---|---|
+| 1 | Runtime config exists for every repo in the fleet | `ls ~/.drydock/configs` (or `$DRYDOCK_CONFIG_DIR`) | one `<owner>_<repo>.json` each; see §1a |
+| 2 | Core is installed at the pinned version | `engram-core --version` | matches the pin in `docs/` / the runbook header |
+| 3 | `.env` complete | compare against `.env.example` | model base URL + key, App id/key/installation, per-repo webhook secrets, Telegram pair (optional) |
+| 4 | Registry says the repo is enabled | `node --experimental-strip-types factory/audit-registry.ts` | enabled, `eligibilityLabel: "agent"`, `autoMerge: false` |
+| 5 | App permission posture | `node gates/github-app-check.mjs` | every managed repo answers `200` on both read and write probes; `Can merge? YES` |
+| 6 | Nothing already holds the lock or the port | `cat fleet/data/routes.json.lock` (a bare pid; `ps -p <pid>` must fail), `lsof -nP -i :9700` | lock file absent or stale, listener port free |
+| 7 | Webhook points at the current funnel URL | `gh api repos/<repo>/hooks --jq '.[].config.url'` | URL matches `tailscale funnel status` |
+
+Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
+
+## 10. Shutdown & restart — what actually happens (2026-11-02)
+
+**Order:** stop the supervisor — `kill -TERM $(cat fleet/data/routes.json.lock)`, since that file holds the live supervisor pid. Children are in the supervisor's process group and are asked to exit before it returns.
+
+**What a clean stop looks like:**
+
+```
+[supervisor] SIGTERM — shutting down (send again to exit immediately)
+[factory:<repo>] [parent-watchdog] supervisor pid N exited; closing …
+[supervisor] child <repo> exited (code=0, signal=none)
+[supervisor] adapter exited (code=0)
+[supervisor] routes file updated: 0 live factories
+```
+
+The `parent-watchdog` line is the one that matters. Children watch their parent and close themselves when it disappears, so a supervisor killed with `SIGKILL` still leaves no harness running: within ~2 s each child notices (`getppid() === 1` after launchd reparents it), closes the core, exits, and its worktree stops being written to.
+
+**Verify, don't assume:**
+
+```bash
+cat fleet/data/routes.json.lock   # gone, or a pid `ps -p` cannot find
+lsof -nP -i :9700                 # listener released
+pgrep -fl "factory/main.ts|adapter.ts"   # nothing left holding an Engram store
+```
+
+**Restart:** `nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> log 2>&1 & disown`. If the funnel URL changed while it was down, re-point the webhooks (§4) — GitHub does not retry deliveries that failed against the old URL, and §7 is how you find out which ones.
+
+**Recovery if orphans do exist** (a pre-watchdog build, or a `SIGKILL` plus a hung child): see [`orphan-recovery-2026-11-01.md`](orphan-recovery-2026-11-01.md) — kill the old tree, confirm nothing shares the Engram store, then start one supervisor. Two harnesses over one durable store is the failure this whole section exists to prevent; the lock catches a second supervisor, and it does not catch anything else.

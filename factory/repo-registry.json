@@ -1,5 +1,5 @@
 {
-  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Runtime config stays in factory/config/<owner>_<repo>.json; the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true — see research/multi-repo-factory-plan.md §5.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md §5.11.",
+  "$comment": "Repo registry (policy, no secrets): which repos the factory manages and what it is allowed to do in each. Per-repo RUNTIME config (model pin, test/setup commands, budgets) is NOT here and no longer in the tree: it lives at $DRYDOCK_CONFIG_DIR/<owner>_<repo>.json (default ~/.drydock/configs), because testCommand is executed to decide whether a branch may be pushed and must not sit inside a path scope a run can edit (see research/multi-repo-factory-plan.md §5.28); the per-deployment supervision file with webhook secrets lives in fleet/. Four decisions are policy because their failure mode is not a crash: whether a repo may be auto-merged (autoMerge), which label makes an issue eligible for pickup (eligibilityLabel), which paths a run may change (pathAllowlist; vendor/ is protected everywhere regardless), and whether a passing test run is required before a branch may be pushed (requireVerification, default true — see research/multi-repo-factory-plan.md §5.19). Safety flags must be real booleans: Boolean(\"false\") is true, so strings are rejected at load. See research/multi-repo-factory-plan.md §5.11.",
   "defaults": {
     "eligibilityLabel": "agent",
     "autoMerge": true,
@@ -8,7 +8,6 @@
   "repos": [
     {
       "repo": "lalanikarim/factory-fixture",
-      "configFile": "factory/config/lalanikarim_factory-fixture.json",
       "pathAllowlist": [
         "src/",
         "test/",
@@ -26,7 +25,6 @@
     },
     {
       "repo": "lalanikarim/factory-fixture-2",
-      "configFile": "factory/config/lalanikarim_factory-fixture-2.json",
       "pathAllowlist": [
         "src/",
         "test/",
@@ -45,7 +43,6 @@
       "repo": "lalanikarim/drydock",
       "enabled": true,
       "autoMerge": false,
-      "configFile": "factory/config/lalanikarim_drydock.json",
       "pathAllowlist": [
         "factory/",
         "fleet/",
@@ -66,7 +63,6 @@
       "repo": "lalanikarim/engram",
       "enabled": true,
       "autoMerge": false,
-      "configFile": "factory/config/lalanikarim_engram.json",
       "pathAllowlist": [
         "app/src/",
         "app/test/",

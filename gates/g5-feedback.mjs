@@ -39,6 +39,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadFactoryEnv, spawnInstance, postTask, rootConversationId, waitForToolResult } from "./lib.ts";
+import { defaultConfigPathFor } from "../factory/factory-config.ts";
 
 const pexec = promisify(execFile);
 loadFactoryEnv();
@@ -91,7 +92,9 @@ async function classifyFix({ issueNumber }) {
 
 // Per-run factory config override: both steps share ONE lessons file even though
 // each gets a fresh instance root/store.
-const baseCfgPath = new URL("../factory/config/lalanikarim_factory-fixture.json", import.meta.url);
+// Runtime config is outside the tree now ($DRYDOCK_CONFIG_DIR); resolve it the way the factory does rather
+// than reaching for a path in the checkout that no longer exists.
+const baseCfgPath = new URL(`file://${defaultConfigPathFor(fixturesRepo)}`);
 const cfg = JSON.parse(readFileSync(baseCfgPath, "utf8"));
 cfg.lessonsFile = LESSONS_FILE;
 const cfgPath = join(runDir, "factory-config-override.json");

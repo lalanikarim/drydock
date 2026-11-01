@@ -11,6 +11,53 @@
 // factory-side trusted config, but we keep the surface strict regardless.
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+
+/**
+ * Where per-repo runtime config lives: OUTSIDE the source tree. Two facts drove this:
+ *
+ * 1. `testCommand` is executed to decide whether a branch may be pushed, and it lived at
+ *    `factory/config/<owner>_<repo>.json` — inside drydock's own path allowlist (`factory/`). A self-run could
+ *    therefore open a draft PR that changed the command used to verify itself. A human merge was the only thing
+ *    between that and a run grading its own work with `true`. Config outside the tree means path scope is no
+ *    longer even asked that question.
+ * 2. These files are deployment state — which model this host serves, what a sandbox image is called here, how
+ *    much wall clock an issue gets on this laptop. They were reviewed like code without being code.
+ *
+ * `DRYDOCK_CONFIG_DIR` overrides the default so a second machine (or a test) can point somewhere else entirely.
+ */
+export const CONFIG_DIR_ENV = "DRYDOCK_CONFIG_DIR";
+
+/** The directory holding `<owner>_<repo>.json` runtime configs. Never inside the repository. */
+export function configDir(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env[CONFIG_DIR_ENV]?.trim();
+  if (fromEnv) return resolve(fromEnv);
+  return join(homedir(), ".drydock", "configs");
+}
+
+/** `lalanikarim/drydock` → `lalanikarim_drydock`. */
+export function configSlug(repo: string): string {
+  return repo.replace("/", "_");
+}
+
+/** Default runtime-config path for a repo, inside the config dir. */
+export function defaultConfigPathFor(repo: string, env: NodeJS.ProcessEnv = process.env): string {
+  return join(configDir(env), `${configSlug(repo)}.json`);
+}
+
+/**
+ * Resolve which runtime config an instance should load: an explicit `--config` path if the operator passed one,
+ * otherwise `<configDir>/<owner>_<repo>.json`. Two cases, deliberately — the only way to point an instance at a
+ * different file is a flag a human typed, so nothing read from policy or from a repository can redirect it.
+ */
+export function resolveFactoryConfigPath(
+  repo: string,
+  opts: { explicit?: string | null; env?: NodeJS.ProcessEnv } = {},
+): string {
+  if (opts.explicit) return resolve(opts.explicit);
+  return defaultConfigPathFor(repo, opts.env ?? process.env);
+}
 
 export const DEFAULTS = {
   sandboxImage: "factory-sandbox:latest",
@@ -50,6 +97,11 @@ export function validateFactoryConfig(raw: unknown): FactoryConfig {
   const obj = raw as Record<string, unknown>;
   const known = new Set(["repo", "sandboxImage", "setupCommand", "testCommand", "models", "gitToken", "budgets", "lessonsFile", "approvalTtlHours"]);
   for (const key of Object.keys(obj)) {
+    // Two exact names may carry prose. A config that lives outside the repository has no diff to explain it,
+    // so the file explains itself — but only these two, because a blanket "leading underscore is ignored"
+    // would let `_testCommand` sit in a file doing nothing, which is the R6 failure mode this check exists to
+    // catch ("I set it and it did nothing").
+    if (key === "_comment" || key === "_notes") continue;
     if (!known.has(key)) throw new Error(`unknown config field: ${key}`);
   }
   if (typeof obj.repo !== "string" || !REPO_RE.test(obj.repo)) {

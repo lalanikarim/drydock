@@ -59,7 +59,7 @@ export function unavailableModelError(ref: ModelRefLike, payload: unknown): stri
     `(PI_AGENT_DIR, default ~/.pi/agent/models.json) plus config/models.json next to the repo config; a provider declared ` +
     `there wins over the OPENAI_BASE_URL auto-registration, so "the endpoint serves it" is not enough — it has to be listed. ` +
     `Available now: ${available.length ? available.join(", ") : "(catalog reported none)"}. ` +
-    `Fix: pin modelId to a listed id in factory/config/<owner>_<repo>.json, or add this model to that provider's entry in models.json.`
+    `Fix: pin modelId to a listed id in $DRYDOCK_CONFIG_DIR/<owner>_<repo>.json (runtime config lives outside the repo), or add this model to that provider\u2019s entry in models.json.`
   );
 }
 

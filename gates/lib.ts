@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
+import { defaultConfigPathFor } from "../factory/factory-config.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, "..");
@@ -29,9 +30,13 @@ export function loadFactoryEnv(): void {
   }
 }
 
-/** Default per-repo factory config path (factory/config/<owner>_<repo>.json). */
+/**
+ * Default per-repo runtime config path. Resolved the same way the production entrypoint resolves it —
+ * `$DRYDOCK_CONFIG_DIR/<owner>_<repo>.json`, outside the source tree — because a gate that read its config
+ * from somewhere the factory never looks would prove nothing about the factory.
+ */
 export function defaultConfigPath(repo: string): string {
-  return join(REPO_ROOT, "factory", "config", `${repo.replace("/", "_")}.json`);
+  return defaultConfigPathFor(repo);
 }
 
 export interface InstanceHandle {
