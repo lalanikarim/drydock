@@ -27,7 +27,7 @@
 //   node --experimental-strip-types fleet/supervisor.ts run <fleet.json>
 //   node --experimental-strip-types fleet/supervisor.ts status <fleet.json>
 
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { loadRootEnv, resolveWebhookSecret, webhookSecretVar } from "../factory/env-file.ts";
 import { createHash } from "node:crypto";
@@ -38,6 +38,9 @@ import { loadRegistry, missingRuntimeConfigs, requireEnabledRepo } from "../fact
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 import { readSweepState } from "./redeliver-failed.mjs";
 import { defaultConfigPathFor } from "../factory/factory-config.ts";
+import { spawnInProcessGroup, terminateProcessGroup, killProcessGroupNow } from "./proc-group.ts";
+import { createShutdownCoordinator } from "./shutdown-coordinator.ts";
+import { SUPERVISOR_PID_ENV } from "../factory/parent-watchdog.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -161,8 +164,22 @@ function loadFleet(path: string): Fleet {
   return fleet;
 }
 
+/**
+ * Spawn a fleet child as its own process group leader (#127).
+ *
+ * `detached` here is not about running in the background — stdio stays piped and read below. It makes the
+ * child's pgid equal to its pid, which gives teardown one address that also reaches grandchildren (a worker's
+ * test subprocesses). Without it, a `SIGKILL`ed supervisor leaves children reparented to launchd and serving:
+ * two harnesses over one durable store (#125).
+ *
+ * Children are told who their supervisor is (`FACTORY_SUPERVISOR_PID`) so they can notice orphaning on their
+ * own — the only half of this that survives us being `SIGKILL`ed, since a dead process runs no handler.
+ */
 function spawnProc(name: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {
-  const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"], env });
+  const child = spawnInProcessGroup(process.execPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...env, [SUPERVISOR_PID_ENV]: String(process.pid) },
+  });
   const pump = (stream: NodeJS.ReadableStream, prefix: string) =>
     stream.on("data", (d: Buffer) => process.stdout.write(`[${name}] ${prefix}${String(d).replace(/\n$/, "")}\n`));
   pump(child.stdout, "");
@@ -205,11 +222,46 @@ async function runFleet(fleetPath: string): Promise<void> {
   }
   console.log(`[supervisor] ${lock.reason} (lock: ${lockPath})`);
 
-  let shuttingDown = false;
   const restarts = new Map<string, number>();
-  const children: ChildProcess[] = [];
+  /** key -> pid of a live child. Each pid is also its process group id (#127). */
+  const managed = new Map<string, number>();
+  /** Pending restart timers, so teardown can guarantee nothing spawns into a shutdown in progress. */
+  const restartTimers = new Set<ReturnType<typeof setTimeout>>();
   // repo -> base URL once the instance reports ready (for the routes file).
   const bases = new Map<string, string>();
+
+  /** Wait for the process group to actually disappear, then log what did not (#127). */
+  const reportGroup = (key: string, result: Awaited<ReturnType<typeof terminateProcessGroup>>) => {
+    if (result.survivors.length > 0) {
+      console.error(`[supervisor] ${key}: ${result.survivors.length} process(es) survived SIGTERM+SIGKILL in group ${result.pgid}: ${result.survivors.join(", ")} — check for a second harness on this store (runbook §7)`);
+    } else if (result.initial.length > 1) {
+      console.log(`[supervisor] ${key}: group ${result.pgid} fully stopped (${result.initial.length} process(es), escalated=${result.escalated})`);
+    }
+  };
+
+  // The shutdown state machine lives in ./shutdown-coordinator.ts; this is the wiring to real processes.
+  const coordinator = createShutdownCoordinator({
+    tracked: () => [...managed.keys()],
+    terminate: (key) => {
+      const pid = managed.get(key);
+      if (pid === undefined) return;
+      // Fire-and-forget on purpose: the coordinator's bounded exit timer is what ends this process, and a
+      // teardown that awaits each group serially would blow past that bound.
+      void terminateProcessGroup(pid).then((r) => reportGroup(key, r), (e) => console.error(`[supervisor] ${key}: group teardown failed: ${(e as Error).message}`));
+    },
+    forceKill: (key) => {
+      const pid = managed.get(key);
+      if (pid === undefined) return;
+      killProcessGroupNow(pid);
+    },
+    stopRestarts: () => {
+      for (const t of restartTimers) clearTimeout(t);
+      restartTimers.clear();
+    },
+    releaseLock: () => lock.release(),
+    exit: (code) => process.exit(code),
+    log: (line) => console.log(line),
+  });
 
   // The routes file lists ALL factories from boot (secret known up front) so
   // the adapter validates cleanly before any instance is ready; `target` is
@@ -227,12 +279,47 @@ async function runFleet(fleetPath: string): Promise<void> {
   // never re-read it. Overwriting unconditionally means every start begins from the current fleet.
   writeRoutes();
 
+  /**
+   * Stop supervising and leave (#127). Non-zero exit on purpose: the old code set a flag and stayed alive,
+   * so a scheduler saw a healthy pid and never restarted it while webhooks kept arriving at an adapter whose
+   * factory was dead — deliveries lost permanently, because GitHub does not retry them. "Gave up" has to
+   * look like a failure to the thing watching, not like a server that is fine.
+   */
+  const giveUp = (key: string) => {
+    console.error(`[supervisor] ${key} exceeded ${MAX_RESTARTS} restarts — giving up and exiting non-zero`);
+    coordinator.begin(`${key}: restart budget exhausted`, { exitCode: 1 });
+  };
+
+  /** Schedule a restart, tracked so teardown can prove nothing spawns after it. */
+  const scheduleRestart = (fn: () => void) => {
+    const timer = setTimeout(() => {
+      restartTimers.delete(timer);
+      if (coordinator.isShuttingDown()) return; // cancelled by teardown
+      fn();
+    }, RESTART_BACKOFF_MS);
+    restartTimers.add(timer);
+  };
+
+  /**
+   * A child that died on its own can leave its own children running, and those keep this repo's durable
+   * store open while the replacement boots. Sweep the group before respawning (#127): the pid we just
+   * reaped is the group id, so anything still alive inside it is a leftover of a process we owned.
+   */
+  const sweepLeftovers = (key: string, pid: number | undefined) => {
+    if (!pid || pid < 0) return;
+    void terminateProcessGroup(pid).then(
+      (r) => {
+        if (r.initial.length > 0) reportGroup(key, r);
+      },
+      (e) => console.error(`[supervisor] ${key}: leftover sweep failed: ${(e as Error).message}`),
+    );
+  };
+
   const startFactory = (f: FactoryEntry) => {
     const key = `factory:${f.repo}`;
     restarts.set(key, (restarts.get(key) ?? 0) + 1);
     if ((restarts.get(key) ?? 0) > MAX_RESTARTS) {
-      console.error(`[supervisor] ${key} exceeded ${MAX_RESTARTS} restarts — giving up`);
-      shuttingDown = true;
+      giveUp(key);
       return;
     }
     // Omitting "config" in the fleet file is now the normal case: the instance resolves the conventional
@@ -250,7 +337,7 @@ async function runFleet(fleetPath: string): Promise<void> {
     const args = ["--experimental-strip-types", join(REPO_ROOT, "factory", "main.ts"), f.repo, "--config", configPath];
     console.log(`[supervisor] starting ${key} — attempt ${restarts.get(key)}`);
     const child = spawnProc(key, args, env);
-    children.push(child);
+    managed.set(key, child.pid ?? -1);
     let readySent = false;
     // Learn the ephemeral port from stdout and publish it to the routes file.
     child.stdout!.on("data", (d: Buffer) => {
@@ -263,10 +350,13 @@ async function runFleet(fleetPath: string): Promise<void> {
       }
     });
     child.on("exit", (code, signal) => {
-      if (shuttingDown) return;
+      const pid = managed.get(key);
+      managed.delete(key);
+      if (coordinator.isShuttingDown()) return;
       bases.delete(f.repo);
+      sweepLeftovers(key, pid);
       console.error(`[supervisor] ${key} exited (${signal ?? `code ${code}`}) — restarting in ${RESTART_BACKOFF_MS / 1000}s`);
-      setTimeout(() => startFactory(f), RESTART_BACKOFF_MS);
+      scheduleRestart(() => startFactory(f));
     });
   };
 
@@ -275,8 +365,7 @@ async function runFleet(fleetPath: string): Promise<void> {
     const key = "adapter";
     restarts.set(key, (restarts.get(key) ?? 0) + 1);
     if ((restarts.get(key) ?? 0) > MAX_RESTARTS) {
-      console.error(`[supervisor] ${key} exceeded ${MAX_RESTARTS} restarts — giving up`);
-      shuttingDown = true;
+      giveUp(key);
       return;
     }
     const a = fleet.adapter!;
@@ -288,25 +377,21 @@ async function runFleet(fleetPath: string): Promise<void> {
     const args = ["--experimental-strip-types", join(REPO_ROOT, "factory", "adapter.ts"), String(a.port), routesFile, a.logPath ? rel(fleetPath, a.logPath) : join(dirname(routesFile), "intake-adapter.jsonl")];
     console.log(`[supervisor] starting ${key} (port ${a.port}) — attempt ${restarts.get(key)}`);
     const child = spawnProc(key, args, process.env);
-    children.push(child);
+    managed.set(key, child.pid ?? -1);
     child.on("exit", (code, signal) => {
-      if (shuttingDown) return;
+      const pid = managed.get(key);
+      managed.delete(key);
+      if (coordinator.isShuttingDown()) return;
+      sweepLeftovers(key, pid);
       console.error(`[supervisor] ${key} exited (${signal ?? `code ${code}`}) — restarting in ${RESTART_BACKOFF_MS / 1000}s`);
-      setTimeout(startAdapter, RESTART_BACKOFF_MS);
+      scheduleRestart(startAdapter);
     });
   };
 
   for (const f of fleet.factories) startFactory(f);
   startAdapter();
 
-  const shutdown = () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log("[supervisor] shutting down");
-    // Release before waiting, so a restart racing our own teardown is not told "already running" by a
-    // lock we no longer intend to hold.
-    lock.release();
-    for (const c of children) c.kill("SIGTERM");
+  const handleDiagnostic = () => {
     const beganAt = Date.now();
     // #110 diagnostic: the lingering-handle cause is still unexplained, only bounded. If something is
     // keeping this process alive one second after teardown, say what it was instead of letting the 3s
@@ -321,13 +406,19 @@ async function runFleet(fleetPath: string): Promise<void> {
       }
       console.log(`[supervisor] still alive ${Date.now() - beganAt}ms after shutdown with ${handles.length} active handle(s): ${[...byType.entries()].map(([k, v]) => `${v}×${k}`).join(", ")}`);
     }, 1_000).unref();
-    // Deliberately NOT unref'd: an unref'd deadline timer lets the process linger on whatever handle a
-    // child left open, which is how a supervisor sat alive 13s after logging "shutting down" and had to
-    // be SIGKILLed. A ref'd timer guarantees shutdown is bounded at 3s either way.
-    setTimeout(() => process.exit(0), 3_000);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+
+  // Every signal goes to the coordinator (#110, #127). Previously the handler opened with `if (shuttingDown)
+  // return`, so a second SIGTERM — the one an operator sends when the first seems not to have worked — was
+  // swallowed, which is how a routine restart stayed alive past its bound and finished as `kill -9`. Now the
+  // first signal asks the children politely and the second one does not ask: it SIGKILLs their groups and
+  // exits immediately. The bounded-exit timer lives in the coordinator and is never unref'd or cleared.
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      handleDiagnostic();
+      coordinator.begin(`received ${signal}`);
+    });
+  }
 }
 
 async function statusFleet(fleetPath: string): Promise<void> {

@@ -28,6 +28,7 @@ import {
   type Route,
 } from "./intake.ts";
 import { fetchIssueState } from "./gh-read.ts";
+import { startParentWatchdog, SUPERVISOR_PID_ENV } from "./parent-watchdog.ts";
 import { authorizePrFeedback, fetchPrFacts, prNumberFromEvent, renderPrFeedbackContent, type PrFacts } from "./pr-feedback.ts";
 import { createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 
@@ -270,12 +271,36 @@ if (isMain) {
     // I serving?" and policy-hash is "which authority am I serving under?" — a target-only refresh
     // moves the first and must never move the second (#81).
     console.log(`adapter listening on http://${host}:${actualPort} (routes: ${routes.map((r) => r.repo).join(", ")}, routes-hash ${startupHash.slice(0, 16)}, policy-hash ${policyFingerprint(routes).slice(0, 16)})`);
-    const shutdown = () => {
+    // One teardown (#127). The adapter is the process that receives GitHub traffic, so "did it stop?" has
+    // to have one unambiguous answer: while it is alive and bound to its port, deliveries arrive and are
+    // refused (and GitHub does not retry a failed delivery). A second signal therefore exits immediately.
+    let closing = false;
+    const shutdown = (reason: string) => {
+      if (closing) {
+        console.log(`adapter: ${reason} while already closing — exiting now`);
+        process.exit(1);
+      }
+      closing = true;
+      console.log(`adapter: ${reason} — closing`);
       server.close();
       process.exit(0);
     };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+    // Orphan self-check (#125 → #127): an adapter reparented to launchd keeps accepting webhooks that no
+    // supervisor's routes file describes. Same rule as the factory child — armed only under a supervisor.
+    let stopWatchdog: () => void = () => {};
+    stopWatchdog = startParentWatchdog({
+      supervisorPid: process.env[SUPERVISOR_PID_ENV],
+      label: "adapter",
+      // Same reason as the factory child: a line logged into a pipe whose reader is gone is not a record.
+      durableLogPath: `${logPath}.orphan-events`,
+      onOrphaned: () => {
+        stopWatchdog();
+        shutdown("orphaned");
+      },
+    });
   }).catch((e) => {
     console.error("adapter failed to start:", e);
     process.exit(1);

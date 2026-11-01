@@ -28,6 +28,7 @@ import { loadRootEnv } from "./env-file.ts";
 import { RefusalBudget } from "./refusal-budget.ts";
 import { createNotifier } from "./notify-telegram.ts";
 import { syncRootCapabilities } from "./root-capabilities.ts";
+import { startParentWatchdog, SUPERVISOR_PID_ENV } from "./parent-watchdog.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -323,7 +324,17 @@ async function main() {
     console.log(`[factory] ${repo} ready on http://127.0.0.1:${instance.actualPort}/ (data: ${dataDir})`);
 
     let keepAlive: NodeJS.Timeout | undefined;
+    // Idempotence guard (#127). Without it, a second event — a repeated signal, or the orphan watchdog
+    // firing while a graceful close is already running — called `instance.close()` twice against a store
+    // whose handles were half-released. Teardown races are exactly the class of bug this repo keeps
+    // finding late, so the guard lives here rather than in each caller.
+    let closing: Promise<void> | null = null;
     const shutdown = (signal: string) => {
+      if (closing) {
+        // The operator asked twice; the first close is not progressing in their eyes. Bound it and go.
+        console.log(`[factory] ${signal} received while already closing — exiting now`);
+        process.exit(1);
+      }
       console.log(`[factory] ${signal} — closing ${repo}`);
       // Refusal ledger on the way out (#100): counts by class, and which runs were stopped. Zero
       // refusals prints nothing, so a healthy shutdown stays quiet.
@@ -337,14 +348,37 @@ async function main() {
         if (stoppedSummary !== "no runs stopped by the refusal budget") console.log(stoppedSummary);
       }
       if (keepAlive) clearInterval(keepAlive);
-      instance.close().then(() => process.exit(0)).catch((e) => {
-        console.error(`[factory] close failed:`, e);
-        process.exit(1);
-      });
+      closing = instance
+        .close()
+        .then(() => process.exit(0))
+        .catch((e) => {
+          console.error(`[factory] close failed:`, e);
+          process.exit(1);
+        });
     };
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     keepAlive = setInterval(() => {}, 1 << 30);
+
+    // Orphan self-check (#125 → #127). The supervisor cannot clean up after `SIGKILL`, and until deploys
+    // stop finishing that way, the child is the only process that can notice it has become unmanaged. An
+    // instance at `ppid 1` keeps its HTTP server up and this repo's `agent.sqlite` open while `routes.json`
+    // points at a replacement — two harnesses over one durable store.
+    //
+    // Armed only when FACTORY_SUPERVISOR_PID is present, so a manual foreground run behaves exactly as
+    // before. The callback goes through the same `shutdown()` path as a signal: one teardown, guarded.
+    let stopWatchdog: () => void = () => {};
+    stopWatchdog = startParentWatchdog({
+      supervisorPid: process.env[SUPERVISOR_PID_ENV],
+      label: `factory ${repo}`,
+      // The pipe to the supervisor dies with it, so this instance's own directory carries the record. Without
+      // it, an orphaned-and-self-closed instance leaves no trace at all — which is how #125 stayed invisible.
+      durableLogPath: join(root, "orphan-events.log"),
+      onOrphaned: () => {
+        stopWatchdog();
+        shutdown("orphaned");
+      },
+    });
 
     // Surface unhandled rejections instead of dying silently (parity with the
     // old supervise).

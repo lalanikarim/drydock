@@ -99,6 +99,21 @@ test("the supervisor takes the lock before writing routes and refuses to proceed
   assert.ok(acquireAt < writeAt, "the lock must be taken BEFORE the shared routes file is written");
   assert.match(src, /if \(!lock\.acquired\)[\s\S]{0,200}process\.exit\(1\)/, "a refused lock must stop the process");
   assert.match(src, /lock\.release\(\)/, "shutdown must release the lock a restart would need");
-  // The bounded-shutdown fix: an unref'd deadline never fires if a child handle keeps the loop alive.
-  assert.match(src, /setTimeout\(\(\) => process\.exit\(0\), 3_000\)(?!\.unref)/, "shutdown deadline must stay ref'd");
+});
+
+test("the supervisor's shutdown bound stays armed and a second signal is not swallowed (source pin, #110/#127)", () => {
+  const src = fsRead(new URL("../fleet/supervisor.ts", import.meta.url), "utf8");
+  // The bounded-shutdown fix moved into the coordinator with #127. The invariant is unchanged and still
+  // pinned by source, because it is exactly the kind of line a later refactor unrefs by accident — and an
+  // unref'd deadline never fires if a child handle keeps the loop alive, which is how a supervisor needed
+  // SIGKILL for a week and orphaned its children (#125).
+  assert.match(src, /createShutdownCoordinator\(/, "teardown must go through the shutdown coordinator");
+  const coord = fsRead(new URL("../fleet/shutdown-coordinator.ts", import.meta.url), "utf8");
+  assert.match(coord, /setTimer\(\(\) => exit\(exitCode\), graceMs\)(?!\.unref)/, "shutdown deadline must stay ref'd");
+  assert.doesNotMatch(coord, /\bclearTimeout\b/, "the teardown bound must never be cancelled once armed");
+
+  // A second signal has to reach the coordinator. The old handler opened with `if (shuttingDown) return`,
+  // which is why a repeated SIGTERM did nothing and the deploy finished as `kill -9`.
+  assert.match(src, /for \(const signal of \["SIGINT", "SIGTERM"\] as const\)[\s\S]{0,200}coordinator\.begin\(/, "every signal must reach the coordinator");
+  assert.doesNotMatch(src, /if \(shuttingDown\) return;/, "a repeated signal must not be swallowed by an early return");
 });
