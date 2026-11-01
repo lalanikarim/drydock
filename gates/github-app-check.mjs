@@ -93,6 +93,32 @@ if (tokRes.status !== 201) {
 }
 const installToken = tokRes.body.token;
 
+// Commit identity, checked against the live API (#87 follow-up). The unit suite for this derivation
+// injects its fetches — which is precisely how the first version passed every check and then faulted
+// its first real run by asking GET /user, an endpoint installation tokens cannot read. So assert the
+// real shape here: /user refused, and the bot account plus noreply email resolvable from app metadata.
+const meRes = await gh("/user", { token: installToken });
+console.log(`IDENTITY: GET /user with an installation token -> HTTP ${meRes.status} (401/403 expected unless the App holds user read)`);
+const slug = appRes.body?.slug;
+if (!slug) {
+  console.log("IDENTITY: /app returned no slug — cannot predict the commit author");
+  process.exitCode = 1;
+} else {
+  const botLogin = `${slug}[bot]`;
+  // Public endpoint, fetched without authorization: gh() always attaches a bearer token, and an
+  // installation token is not valid on user endpoints.
+  const botRes = await fetch(`https://api.github.com/users/${encodeURIComponent(botLogin)}`, {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "drydock-app-check" },
+  });
+  const bot = await botRes.json().catch(() => null);
+  if (botRes.ok && Number.isInteger(bot?.id)) {
+    console.log(`IDENTITY: commits will be authored by ${botLogin} <${bot.id}+${botLogin}@users.noreply.github.com>`);
+  } else {
+    console.log(`IDENTITY: could not read the bot account ${botLogin} (HTTP ${botRes.status}) — worker preparation would fault`);
+    process.exitCode = 1;
+  }
+}
+
 // Paginate: `repository_selection: all` means every repo in the account, including ones created
 // later, so a single page tells you nothing about the real blast radius. Count them all.
 const repos = [];

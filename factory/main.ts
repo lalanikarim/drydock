@@ -23,6 +23,7 @@ import { factoryPipeline, orchestratorInstructions } from "./pipeline.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
 import { createGitAuth } from "./github-auth.ts";
+import { resolveGitIdentity } from "./git-identity.ts";
 import { loadRootEnv } from "./env-file.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -156,6 +157,17 @@ async function main() {
       console.error(`[factory] refusing to announce ready on a credential that does not work`);
       process.exit(1);
     }
+  }
+
+  // Commit identity (#87 follow-up), resolved with the same derivation worker preparation uses and
+  // logged here because "which author will my commits get" is a startup question. Warning rather than
+  // exit: a transient API failure should not keep the factory down, and the run-time path fails loudly
+  // with the identical message if it still cannot resolve.
+  try {
+    const identity = await resolveGitIdentity({ token: await gitAuth.token() });
+    console.log(`[factory] ${repo}: commit identity: ${identity.name} <${identity.email}>`);
+  } catch (e) {
+    console.warn(`[factory] ${repo}: WARNING — commit identity unresolved; runs will fault before pushing. ${(e as Error).message}`);
   }
 
   const pipelineOpts = {
