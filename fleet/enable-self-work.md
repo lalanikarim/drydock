@@ -213,6 +213,44 @@ Operational facts learned:
 - A worker may touch files the issue did not name as long as they are inside the path allowlist — #83's run also modified `factory/verification.ts` and the reviewer flagged it as bundled-in scope creep. Path scope answers "may this file change at all?", not "should this issue change it?"; review is the control for that (recorded as R9).
 - Reviewer output includes the verification block (`npm test`, exit code, tail) from decision C1, so a green claim is attached to a command rather than asserted.
 
+## 6. Asking for rework on a pull request (`/factory`, #67)
+
+A comment on an open PR can now drive the factory:
+
+```text
+/factory rebase
+/factory resolve-conflicts
+/factory rename totalAmount to subtotalAmount and update the tests
+```
+
+**Enable it in three places**, each of which fails silently if skipped:
+
+1. **Registry policy** — `prFeedback: true` on the repo entry in `factory/repo-registry.json` (default `false`; must be a real boolean).
+2. **Routes** — automatic: the supervisor copies the flag onto the route, and the adapter refuses comment events for repos without it. Restart the supervisor after changing the registry, since routes are written at start.
+3. **Webhook events** — the hook must subscribe to `issue_comment` in addition to `issues`:
+
+```bash
+gh api -X PATCH repos/lalanikarim/drydock/hooks/<hook-id> -f name=webhook \
+  -f 'events[]=issues' -f 'events[]=issue_comment' -f active=true \
+  -f 'config[url]=https://<your-public-host>/webhook/github' \
+  -f 'config[content_type]=json' -f "config[secret]=$WEBHOOK_SECRET" -f 'config[insecure_ssl]=0'
+```
+
+**What will not trigger, by design** — and each of these is asserted in tests rather than merely intended:
+
+| Comment | Result |
+|---|---|
+| `should we rebase this?` | refused: the command must start the body |
+| `/factory …` from any login outside `allowedSenders` | 403 before parsing |
+| `/factory …` from a bot, even an allowlisted one | refused — comment-triggered pipelines loop |
+| on a PR whose head is not `agent/issue-<n>` | refused: the factory only reworks branches it created |
+| on a closed or merged PR | refused, with the state named in the reason |
+| anything at all, if `prFeedback` is off for that repo | refused, and the PR is never even read |
+
+**What happens when it does trigger:** the worker checks out the PR's current branch (not a fresh one from `main`), applies the instruction, runs the repo's test command, and `open_draft_pr` pushes — running verification and independent review first, exactly as on the first pass. Because a PR already exists for the branch, it is updated in place; no second PR appears and nothing merges. The run logs `[factory.worker] REWORK issue #<n> on agent/issue-<m> (PR #<p>, directive <kind>)`, which is the fastest way to see whether intake accepted a comment.
+
+**If a comment seems ignored,** read `data/intake-adapter.jsonl`: every delivery lands there with `accepted`, `reason` and (for refusals decided after reading PR state) `refused after state check: …`. A 200 with `accepted: false` is a policy decision; a 5xx is a broken listener or instance.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:

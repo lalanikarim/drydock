@@ -261,7 +261,7 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       await pushBranch(ws, branch, env);
 
       // Idempotency: reuse an open PR for this head branch if one exists.
-      let prJson: { number: number; url: string } | null = null;
+      let prJson: { number: number; url: string; isDraft?: boolean } | null = null;
       try {
         const existing = await sh("gh", [
           "pr", "list", "--repo", fixturesRepo, "--state", "open",
@@ -290,7 +290,10 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
           type: "text" as const,
           // The sha here is what the orchestrator must pass to pr_status/merge_pr (#47): an approval
           // is scoped to this commit, so a later push cannot reuse it.
-          text: JSON.stringify({ prUrl, isDraft: true, branch, head, verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, passed: tests.passed } }),
+          // isDraft reports the truth, not the intent: on the rework path (#67) a human may have marked
+          // the PR ready for review, and an orchestrator told `isDraft: true` would describe a state
+          // that no longer exists.
+          text: JSON.stringify({ prUrl, isDraft: prJson ? prJson.isDraft !== false : true, branch, head, verification: { ran: tests.ran, command: tests.command, exitCode: tests.exitCode, passed: tests.passed } }),
         }],
       };
     },

@@ -181,7 +181,9 @@ test("a target-only change is adopted in place and dispatch follows the new port
 
     // And dispatch really uses it: makeRouteDispatch captured the same array at startup.
     const dispatch = makeRouteDispatch(liveRoutes);
-    const result = await dispatch("o/a", { issue: { number: 3 }, action: "labeled" });
+    // A genuinely eligible event: since #67 the dispatcher re-applies intake's own classifier rather
+    // than trusting that the caller already checked, so a bare {action:"labeled"} is refused.
+    const result = await dispatch("o/a", { issue: { number: 3 }, action: "labeled", label: { name: "agent" } });
     assert.deepEqual(result, { ok: true });
     assert.equal(hits.length, 1, "the task reached the instance that is actually listening");
     assert.match(hits[0].body, /"requestId":"issue-3"/);

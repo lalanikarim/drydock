@@ -11,6 +11,7 @@
 
 import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { isPrCommentEvent, parseFactoryDirective, prFeedbackRequestId, prNumberFromEvent, type ParsedDirective } from "./pr-feedback.ts";
 import { appendFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -53,6 +54,55 @@ export function intakeRequestId(event: any): string {
   const n = event.issue?.number;
   if (!Number.isInteger(n)) throw new Error("webhook event has no issue number");
   return `issue-${n}`;
+}
+
+/** What an accepted webhook event means, and therefore what gets dispatched. */
+export type WebhookKind = "issue" | "pr-feedback";
+
+export type EventVerdict =
+  | { accepted: true; kind: WebhookKind; requestId: string }
+  | { accepted: false; reason: string };
+
+/**
+ * Single source of truth for "does this event mean work?" (#67).
+ *
+ * Two kinds qualify: a labeled issue (the original path) and a `/factory …` comment on an open pull
+ * request, which is opt-in per repository because it turns a conversational surface into a trigger.
+ * The intake server calls this to answer the delivery; the adapter's dispatcher calls it again to
+ * build the task — same function, so acceptance and dispatch can never disagree about what was
+ * accepted (the class of bug where a gate is checked on one path and forgotten on the other).
+ *
+ * Comment authors that are bots are refused even if allowlisted: as soon as the factory writes a PR
+ * comment, a comment-triggered pipeline would otherwise feed itself.
+ */
+export function classifyWebhookEvent(
+  event: any,
+  { eligibilityLabel = AGENT_LABEL, prFeedback = false }: { eligibilityLabel?: string; prFeedback?: boolean } = {},
+): EventVerdict {
+  if (isPrCommentEvent(event)) {
+    if (!prFeedback) return { accepted: false, reason: "PR feedback is not enabled for this repository" };
+    const pr = prNumberFromEvent(event);
+    if (!pr) return { accepted: false, reason: "comment event does not identify a pull request" };
+    const sender = event?.sender?.login;
+    if (!sender) return { accepted: false, reason: "comment event has no sender login" };
+    if (event.sender?.type === "Bot") {
+      return { accepted: false, reason: `comment author ${sender} is a bot — feedback loops are refused` };
+    }
+    const directive = parseFactoryDirective(event.comment.body);
+    if (!directive.ok) return { accepted: false, reason: directive.reason };
+    return { accepted: true, kind: "pr-feedback", requestId: prFeedbackRequestId(event) };
+  }
+  if (isAgentIssueEvent(event, eligibilityLabel)) {
+    return { accepted: true, kind: "issue", requestId: intakeRequestId(event) };
+  }
+  return { accepted: false, reason: "not an eligible event (label the issue, or comment /factory on a factory pull request)" };
+}
+
+/** The parsed directive of an accepted PR-feedback comment (throws if the body no longer parses). */
+export function directiveFromEvent(event: any): Extract<ParsedDirective, { ok: true }> {
+  const parsed = parseFactoryDirective(event?.comment?.body);
+  if (!parsed.ok) throw new Error(`PR feedback event has no valid directive: ${parsed.reason}`);
+  return parsed;
 }
 
 /** Render the issue as delimited untrusted data plus an outer instruction. */
@@ -121,6 +171,12 @@ export interface Route {
   allowedSenders?: string[];
   /** Which issue label makes work eligible for THIS repo — copied from the registry by the supervisor. */
   eligibilityLabel?: string;
+  /**
+   * Opt-in for `/factory …` comments on this repo's open PRs (#67). Copied from the registry by the
+   * supervisor, like `eligibilityLabel`: a wrong value here would either silently ignore feedback or
+   * quietly open a comment-driven trigger nobody approved.
+   */
+  prFeedback?: boolean;
 }
 
 /** Validate a multi-repo route list (multi-repo plan §3.2). */
@@ -143,6 +199,11 @@ export function validateRoutes(routes: Route[]): Route[] {
     // route that spells it wrong would silently drop every event for that repo (health stays green).
     if (r.eligibilityLabel !== undefined && (typeof r.eligibilityLabel !== "string" || !r.eligibilityLabel.trim())) {
       throw new Error(`route ${r.repo} eligibilityLabel must be a non-empty string when present`);
+    }
+    // Strict boolean, not truthiness: `prFeedback: "false"` would otherwise enable a comment trigger
+    // that the operator meant to disable (the R6 lesson — Boolean("false") === true).
+    if (r.prFeedback !== undefined && typeof r.prFeedback !== "boolean") {
+      throw new Error(`route ${r.repo} prFeedback must be a boolean when present`);
     }
     if (seen.has(r.repo)) throw new Error(`duplicate route for repo ${r.repo}`);
     seen.add(r.repo);
@@ -362,18 +423,22 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
 
       let result: any;
       if (routes) {
-        const eligibility = routes.find((r) => r.repo === matchedRepo)?.eligibilityLabel ?? AGENT_LABEL;
-        if (!isAgentIssueEvent(event, eligibility)) {
-          result = { accepted: false, reason: "not an agent issue event" };
-        } else {
-          result = { accepted: true, requestId: intakeRequestId(event), routedTo: matchedRepo };
-        }
+        const route = routes.find((r) => r.repo === matchedRepo);
+        // One classifier for both accepted kinds (labeled issue, /factory PR comment) — see
+        // classifyWebhookEvent. Acceptance here is cheap and network-free; the dispatcher repeats the
+        // same call so the two paths cannot disagree.
+        result = classifyWebhookEvent(event, {
+          eligibilityLabel: route?.eligibilityLabel ?? AGENT_LABEL,
+          prFeedback: route?.prFeedback === true,
+        });
+        if (result.accepted) result = { ...result, routedTo: matchedRepo };
       } else {
         result = await handleIntakeEvent(event, { dispatch: dispatch as (a: { requestId: string; content: string }) => Promise<any>, eligibilityLabel });
       }
       const line = {
         deliveryId: req.headers["x-github-delivery"] ?? null,
         action: event.action ?? null,
+        kind: result.kind ?? null,
         requestId: result.requestId ?? null,
         accepted: result.accepted,
         reason: result.reason ?? null,
@@ -388,7 +453,27 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
         // Routes mode: dispatch to the owning factory AFTER the event is
         // verified and audited. Dispatch failures are 502 — GitHub will retry.
         try {
-          await (dispatch as (repo: string, event: any) => Promise<any>)(matchedRepo!, event);
+          const dispatched = await (dispatch as (repo: string, event: any) => Promise<any>)(matchedRepo!, event);
+          // A policy refusal decided from verified PR state (closed PR, branch we don't own) is NOT a
+          // delivery failure: answering 2xx keeps GitHub from retrying a request that will be refused
+          // every time, while 502 stays reserved for problems a retry can fix.
+          if (dispatched && dispatched.accepted === false) {
+            result = { accepted: false, reason: dispatched.reason, kind: result.kind, requestId: result.requestId, routedTo: matchedRepo };
+            // The pre-dispatch line above said "accepted"; record the reversal next to it so the log
+            // explains itself — an operator reading one line should not have to infer the other.
+            if (logPath) {
+              await appendFile(logPath, JSON.stringify({
+                deliveryId: req.headers["x-github-delivery"] ?? null,
+                kind: result.kind,
+                requestId: result.requestId,
+                accepted: false,
+                reason: `refused after state check: ${dispatched.reason}`,
+                ts: new Date().toISOString(),
+              }) + "\n");
+            }
+          } else {
+            result = { ...result, submission: dispatched };
+          }
         } catch (e) {
           const failLine = { deliveryId: req.headers["x-github-delivery"] ?? null, accepted: false, reason: `dispatch failed for ${matchedRepo}: ${(e as Error).message}`, ts: new Date().toISOString() };
           if (logPath) {
