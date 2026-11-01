@@ -26,6 +26,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { sanitizeUntrusted } from "./untrusted.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -45,7 +46,9 @@ export const MAX_FEEDBACK_INSTRUCTION_CHARS = 16_000;
  * The replacement is lossy on purpose: preserving a lookalike would just move the problem.
  */
 export function sanitizeFeedback(text: string): string {
-  return text.replace(/<\s*\/?\s*untrusted\s*>/gi, "[delimiter removed by the factory host]");
+  // One implementation (#95): this name is kept because callers and tests use it, but the regex now
+  // lives in factory/untrusted.ts so the issue-body path and the comment path cannot drift apart.
+  return sanitizeUntrusted(text);
 }
 
 export type PrDirectiveKind = "rebase" | "resolve-conflicts" | "instruct";
