@@ -268,11 +268,34 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   return { code: applied.every((a) => a.ok) ? 0 : 1, failed, applied };
 }
 
+/**
+ * CLI entry: map the sweep's verdict onto a process exit code.
+ *
+ * This indirection exists because of a bug found by running the thing. `main()` returns `{code}` —
+ * 1 when a dry run found undelivered events, so a scheduled job surfaces in mail/logs — but the
+ * direct-run block only ever exited on a thrown error. Result: every real invocation exited **0**,
+ * including the ones that just reported 35 lost deliveries, and the launchd template's "exit 1 on
+ * findings" claim was false on first contact with production. `main()` returning a code is not the
+ * same as the process signalling one; a gate that trusts an exit code has to check that something
+ * actually sets it (R6/R10 again).
+ *
+ * `exit` is injectable so this is testable without a network or a subprocess.
+ */
+export async function runCli({ argv = process.argv.slice(2), env = process.env, fetchImpl = ghFetch, log = console.log, exit = (code) => process.exit(code) } = {}) {
+  let result;
+  try {
+    result = await main({ argv, env, fetchImpl, log });
+  } catch (e) {
+    log(`[redeliver-failed] fatal: ${e?.message ?? e}`);
+    exit(2);
+    return { code: 2, failed: [], applied: [] };
+  }
+  exit(result.code);
+  return result;
+}
+
 // Same direct-run test the supervisor uses: importing this module for tests must not fire a live sweep.
 const isDirectRun = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) {
-  main().catch((e) => {
-    console.error(`[redeliver-failed] fatal: ${e.message}`);
-    process.exit(1);
-  });
+  runCli();
 }
