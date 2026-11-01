@@ -25,6 +25,7 @@ import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts
 import { createGitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
 import { loadRootEnv } from "./env-file.ts";
+import { RefusalBudget } from "./refusal-budget.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -170,7 +171,14 @@ async function main() {
     console.warn(`[factory] ${repo}: WARNING — commit identity unresolved; runs will fault before pushing. ${(e as Error).message}`);
   }
 
+  // Retry budget (#100): one per process, shared with open_draft_pr through the pipeline so a stop is
+  // attached to the issue rather than to a tool instance. Terminal events are logged as they happen;
+  // the ledger is printed at shutdown, because "how many refusals did this instance absorb" used to be
+  // answerable only by reading the durable store (that is how #99's six cycles were found).
+  const refusalBudget = new RefusalBudget({ log: (m) => console.warn(`[factory] ${repo}: refusal budget — ${m}`) });
+
   const pipelineOpts = {
+    refusalBudget,
     workDir: workRoot,
     fixturesRepo: factoryCfg.repo,
     autoMerge: policy.autoMerge,
@@ -198,6 +206,11 @@ async function main() {
     policy.requireVerification
       ? `[factory] ${repo}: verification required — open_draft_pr runs \`${factoryCfg.testCommand}\` and refuses to push on a non-zero exit`
       : `[factory] ${repo}: WARNING — verification waived by registry policy; draft PRs may be opened with no test run at all`,
+  );
+  // Retry posture (#100) stated at boot, the same way the merge and verification postures are: what
+  // a human needs to know before a run starts, not after it has been retrying for an hour.
+  console.log(
+    `[factory] ${repo}: refusal budget — a run stops after ${refusalBudget.maxIdentical} identical refusals or ${refusalBudget.maxTotal} total (path-scope refusals are non-retryable by class)`,
   );
 
   createCoreInstance({
@@ -235,6 +248,17 @@ async function main() {
     let keepAlive: NodeJS.Timeout | undefined;
     const shutdown = (signal: string) => {
       console.log(`[factory] ${signal} — closing ${repo}`);
+      // Refusal ledger on the way out (#100): counts by class, and which runs were stopped. Zero
+      // refusals prints nothing, so a healthy shutdown stays quiet.
+      const ledger = refusalBudget.ledger();
+      if (ledger.length > 0) {
+        const byClass = new Map<string, number>();
+        for (const r of ledger) byClass.set(r.class, (byClass.get(r.class) ?? 0) + 1);
+        const parts = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
+        console.log(`[factory] ${repo}: refusals this process: ${ledger.length} (${parts}); runs stopped: ${refusalBudget.stoppedIssues().join(", ") || "none"}`);
+        const stoppedSummary = refusalBudget.summary();
+        if (stoppedSummary !== "no runs stopped by the refusal budget") console.log(stoppedSummary);
+      }
       if (keepAlive) clearInterval(keepAlive);
       instance.close().then(() => process.exit(0)).catch((e) => {
         console.error(`[factory] close failed:`, e);
