@@ -89,7 +89,14 @@ const modelsRes = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
 const modelsBody = (await modelsRes.json()) as { data?: Array<{ id: string }> };
 const modelId = modelsBody.data?.[0]?.id;
 if (!modelId) throw new Error("no models reported by the inference endpoint");
-const modelRef = { provider: "openai-completions", modelId };
+// Provider resolution matters more than it looks. A ref that names a provider whose host is down does not
+// fail loudly: the submission takes, sits unsettled, and produces no assistant turn — the same silence the
+// fleet shows when aurora is offline (#133). DEFAULT_MODEL=<provider>:<modelId> therefore wins over the
+// env-derived "openai-completions" default, and the non-vacuity assertion below proves a run really happened.
+const modelRef = process.env.DEFAULT_MODEL?.includes(":")
+  ? { provider: process.env.DEFAULT_MODEL.split(":")[0]!, modelId: process.env.DEFAULT_MODEL.split(":").slice(1).join(":") }
+  : { provider: "openai-completions", modelId };
+console.log(`probe conversation model: ${modelRef.provider}:${modelRef.modelId}`);
 
 const logLines: string[] = [];
 const instance = await createCoreInstance({
@@ -108,7 +115,11 @@ const instance = await createCoreInstance({
       modelRef,
       log: (m) => logLines.push(m),
       agents: {
-        refine: { instructions: "Call probe_echo exactly once, then reply DONE and stop.", tools: [probeTool] },
+        refine: {
+          instructions:
+            "You are a probe. When asked, call the probe_echo tool first — never answer without calling a tool — then reply DONE on one line and stop.",
+          tools: [probeTool],
+        },
       },
     }),
   ],
@@ -138,11 +149,32 @@ async function settle(conversationId: number, ms = 120_000) {
   await Promise.race([conv.waitForIdle(BACKGROUND_CONTEXT), new Promise((_, rej) => setTimeout(() => rej(new Error("settle timeout")), ms))]);
 }
 
+/** Entry kinds for a conversation, read through the kernel's own HTTP surface. */
+async function entryKinds(conversationId: number): Promise<string[]> {
+  const res = await fetch(`${base}/conversations/${conversationId}/entries`, { headers: auth });
+  if (!res.ok) throw new Error(`entries for ${conversationId}: HTTP ${res.status}`);
+  const body = (await res.json()) as { entries?: unknown[] } | unknown[];
+  const list = Array.isArray(body) ? body : (body.entries ?? []);
+  return list.map((e) => String((e as { kind?: unknown }).kind ?? "?"));
+}
+
+/** Entry count for a conversation, read through the kernel's own HTTP surface. */
+async function entryCount(conversationId: number): Promise<number> {
+  const res = await fetch(`${base}/conversations/${conversationId}/entries`, { headers: auth });
+  if (!res.ok) throw new Error(`entries for ${conversationId}: HTTP ${res.status}`);
+  const body = (await res.json()) as { entries?: unknown[] } | unknown[];
+  const list = Array.isArray(body) ? body : (body.entries ?? []);
+  return list.length;
+}
+
 async function enabledTools(conversationId: number): Promise<string[]> {
+  // Live-kernel note: `harness.snapshot(AgentDoc, …)` resolves to the agent state itself, not a record
+  // wrapper — the tool filter is `rec.tools`, a string array of enabled tool names. (An earlier revision
+  // read `rec.value.tools`, ran against the real kernel, and asserted on an empty array.)
   const rec = (await instance.harness.snapshot(AgentDoc, conversationId as never, BACKGROUND_CONTEXT)) as unknown as
-    | { value?: { tools?: string[] | { remove: string[] } } }
+    | { tools?: string[] | { remove: string[] } }
     | undefined;
-  const tools = rec?.value?.tools;
+  const tools = rec?.tools;
   return Array.isArray(tools) ? tools : [];
 }
 
@@ -184,15 +216,28 @@ try {
   assert.notEqual(third.json.conversationId, convA, "issue #2 must not share issue #1's conversation");
   console.log(`check: a different subject got its own conversation (${third.json.conversationId})`);
 
-  // 7. A redelivery of an already-settled requestId does no work — verified by the tool's own counter.
+  // 7. A redelivery of an already-settled requestId does no work — verified by the tool's own counter and
+  // by the conversation's entry count. Both halves are load-bearing: an earlier revision asserted only
+  // "tool executions unchanged" and passed with the counter at zero, i.e. it proved nothing about a run
+  // that had never happened. Hence the non-vacuity assertion first.
   await settle(convA);
+  const assistantTurns = await entryKinds(convA);
+  assert.ok(
+    assistantTurns.some((k) => String(k).includes("assistant")),
+    `non-vacuity: the first submission must produce an assistant turn (entry kinds: ${assistantTurns.join(",") || "none"}) — a conversation that only ever holds the user entry means generation never ran, usually a provider whose host is unreachable`,
+  );
+  assert.ok(echoCalls >= 1, `non-vacuity: probe_echo must have executed for the first submission (got ${echoCalls}) — without this, the duplicate check below is vacuous`);
   const before = echoCalls;
+  const entriesBefore = await entryCount(convA);
+  assert.ok(entriesBefore > 1, `the first run should have written a transcript (entries=${entriesBefore})`);
+
   const dup = await post({ kind: "refine", subject: "#1", requestId: "probe-1", content: "Call probe_echo once." });
   assert.equal(dup.status, 200, `expected 200 duplicate, got ${dup.status}: ${JSON.stringify(dup.json)}`);
   assert.equal(dup.json.duplicate, true);
-  await new Promise((r) => setTimeout(r, 1500));
+  await new Promise((r) => setTimeout(r, 2000));
   assert.equal(echoCalls, before, `a redelivery must not execute tools again (was ${before}, now ${echoCalls})`);
-  console.log(`check: redelivered requestId answered 200 duplicate; tool executions unchanged (${echoCalls})`);
+  assert.equal(await entryCount(convA), entriesBefore, "a redelivery must not append to the transcript either");
+  console.log(`check: redelivered requestId answered 200 duplicate — tool executions stayed at ${echoCalls}, entries at ${entriesBefore}`);
 
   // 8. A kind with no capability envelope is refused rather than routed somewhere convenient.
   const refused = await post({ kind: "issue", subject: "#1", requestId: "probe-4", content: "go" });
