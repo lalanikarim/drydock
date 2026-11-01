@@ -103,6 +103,7 @@ export function factoryPipeline(opts: PipelineOptions) {
     wallSecsPerIssue: opts.wallSecsPerIssue,
     lessonsFile,
     sandboxPolicy: opts.sandboxPolicy,
+    pathScope: opts.pathScope,
     gitAuth: auth,
   });
   const reviewerTaskDef = factoryReviewerTask({
