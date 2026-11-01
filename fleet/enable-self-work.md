@@ -319,6 +319,25 @@ Other refusals, all before any inference is spent: sender is a bot; the issue is
 dispatch and immediately before posting); `/refine` directive longer than 2000 characters (refused rather than
 truncated, because the directive *is* the request); repository has `refine: false`.
 
+### Gotcha found while verifying this live: capabilities and a long-lived root conversation
+
+Two separate things can make a refinement (or any newly shipped tool) unreachable, and they look identical
+from the outside — the boot log says the feature is enabled either way.
+
+1. **The tool never reached the agent.** `harness.root()` applies its agent options only when the root
+   conversation is *created*, so a restart used to deliver neither new tools nor revised instructions nor a
+   re-pinned model. Boot now re-asserts them and reads the result back (`root capabilities synced: …`); if the
+   set does not match the registry, the instance refuses to start rather than run with authority nobody chose.
+   If that line is missing from a boot log, the instance is older than the fix.
+2. **The tool reached the agent and the model refused to use it anyway.** The root conversation accumulates
+   its own past refusals; once it has written "I don't have `refine_issue`" twice, it cites that as evidence
+   even with the tool present in the request (verified by capturing the outbound request through a logging
+   proxy). Nothing in the transcript is proof of what the model was offered.
+
+Diagnostic when a task seems ignored: check the boot log for the capability line, then read the root
+conversation's newest assistant turn in the instance store. If it claims a tool is missing, do not trust it —
+compare against the request the endpoint actually received before changing any code.
+
 ## 7. Failed deliveries are not retried — re-drive them yourself (#107)
 
 **Assumption that was wrong, and is now gone from the codebase:** that GitHub retries a failed webhook delivery. It does not — [Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries) states it twice. A 503 from an adapter mid-restart, a timeout while the laptop slept, a funnel blip: recorded once, never attempted again. Our own drift path answered 503 *because* of the old comment claiming that bought recovery; it buys nothing.

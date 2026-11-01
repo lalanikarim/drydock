@@ -26,6 +26,7 @@ import { createGitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
 import { loadRootEnv } from "./env-file.ts";
 import { RefusalBudget } from "./refusal-budget.ts";
+import { syncRootCapabilities } from "./root-capabilities.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -227,6 +228,16 @@ async function main() {
     `[factory] ${repo}: refusal budget — a run stops after ${refusalBudget.maxIdentical} identical refusals or ${refusalBudget.maxTotal} total (path-scope refusals are non-retryable by class)`,
   );
 
+  // The root agent's whole configuration, built once because it is asserted twice: at creation (below)
+  // and again on the existing conversation after boot (`syncRootCapabilities`). The second assertion is
+  // what makes `autoMerge=false` and a newly shipped tool take effect on restart rather than only the one
+  // time this instance's database was created.
+  const rootAgentChange = {
+    instructions: orchestratorInstructions({ autoMerge: policy.autoMerge, refine: policy.refine }),
+    tools: rootTools,
+    model: { provider: modelRef.provider, modelId: modelRef.modelId },
+  };
+
   createCoreInstance({
     config,
     modelsConfig,
@@ -237,11 +248,7 @@ async function main() {
     // which resolved independently of the catalog and silently pointed the root agent at a model that
     // wasn't registered ("unanswered / no_model", 2026-10-30). The repo config's modelId now decides,
     // for the orchestrator as well as for worker/reviewer tasks.
-    rootAgent: {
-      instructions: orchestratorInstructions({ autoMerge: policy.autoMerge, refine: policy.refine }),
-      tools: rootTools,
-      model: { provider: modelRef.provider, modelId: modelRef.modelId },
-    },
+    rootAgent: rootAgentChange,
   }).then(async (instance) => {
     // Check the model against the catalog THIS instance actually built, before announcing readiness.
     // Announcing ready and then settling every task as "unanswered / no_model" is what made a config
@@ -251,6 +258,33 @@ async function main() {
       const catalog = await assertModelAvailable(modelRef, `http://127.0.0.1:${instance.actualPort}`, process.env.API_TOKEN ?? "");
       const warn = defaultMismatchWarning(modelRef, catalog);
       if (warn) console.warn(`[factory] warning: ${warn}`);
+    } catch (e) {
+      console.error(`[factory] fatal: ${(e as Error).message}`);
+      await instance.close().catch(() => {});
+      process.exit(1);
+    }
+
+    // Re-assert the root agent's capabilities (#65 live finding). `harness.root()` applies its `agent`
+    // options only when the root conversation is CREATED; for an existing root it returns early and the
+    // options are discarded without a word. A restarted instance therefore kept whatever tools,
+    // instructions and model its root conversation was born with — which is why the live orchestrator,
+    // booted with "refinement enabled" logged, replied that `refine_issue` does not exist.
+    //
+    // Fail closed on a mismatch: an instance whose actual capability set differs from the registry's is
+    // exactly the thing this project refuses to run. The error prints both lists, so the difference is
+    // visible instead of being inferred later from behavior.
+    try {
+      const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
+      const synced = await syncRootCapabilities({
+        conversation: () => instance.harness.conversation(instance.rootConversationId as never, BACKGROUND_CONTEXT),
+        change: rootAgentChange,
+        expected: rootToolNames,
+        ctx: BACKGROUND_CONTEXT,
+        log: (line) => console.log(`[factory] ${repo}: ${line}`),
+      });
+      if (synced.tools.length === 0) {
+        throw new Error("root capability sync offered zero tools — an orchestrator with no tools cannot run a task");
+      }
     } catch (e) {
       console.error(`[factory] fatal: ${(e as Error).message}`);
       await instance.close().catch(() => {});
