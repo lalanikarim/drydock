@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { loadRegistry, requireEnabledRepo } from "../factory/repo-registry.ts";
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
+import { readSweepState } from "./redeliver-failed.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -285,6 +286,20 @@ async function runFleet(fleetPath: string): Promise<void> {
     // lock we no longer intend to hold.
     lock.release();
     for (const c of children) c.kill("SIGTERM");
+    const beganAt = Date.now();
+    // #110 diagnostic: the lingering-handle cause is still unexplained, only bounded. If something is
+    // keeping this process alive one second after teardown, say what it was instead of letting the 3s
+    // deadline paper over it — that mystery is how a supervisor needed SIGKILL for a week.
+    setTimeout(() => {
+      const handles = (process as unknown as { _getActiveHandles?: () => Array<{ constructor?: { name?: string } }> })._getActiveHandles?.() ?? [];
+      if (handles.length === 0) return;
+      const byType = new Map<string, number>();
+      for (const h of handles) {
+        const name = h?.constructor?.name ?? "unknown";
+        byType.set(name, (byType.get(name) ?? 0) + 1);
+      }
+      console.log(`[supervisor] still alive ${Date.now() - beganAt}ms after shutdown with ${handles.length} active handle(s): ${[...byType.entries()].map(([k, v]) => `${v}×${k}`).join(", ")}`);
+    }, 1_000).unref();
     // Deliberately NOT unref'd: an unref'd deadline timer lets the process linger on whatever handle a
     // child left open, which is how a supervisor sat alive 13s after logging "shutting down" and had to
     // be SIGKILLed. A ref'd timer guarantees shutdown is bounded at 3s either way.
@@ -331,6 +346,21 @@ async function statusFleet(fleetPath: string): Promise<void> {
   for (const r of rows) {
     console.log(`${r.repo.padEnd(width)}  ${r.state.padEnd(18)}  ${r.pending}`);
   }
+
+  // Failed-delivery sweep freshness (#110). GitHub does not retry failed deliveries, so "we have a
+  // recovery tool" is worth nothing unless someone ran it — and the only way to find out at a glance
+  // is for the status command to admit when it has never happened.
+  const routesPath = rel(fleetPath, fleet.adapter!.routesFile);
+  const sweepPath = process.env.FACTORY_SWEEP_STATE ?? join(dirname(routesPath), "last-sweep.json");
+  const sweep = readSweepState(sweepPath);
+  if (!sweep.ok) {
+    console.log(`\nfailed-delivery sweep: ${sweep.reason === "never" ? "NEVER RECORDED" : sweep.reason.toUpperCase()} — run fleet/redeliver-failed.mjs with --state-file ${sweepPath}`);
+    return;
+  }
+  const st = sweep.state as { at: string; mode?: string; inspected?: number; undelivered?: number; queued?: number };
+  const ageMin = Math.round((Date.now() - Date.parse(st.at)) / 60_000);
+  const stale = ageMin > 60 ? " ⚠ older than 1h" : "";
+  console.log(`\nfailed-delivery sweep: ${ageMin} min ago (${st.mode ?? "?"}) — inspected ${st.inspected ?? "?"}, undelivered ${st.undelivered ?? "?"}, queued ${st.queued ?? 0}${stale}`);
 }
 
 // CLI guard: importing this module (tests pull in checkRegistryPolicy) must not consume argv or

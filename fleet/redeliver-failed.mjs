@@ -21,8 +21,9 @@
 // Auth: GITHUB_TOKEN / GH_TOKEN, else `gh auth token`.
 
 import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const API = "https://api.github.com";
 
@@ -150,6 +151,47 @@ export async function redeliver({ repo, hookId, deliveryId, token, fetchImpl = g
   return { deliveryId, ok: res.status === 202 || res.ok, status: res.status };
 }
 
+/**
+ * Sweep state for operators and for `supervisor status` (#110): "when did we last look, and what did
+ * we see" is the only way a tool that runs on a schedule earns trust. Written after a successful
+ * listing, including the zero-failure case — a sweep that found nothing is information, and "never
+ * ran" must be distinguishable from "ran and was clean".
+ */
+export function sweepStatePayload({ repo, hookId, mode, inspected, undelivered, queued = 0 }) {
+  return {
+    at: new Date().toISOString(),
+    repo,
+    hookId: String(hookId),
+    mode,
+    inspected,
+    undelivered,
+    queued,
+  };
+}
+
+export function writeSweepState(path, payload) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(payload) + "\n");
+}
+
+/** Never throws: `supervisor status` must still print its table when the state file is missing or
+ *  corrupt. Returns { ok:false, reason } instead of an exception in both those cases. */
+export function readSweepState(path) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    return { ok: false, reason: (e && e.code === "ENOENT") ? "never" : "unreadable" };
+  }
+  try {
+    const state = JSON.parse(raw);
+    if (!state || typeof state !== "object" || typeof state.at !== "string") return { ok: false, reason: "corrupt" };
+    return { ok: true, state };
+  } catch {
+    return { ok: false, reason: "corrupt" };
+  }
+}
+
 export async function main({ argv = process.argv.slice(2), env = process.env, fetchImpl = ghFetch, log = console.log } = {}) {
   const args = new Set(argv);
   const opt = (name) => {
@@ -164,6 +206,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   // name what it touches. Comma-separated.
   const only = (opt("only") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   const apply = args.has("--apply");
+  // Optional breadcrumb for scheduling and `supervisor status` (#110). Not written by default: a tool
+  // that silently creates state files on every invocation is how deployments accumulate mystery files.
+  const stateFile = opt("state-file") ?? null;
 
   if (!repo || !hookId) {
     log("usage: node fleet/redeliver-failed.mjs --repo owner/repo --hook <hook_id> [--since <ISO>] [--only <id,id>] [--apply]");
@@ -188,12 +233,26 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
     log(`  ${group.reason}: ${group.count} (${group.events.join(", ")}) ids: ${group.ids.slice(0, 8).join(", ")}${group.ids.length > 8 ? " …" : ""}`);
   }
 
-  if (!failed.length) return { code: 0, failed, applied: [] };
+  const recordSweep = (mode, queued) => {
+    if (!stateFile) return;
+    try {
+      writeSweepState(stateFile, sweepStatePayload({ repo, hookId, mode, inspected: all.length, undelivered: failed.length, queued }));
+    } catch (e) {
+      // A state file that cannot be written is worth knowing about but never fails the sweep itself.
+      log(`warning: could not write --state-file ${stateFile}: ${e.message}`);
+    }
+  };
+
+  if (!failed.length) {
+    recordSweep(apply ? "apply" : "dry-run", 0);
+    return { code: 0, failed, applied: [] };
+  }
 
   if (!apply) {
     log("");
     log("DRY RUN — nothing re-driven. Re-run with --apply to POST delivery attempts.");
     log("  (A policy refusal is NOT listed here: those answer 2xx and GitHub records them as OK.)");
+    recordSweep("dry-run", 0);
     return { code: 1, failed, applied: [] }; // nonzero so a scheduled run surfaces in mail/logs
   }
 
@@ -205,6 +264,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   }
   const queued = applied.filter((a) => a.ok).length;
   log(`${queued}/${applied.length} redelivery attempt(s) queued. GitHub accepted != delivered — check again next run.`);
+  recordSweep("apply", queued);
   return { code: applied.every((a) => a.ok) ? 0 : 1, failed, applied };
 }
 

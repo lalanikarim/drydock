@@ -602,3 +602,29 @@ Two ceilings, because one is gameable: **2 identical refusals** (same signature)
 **Honest limits.** The budget is per-process memory: a restart clears it, deliberately, since restarting is a human act and a durable stop would outlive that intent (dispatch dedupe across restarts is intake's `requestId`, a different mechanism). It also cannot tell an unsatisfiable task from a merely hard one — it only knows that a refusal repeated. A task that needs a widened allowlist still needs the human to widen it; what changed is that asking now costs two cycles instead of six, and says so out loud.
 
 12 checks in `test/refusal-budget.test.mjs` (classification, signature normalization, both ceilings, per-issue isolation, infrastructure never charged, frozen counts after a stop, payload contents, constructor validation) and 5 in `test/refusal-stop-short.test.mjs` drive the real tool against scratch git repositories with no model and no token.
+
+### 5.23 Say what happened on the PR, and admit when nobody looked (#110 layer + #96, 2026-11-01)
+
+Two small visibility defects from the same week, fixed together because both are "the system knew and nobody else did".
+
+**#96 — a rework with no artifact.** `/factory rebase` on an already-current branch is a *correct* outcome: nothing to do, nothing pushed, suite green. It was also completely invisible — the only proof it happened was a durable-store row, so the human who typed the comment could not distinguish success from silent failure and would reasonably ask again (a full worker cycle to rediscover "nothing changed"). Same for a gate refusal after a rework request: the reviewer knew, the model knew, the PR said nothing.
+
+`factory/pr-report.ts` builds one comment per rework, verdict on the first line — **pushed** (previous → new sha), **no change to push** (with the reason that case is legitimate), or **refused — nothing was pushed** plus a Why section. Facts come from host state: the previous head is read from the PR before pushing (`headRefOid`), so `classifyPush()` answers "did anything change" from two shas rather than from what the model claims it did. A budget stop (#100) renders as its own row, because "stopped after 2 identical refusals" is a different statement than "refused".
+
+Two boundaries were decided rather than stumbled into:
+
+- **Only runs that reached a PR report.** Pre-dispatch refusals — sender not allowlisted, comment on a branch we do not own, closed PR — post nothing. Those decisions are made against a stranger's comment; replying would disclose policy detail to whoever typed it and hand anyone with an account a comment-writing primitive.
+- **One reply per rework.** A first draft PR already carries the evidence pack in its body, so `findOpenPr()` gates reporting on an existing PR rather than commenting everywhere.
+
+Reporting is strictly downstream: the push happens first, and a failed comment is logged and swallowed (`postPrComment` throwing must never turn a successful push into a failed run — asserted by test, since "best effort" is the kind of claim that quietly becomes "fatal in prod").
+
+**#110 — recovery you have to remember to run.** `fleet/redeliver-failed.mjs` existed but left no trace, so "we can recover lost webhook deliveries" and "we have been silently losing them for two days" produced identical output. Now:
+
+- `--state-file <path>` writes `{at, repo, hookId, mode, inspected, undelivered, queued}` after any run whose listing succeeded — **including the clean case**, because "never ran" has to differ from "ran and was clean". Opt-in flag rather than ambient state: a tool that drops files on every invocation is how deployments accumulate mystery artifacts.
+- `fleet/supervisor.ts status` prints the sweep's age and findings, with a `⚠ older than 1h` marker, and says **NEVER RECORDED** when there is no state file. `readSweepState()` cannot throw — missing/corrupt return `{ok:false, reason}` so the status table always prints.
+- `fleet/launchd/com.drydock.redeliver.plist.example` answers the scheduling question #110 was blocked on. **launchd, not cron: a laptop sleeps**, and cron skips the jobs it would have run during sleep without ever catching up — which is exactly the window in which webhook deliveries fail. `StartInterval` resumes on wake; `KeepAlive=false` keeps it a short-lived process instead of another daemon to supervise. The template is **report-only** (no `--apply`) with exit 1 on findings: a scheduled job that acts could resurrect work for an issue closed hours ago, so detection is automated and recovery stays a human call with `--only <id>`.
+- Shutdown got a diagnostic instead of another assumption: one second after teardown the supervisor logs how many handles are still open and of what types. The lingering-handle cause is still unexplained — #108 bounded it to 3s, this makes it visible if it comes back, which is the honest state of that sub-item.
+
+**Limits.** The report is a comment, not a notification (#64 remains open); a run that dies before reaching `open_draft_pr` — worker crash, budget stop before any call — still reports nothing on the PR, though the latter logs and refuses loudly. And the launchd job is a template: scheduling is not installed by this change, because cadence is an operator decision about API volume on a laptop, not a library default.
+
+7 checks in `test/pr-report.test.mjs` (three report shapes, sha-based classification, truncation, placeholders), 4 in `test/pr-report-wiring.test.mjs` (one comment per refusal, refused files named, silence when no PR exists, reporting failure cannot change the outcome) and 6 in `test/sweep-state.test.mjs` (payload contract, never-throws reader, dry-run/clean/no-flag write semantics).
