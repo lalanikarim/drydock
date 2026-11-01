@@ -129,7 +129,9 @@ test("factory/repo-registry.json loads and describes the expected registry", () 
 test("drydock is enabled for self-work and can never auto-merge", () => {
   const raw = JSON.parse(readFileSync(join(ROOT, "factory/repo-registry.json"), "utf8"));
   const drydock = raw.repos.find((r) => r.repo === "lalanikarim/drydock");
-  assert.equal(drydock.enabled, true, "self-work is enabled: local, human-dispatched runs only (no fleet entry, no published listener)");
+  // Enabled since #58. Dispatch still requires a deliberate act by an allowlisted sender:
+  // the `build` eligibility label on an issue, or a `/factory` comment on a factory PR.
+  assert.equal(drydock.enabled, true, "self-work is enabled: nothing starts a run without an eligible event");
   // The invariant that replaced "disabled" as the safety story. autoMerge:false is what removes
   // merge_pr from the tool list entirely (test/repo-enforcement.test.mjs), so a self-run cannot land
   // anything in the repo holding the research record even if every other control were bypassed.
