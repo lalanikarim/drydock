@@ -34,6 +34,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { loadRegistry, requireEnabledRepo } from "../factory/repo-registry.ts";
+import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -169,6 +170,22 @@ function rel(fleetPath: string, p: string): string {
 
 async function runFleet(fleetPath: string): Promise<void> {
   const fleet = loadFleet(fleetPath);
+
+  // Single-instance guard (#107), taken BEFORE the routes file is written. Two supervisors are not two
+  // factories: each mints its own per-route instance token and rewrites the shared routes file, so they
+  // take turns invalidating each other's adapter, and every delivery refused during that window is gone
+  // for good — GitHub does not automatically redeliver failed webhook deliveries. The lock lives beside
+  // the file it protects so a second fleet on another routes file is still allowed.
+  const lockTarget = fleet.adapter ? rel(fleetPath, fleet.adapter.routesFile) : resolve(fleetPath);
+  const lockPath = process.env.FACTORY_SUPERVISOR_LOCK?.trim() || defaultLockPath(lockTarget);
+  const lock = acquireInstanceLock(lockPath, { label: "supervisor" });
+  if (!lock.acquired) {
+    console.error(`[supervisor] ${lock.reason}`);
+    console.error(`[supervisor] refusing to start; nothing was written to ${lockTarget}`);
+    process.exit(1);
+  }
+  console.log(`[supervisor] ${lock.reason} (lock: ${lockPath})`);
+
   let shuttingDown = false;
   const restarts = new Map<string, number>();
   const children: ChildProcess[] = [];
@@ -264,8 +281,14 @@ async function runFleet(fleetPath: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log("[supervisor] shutting down");
+    // Release before waiting, so a restart racing our own teardown is not told "already running" by a
+    // lock we no longer intend to hold.
+    lock.release();
     for (const c of children) c.kill("SIGTERM");
-    setTimeout(() => process.exit(0), 3_000).unref();
+    // Deliberately NOT unref'd: an unref'd deadline timer lets the process linger on whatever handle a
+    // child left open, which is how a supervisor sat alive 13s after logging "shutting down" and had to
+    // be SIGKILLed. A ref'd timer guarantees shutdown is bounded at 3s either way.
+    setTimeout(() => process.exit(0), 3_000);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
