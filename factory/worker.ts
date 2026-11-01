@@ -32,6 +32,7 @@ import { readLessons } from "./lessons.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
+import type { PathScope } from "./path-scope.ts";
 import {
   authorizePrFeedback,
   directiveGuidance,
@@ -123,7 +124,25 @@ export interface WorkerReworkPrompt {
   truncated: boolean;
 }
 
-export function workerPrompt({ issueNumber, issueText, lessons = "", testCommand = "node --test", rework }: { issueNumber: number; issueText: string; lessons?: string; testCommand?: string; rework?: WorkerReworkPrompt }): string {
+export function workerPrompt({
+  issueNumber,
+  issueText,
+  lessons = "",
+  testCommand = "node --test",
+  rework,
+  pathScope,
+}: {
+  issueNumber: number;
+  issueText: string;
+  lessons?: string;
+  testCommand?: string;
+  rework?: WorkerReworkPrompt;
+  /**
+   * The repo's effective scope, stated up front (#100). A worker that is not told its boundary
+   * discovers it at push time — one full worker+review cycle later, repeated on every retry.
+   */
+  pathScope?: PathScope;
+}): string {
   const branch = `agent/issue-${issueNumber}`;
   return [
     `You are a software factory worker. The repository is checked out in /sandbox (your working directory), already on branch ${branch}.`,
@@ -168,6 +187,17 @@ export function workerPrompt({ issueNumber, issueText, lessons = "", testCommand
     "",
     "Working rules:",
     `- Stay on branch ${branch}. Do not create other branches, do not push, and do not use any git remote commands.`,
+    // State the boundary before the work instead of enforcing it only at the end: six identical
+    // refusals in #99 were paid for by a worker that had no way to know package.json was off limits.
+    ...(pathScope?.allowlist
+      ? [
+          `- This repository accepts changes ONLY under: ${pathScope.allowlist.join(", ")}. The factory host refuses the WHOLE change before anything is pushed or reviewed if any other file is touched — an out-of-scope edit does not cost a retry, it costs the entire run.`,
+          ...(pathScope.protectedPaths?.length
+            ? [`- Never change these, even if they look in scope above: ${pathScope.protectedPaths.join(", ")}.`]
+            : []),
+          "- If the issue cannot be completed without touching a file outside that list, stop and say exactly that in your final answer. Declining for scope reasons is a correct outcome; making the edit and hoping nobody notices is not.",
+        ]
+      : []),
     rework
       ? "- Make the smallest change that satisfies the reviewer's request while keeping the issue's acceptance criteria intact. Do not rewrite unrelated parts of the branch, and do not drop commits you did not need to touch."
       : "- Implement the smallest change that satisfies the issue and its acceptance criteria. Follow the behavior spec in README.md where relevant.",
@@ -195,9 +225,11 @@ export interface WorkerTaskOptions {
   wallSecsPerIssue?: number;
   lessonsFile?: string; // standing lessons fed to every worker prompt
   sandboxPolicy?: SetupPolicy | null;
+  /** The same scope the push gate enforces, so the worker can respect it instead of discovering it. */
+  pathScope?: PathScope;
 }
 
-export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth }: WorkerTaskOptions) {
+export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth, pathScope }: WorkerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
   const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
     try {
@@ -291,7 +323,7 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
         const handle = await runtime.conversation(convId, ctx);
         if (handle === undefined) throw new Error("worker conversation missing");
         await handle.submit(
-          { type: "input", content: workerPrompt({ issueNumber, issueText, lessons, testCommand, rework: reworkPrompt }), requestId: `worker-${task.id}` },
+          { type: "input", content: workerPrompt({ issueNumber, issueText, lessons, testCommand, rework: reworkPrompt, pathScope }), requestId: `worker-${task.id}` },
           ctx,
         );
         await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId } }), ctx);
