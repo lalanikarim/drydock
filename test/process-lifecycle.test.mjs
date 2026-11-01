@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -92,13 +92,29 @@ const alive = (pid) => {
 
 // ---------------------------------------------------------------------------
 
-test("a detached child leads its own process group", () => {
+/**
+ * Wait until `pgrep -g` can see the group. A spawn that has not been scheduled yet is invisible to it, and a
+ * teardown test that fires in that window proves nothing — CI caught exactly this on an ubuntu runner (the
+ * stubborn-child test below reported "no escalation needed" because there was nothing in the group yet).
+ */
+async function waitForGroup(pid, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const seen = listProcessGroup(pid);
+    if (seen.length > 0) return seen;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.fail(`process group ${pid} never became visible to pgrep — group-addressable teardown cannot be tested`);
+}
+
+test("a detached child leads its own process group", async () => {
   const dir = workdir();
   const leader = spawnInProcessGroup(execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   try {
     assert.ok(leader.pid, "child must have a pid");
     // pgid === child pid is the whole premise of group-addressable teardown.
-    assert.deepEqual(listProcessGroup(leader.pid), [leader.pid]);
+    const seen = await waitForGroup(leader.pid);
+    assert.deepEqual(seen, [leader.pid]);
   } finally {
     leader.kill("SIGKILL");
     rmSync(dir, { recursive: true, force: true });
@@ -129,10 +145,23 @@ test("group termination reaches grandchildren — a child's own subprocess does 
 
 test("a child that ignores SIGTERM is escalated to SIGKILL and reported as escalated", async () => {
   const dir = workdir();
+  // The child announces readiness AFTER installing its trap. Without that handshake this test was a race and
+  // lost on a loaded runner: teardown ran while the group was still empty, so "escalation was not needed" was
+  // reported as if SIGTERM had been honored — a pass about scheduling, not about the code under test.
+  const ready = join(dir, "ready");
   const stubborn = join(dir, "stubborn.mjs");
-  writeFileSync(stubborn, `process.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n`);
+  writeFileSync(
+    stubborn,
+    `import { appendFileSync } from "node:fs";\nprocess.on("SIGTERM", () => {});\nappendFileSync(${JSON.stringify(ready)}, "armed\\n");\nsetInterval(() => {}, 1000);\n`,
+  );
   const child = spawnInProcessGroup(execPath, [stubborn], { stdio: "ignore" });
   const exited = once(child, "exit");
+
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(ready) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  assert.ok(existsSync(ready), "stubborn child never installed its SIGTERM trap — nothing to escalate against");
+  // Non-vacuity: there must be something in the group before teardown claims it escalated.
+  assert.equal((await waitForGroup(child.pid)).length, 1);
 
   const result = await terminateProcessGroup(child.pid, { termGraceMs: 400, killGraceMs: 1_500 });
   await exited;
