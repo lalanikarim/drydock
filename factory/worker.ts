@@ -446,10 +446,15 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           // (no manual teardown — core-owned)
         }
       }),
-      abort: guarded("ABORT", async (task, runtime, ctx) => {
-        await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "worker aborted" } }), ctx);
-      }),
     },
+    // `abort` is a top-level member of TaskDefinition — "runs in a fresh invocation after an abort mark and must
+    // commit a terminal outcome" — not a phase. Nested under `phases` it type-checked as just another phase name (the
+    // map has a string index signature) and was never called: every abort mark on a worker threw
+    // `erased(...).abort is not a function` and the task faulted instead of settling (#164). The repo had no
+    // type-check step, so a missing required interface member was invisible; see also test/task-definition-contract.test.mjs.
+    abort: guarded("ABORT", async (task, runtime, ctx) => {
+      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "worker aborted" } }), ctx);
+    }),
   });
 }
 

@@ -24,6 +24,7 @@ import { RefusalBudget } from "./refusal-budget.ts";
 import type { Notifier } from "./notify-telegram.ts";
 import type { PathScope } from "./path-scope.ts";
 import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
+import { assertAbortable } from "./task-contract.ts";
 
 /**
  * The orchestrator prompt.
@@ -196,6 +197,13 @@ export function factoryPipeline(opts: PipelineOptions) {
     sandboxPolicy: opts.sandboxPolicy,
     gitAuth: auth,
   });
+
+  // #164: a factory that cannot abort its own workers should refuse to start. The alternative is discovering it during
+  // an incident — the kernel only touches `definition.abort` when an abort mark arrives, which may be days after the
+  // definition was written, and the faulted record keeps `{message}` with no stack.
+  assertAbortable(workerTaskDef, "factory.worker");
+  assertAbortable(reviewerTaskDef, "factory.reviewer");
+  assertAbortable(refineTaskDef, "factory.refine"); // null when refinement is disabled; the check skips it
 
   return defineExtension({
     name: "factory",
