@@ -48,9 +48,10 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 | kernel pin | `vendor/engram` @ `v0.2.0` (`a764e36`) | `git submodule status` |
 | credential | App `drydock-factory` (5557270), installation 177271737, hourly installation tokens, PEM outside the tree | `node gates/github-app-check.mjs` |
 | drydock registry entry | `enabled:true`, `autoMerge:false`, eligibility `build`, `refine:true`, `prFeedback:true`, allowlist `factory/ fleet/ test/ research/ README.md AGENTS.md`, protected `gates/probes/`, verification required | `factory/repo-registry.json` |
-| **last full nine-gate battery** | ⚠️ **`main` = `2596e9e`, 2026-10-28.** Everything since is unverified by the battery | plan §5.9 / §5.18 |
+| **last full nine-gate battery** | ✅ **7 of 9 green on 2026-11-02** (`main` `398385f` → `626de7a`): G0, G1, G2, G3, M1, M2, M4 PASS. G4 partial (T1 merged with exactly one merge commit; T2's retry after mid-approval SIGKILL never landed inside 900 s). G5 red — its two arms ran on one branch, so its "attribution" number was measured off a no-op diff (#145) | runbook §12; #144 (fix), #145 |
+| **fixture supply** | ⚠️ The battery consumes its own targets: every fixture issue in both repos was closed/implemented, and M-gates refuse to run without `M_REPO_B`/`M_ISSUE_B`. Eight issues were seeded for this run from live `curl` transcripts (`battery-seed`, never `agent`) | runbook §12 |
 
-Open issues: **#122** transcript poisoning · **#110** shutdown handle/SIGTERM · **#64** notification end-to-end
+Open issues (2026-11-02): **#143** supervisor died on a config read in its own recovery path · **#141** wall-budget aborts retried without a counter, and no `abort` verb exists · **#145** G5 arms share one branch · **#133** inference reachability (first half shipped) · **#120** stuck-run runbook · **#110** shutdown handle root cause · **#64** Telegram end-to-end
 proof · #120 (real doc work, specified by a refinement brief) · #78 deferred · #42 parked · #41 hold.
 
 ---
@@ -115,10 +116,32 @@ runbook §6b.
 *Still owed:* one real `refine` label producing a brief from a one-tool conversation, on the deployed fleet. The
 real-kernel check for it (`factory/intake-boot.test.ts`) is written and skips without an inference endpoint.
 
-### P0-2 · Re-run the nine-gate battery on current `main` — ~half a day wall time
-Last PASS was 105 commits and ~29 merged PRs ago. Gates: `gates/g{0..5}-*.mjs`, `gates/m1-two-repos.mjs`,
-`gates/m2-isolation.mjs`, `gates/m4-budget.mjs`. G1/G4 mutate fixtures → need explicit sign-off. Expect new
-findings; budget for them rather than treating a red gate as surprise noise.
+### P0-2 · Re-run the nine-gate battery on current `main` — **DONE with two open tails (2026-11-02)**
+
+Run on `main` `398385f` → `626de7a`, sequential, ~5.5 h wall including fixture seeding and one fix shipped mid-run.
+Sign-off for G1/G4 fixture mutations was given by the operator before starting; it cost 8 seeded issues plus merges of
+fixture PRs #52/#57-era drafts.
+
+| gate | result | what it proved |
+|---|---|---|
+| G0 | **PASS** 20/20 | exactly-once intake under simulated retry, signature verification, multi-repo routing/M3, sender allowlist |
+| G1 | **PASS** 190 s | label → unattended draft PR (fixture #49 → PR #52) |
+| G2 | **PASS** 1/1 | #45 → PR #53; suite 98/0, scope ok, behavior ok, `zeroEdits=true`, 281K tokens |
+| G3 | **PASS** | negative arm caught the seeded bad fix and named the root cause; positive arm passed |
+| M1 | **PASS** | two repos completed the full chain **simultaneously**, evidence complete, one merge commit each |
+| M2 | **PASS** | A SIGKILLed mid-run at 6 s; B completed end-to-end unaffected |
+| M4 | **PASS** | A aborted cleanly by a 120 s budget (`abortedByBudget=true`, no PR); B completed |
+| G4 | **partial** | T1: evidence on PR → approve → merge, `mergeCommits=1` verified. T2: approval survived the SIGKILL and re-verified the head sha, but the retry never merged within 900 s — under investigation |
+| G5 | **FAIL (harness)** | baseline arm exhibited the handler patch and the lesson arm did not — but both arms ran on `agent/issue-55`/PR #57, which had one commit total, so "did not recur" was measured off a no-op diff (#145) |
+
+**What the run bought, beyond a green checkbox:** the first thing it caught was that three gates were failing on a
+duplicated literal (`## Test suite (host-verified at PR creation)` vs the heading production emits), with exactly-once
+merge, isolation and budget abort all passing underneath — fixed by putting the contract in `factory/pr-evidence.ts`
+with producer and consumer sharing it (#144, +5 tests, mutation-checked). The second was G5's arm coupling (#145).
+Both are harness defects: the properties under test held in every case.
+
+**Open tails:** G4-T2's retry-after-crash stall (if a durable approval is recorded but nothing re-drives the merge,
+the Telegram-button flow silently stalls — worth treating as P1 until understood), and #145.
 
 ### P0-3 · Deploy path: `SIGTERM` ignored — **DONE (2026-11-02, #130)**
 
