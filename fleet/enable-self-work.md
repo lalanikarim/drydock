@@ -700,6 +700,75 @@ that when the reason is policy rather than a fire.
   pid, the real supervisor kept the lock, and the restart refused with a message that blamed the new process. Read
   the owner from `fleet/data/routes.json.lock`, or anchor the pattern: `pgrep -f '^node --experimental-strip-types fleet/supervisor[.]ts'`.
 
+## 7d. Counting work that was accepted and produced nothing (#161)
+
+A task can `faulted` and a submission can settle `unanswered` while every health endpoint says `ok`. Nothing counted
+either until this gate existed; the first thing it ever ran against production found four faulted factory workers and
+reported them as ordinary rows in a table nobody opened.
+
+```bash
+node gates/settlement-window.mjs              # window mode: alarm only on settlements newer than the watermark
+node gates/settlement-window.mjs --json       # machine-readable; same exit codes
+node gates/settlement-window.mjs --all-kinds  # include kernel-internal tasks (pi.generation, pi.tool)
+node gates/settlement-window.mjs --reset-watermark   # re-baseline on purpose
+node gates/settlement-window.mjs --no-advance        # look without moving the watermark
+```
+
+Exit **0** = window clean (or baseline established). Exit **2** = new `failing`/`unanswered` settlements, or nothing
+was examined at all, or the watermark is corrupt. A run that opened zero stores must never be green.
+
+| class | comes from | alarms? |
+|---|---|---|
+| `completed` | task outcome `completed`, submission `done` | no |
+| `failing` | task outcome `failed` / `faulted`, or an outcome the ledger does not recognize | **yes** |
+| `unanswered` | submission `unanswered` whose reason is not `aborted` — this is the #133 shape (no model answered) | **yes** |
+| `aborted` | task aborted with no reason (an operator using `POST /factory/runs/abort`, #141), or a submission `unanswered` with `reason=aborted` | no, reported |
+| `restarted` | task aborted with `abortReason=restart` — reclaimed by a restart | no, churn |
+| `unsettled` | submission still `queued` / `placed` | no, gauge only |
+
+An operator stopping a run is information, not evidence the model flailed; charging it to an incident counter trains
+everyone to mute the counter. That is the same reasoning #141 used for the wall-budget cap.
+
+### First run baselines, deliberately
+
+Without a watermark every historical failure alarms at once, and the rational response to that is to delete the gate.
+So run 0 says `BASELINE RUN`, prints lifetime counts, moves the watermark, and exits 0. `--no-baseline` demands the
+alarm anyway. After that, only newer rows count — and **a window that alarmed does not advance**, so an unacknowledged
+failure alarms again on every run until it is either examined or the watermark is moved deliberately.
+
+### Two columns that will lie to you (`AGENTS.md`: verify what you collected)
+
+Both of these were found by querying production first, and both produce a permanently clean report if guessed:
+
+```bash
+# 1. Text columns are JSON-encoded — `kind` holds "factory.worker" WITH quotes.
+sqlite3 "file:factory-instances/<repo>/engram-data/agent.sqlite?mode=ro" \
+  "select count(*) from tasks where kind = 'factory.worker';"        # → 0, forever
+sqlite3 "file:factory-instances/<repo>/engram-data/agent.sqlite?mode=ro" \
+  "select json_extract(kind,'$') as kind, count(*) from tasks group by 1;"   # → real counts
+
+# 2. `state.status` is the state machine, not the result — it says `terminal` for every row, failures included.
+sqlite3 "file:factory-instances/<repo>/engram-data/agent.sqlite?mode=ro" \
+  "select coalesce(json_extract(record,'$.state.outcome.status'),'(none)') o, count(*) from tasks group by 1;"
+```
+
+Task ids also come from a **shared allocator** (`record_ids` covers conversations, entries, tasks, submissions and
+documents), so they are sparse — 655 tasks below id 1543 is normal, not pruning — but strictly monotone, which is why
+the watermark tracks "highest id seen per store per table" rather than a timestamp.
+
+### What this gate deliberately does not do
+
+- **No HTTP surface.** The counts are not on `/health`. That endpoint is served through the Funnel, and #138 already
+  produced one exposure by putting operational detail behind an address check that Tailscale terminates from
+  `127.0.0.1`. A command with `--json` answers the same question without new public surface; if a route is ever
+  wanted it must be bearer-gated like `/health/inference`, not loopback-gated.
+- **No timestamps for submissions.** They do not have any (verified against production, 2026-11-03). The ledger
+  reports `when` only for tasks, from `$.endedAt`.
+- **Kernel tasks are out of the default scope**, because in a real store `pi.tool`/`pi.generation` outnumber factory
+  runs about 17:1 and would bury the signal. `--all-kinds` includes them; `byFamily` reports both halves either way.
+- **It does not fix what it counts.** Four faulted workers were found on the first run (two from the #98 git-identity
+  403, two from an `erased(...).abort is not a function` crash) and are historical, so they sit below the baseline.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
@@ -824,6 +893,7 @@ that the chat is reachable; use the credential check above for that half.
 | 9 | The running supervisor is on the commit you think it is | `curl -s localhost:9700/health \| jq '{build,startedAt}'` vs `git log -1 --format=%h` | `build.sha` equals trunk; if not, restart. Also grep `fleet/data/supervisor.log` for `SERVING STALE POLICY` (#150) — that means policy edits are not live |
 | 10 | You can name the supervisor pid without guessing | `cat fleet/data/routes.json.lock` | a live pid owned by this deployment — `pgrep -f … \| head -1` has twice returned a shell wrapper instead (§7c traps) |
 | 11 | An alert would actually reach you | `node gates/alert-drill.mjs` (needs the `TELEGRAM_*` pair) | exit 0 with both an outage and a recovery delivered to the local stand-in; exit 2 means the channel is broken, not that nothing happened (§8) |
+| 12 | Nothing settled without producing work | `node gates/settlement-window.mjs` | exit 0 with an empty window. Exit 2 means a task failed/faulted or a submission went `unanswered` since the last run — or that no store was readable, which is the other way this can be bad (§7d). First run baselines and exits 0 by design |
 
 Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
 
