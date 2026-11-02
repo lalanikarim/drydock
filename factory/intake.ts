@@ -10,6 +10,7 @@
 // delimiters with an explicit do-not-follow wrapper outside them.
 
 import http from "node:http";
+import type { InferenceAggregate, ProbeResult } from "./inference-probe.ts";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isPrCommentEvent, parseFactoryDirective, prFeedbackRequestId, prNumberFromEvent, type ParsedDirective } from "./pr-feedback.ts";
 import {
@@ -363,7 +364,7 @@ function readBoundedBody(req: http.IncomingMessage, cap: number): Promise<{ body
  * (plan §3.2 / gate M3) — signature validity doubles as per-repo
  * authorization. In this mode dispatch is called as dispatch(repo, event).
  */
-export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret, routes, dispatch, logPath, eligibilityLabel = AGENT_LABEL, routesDriftCheck }: {
+export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret, routes, dispatch, logPath, eligibilityLabel = AGENT_LABEL, routesDriftCheck, inferenceStatus, inferenceDetails }: {
   port?: number;
   host?: string;
   webhookSecret?: string;
@@ -379,6 +380,13 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
    * to stop rather than to serve on old authority. #69.
    */
   routesDriftCheck?: () => void;
+  /**
+   * Cached inference-endpoint state (#133), reported on /health without provider names. Return null until the
+   * first probe completes — "not yet measured" must not render as "reachable".
+   */
+  inferenceStatus?: () => InferenceAggregate | null;
+  /** Per-provider probe detail for the loopback-only /health/inference view. */
+  inferenceDetails?: () => readonly ProbeResult[];
 }): Promise<{ server: http.Server; port: number; host: string }> {
   if (routes) validateRoutes(routes);
   const hasAuth = Boolean(webhookSecret) || Boolean(routes?.length);
@@ -389,11 +397,30 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       if (req.method === "GET" && url.pathname === "/health") {
-        // Liveness only. This endpoint is unauthenticated, and once the listener
-        // is published anyone can reach it: naming configured repositories here
-        // would disclose private repo names to strangers.
+        // Liveness plus ONE honest fact. This endpoint is unauthenticated, and once the listener
+        // is published anyone can reach it: naming configured repositories here would disclose private
+        // repo names to strangers. Inference *state* discloses nothing about what is configured — no
+        // provider id, no host, no model — and its absence is what let a dead inference host look like a
+        // healthy fleet on 2026-11-02 (#133). `status` stays "ok" while the listener itself is alive and
+        // answering correctly; that is what liveness means here, and consumers of this field keep working.
+        const body: Record<string, unknown> = { status: "ok" };
+        const inf = inferenceStatus?.() ?? null;
+        if (inf) body.inference = { state: inf.state, reachable: inf.reachable, total: inf.total, checkedAt: inf.checkedAt };
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ status: "ok" }));
+        return res.end(JSON.stringify(body));
+      }
+      // Loopback-only detail (#133): which provider, which host, what failed. Names internal hostnames, so
+      // it answers nothing to a caller that is not on this machine — and returns 404 rather than 403 so the
+      // endpoint's existence is not advertised through the funnel.
+      if (req.method === "GET" && url.pathname === "/health/inference") {
+        const peer = req.socket.remoteAddress ?? "";
+        const loopback = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
+        if (!loopback || !inferenceDetails) {
+          res.writeHead(404, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: "not found" }));
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ aggregate: inferenceStatus?.() ?? null, providers: inferenceDetails() }));
       }
       if (req.method !== "POST" || url.pathname !== "/webhook/github") {
         res.writeHead(404, { "content-type": "application/json" });

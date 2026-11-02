@@ -897,3 +897,21 @@ Every webhook event in the fleet used to land in the **root conversation** — t
 **Residual risk, stated.** Creating a conversation and recording it in the durable ledger (`factory.intake-ledger`, a session-scoped doc) are two commits. A crash between them leaves a conversation nothing points at; the next redelivery opens another and the core's dedupe cannot see the first. The window is one commit wide, and the same crash would have lost the submission before this change too. A ledger entry whose conversation has disappeared is detected and replaced rather than retried forever.
 
 **Verification.** `test/intake-scoping.test.mjs` (15 tests) pins validation refusals, the policy→tool-name matrix against the real `factoryPipeline`, one-conversation-per-subject, isolation between subjects, redelivery → 200 duplicate with no second submission, and a hostile fake harness that refuses what the kernel refuses (unknown conversation id → undefined, settled requestId → throw, zero tools → refuse). `factory/intake-boot.test.ts` is the real-kernel version: ephemeral port, real sqlite store, real HTTP, asserting on the created conversation's `pi.agent` tool list and on how many times a probe tool actually executed. Suite: **360 pass / 0 fail**. *Not yet run live:* both boot-level checks require the inference endpoint, and `aurora.infinidigm:8888` was unreachable while this shipped (`ping: sendto: No route to host`), so they skip rather than pretend. Live end-to-end — a real `refine` label producing a comment from a one-tool conversation — is still owed.
+
+### 5.30 Backup is a drill, not a directory (P0-4, 2026-11-02)
+
+`gates/backup-drill.mjs`: snapshot → verify → restore → boot-from-the-restore, in one command, against the real stores.
+
+Until now P0-4 read "back up and prove a restore works" with no artifact behind it. The belief being replaced was *"there are sqlite files, they look fine"*, which does not survive three things:
+
+1. **WAL mode.** `cp agent.sqlite` can capture a database whose newest transactions are still in `-wal`. It restores as an older store, silently. Fixed by using `VACUUM INTO`, which folds the WAL into one self-contained file.
+2. **A copy that opens is not a copy that is sound.** `PRAGMA integrity_check` runs on the *copy*; a snapshot of corruption passes "the file exists".
+3. **Sound is not usable.** The restored store must accept a write — proven with an `INSERT` inside a rolled-back transaction — because the first thing a restarted harness does is commit, not read.
+
+Verification is by observable effect (AGENTS.md), never exit codes: row counts per table and **per-kind document counts** compared against a manifest written at backup time. The kind census is the one that matters — app-level state lives in `documents` (`mvp.meta`, approvals, approval rules, and since #122 `factory.intake-ledger`), and a total row count can be identical while a whole kind is missing.
+
+With `--boot`, an instance is started against the restored tree via `FACTORY_INSTANCES_ROOT` (the isolation seam factory/main.ts already honors). That closes the loop — "the application accepts this store" — and it cannot damage the live state, because the drill never points at it: the same mistake §10 warns about (two harnesses over one store) is structurally unavailable here.
+
+**Run (2026-11-02), real stores, real inference host:** `lalanikarim_drydock` snapshot integrity ok; restored tree matched `conversations=15 entries=460 tasks=430 submissions=28 documents=89 document_revisions=90` and 6 document kinds; write probe ok; instance booted from the restore and listed **15 conversations recovered**. `BACKUP DRILL PASSED`.
+
+**What this does not buy.** The backup directory is on the same physical disk as the stores, so it survives operator error, a bad migration and store corruption — not a dead machine. Off-host encrypted copies are the open half; runbook §11 says so rather than letting "we have backups" mean disaster recovery. Scheduling (launchd, like `com.drydock.redeliver`) is deliberately not installed: an unwatched backup job is how a month of silent failures accumulates, so schedule it with pruning and check the first few manifests.

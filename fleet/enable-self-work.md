@@ -519,6 +519,22 @@ Any `factory/main.ts` whose `PPID` is `1` — or anything other than the lock ow
 it (children honour `SIGTERM`; it is supervisors that don't, #110) and confirm exactly one remains. The count
 alone is not evidence; the `PPID` column is what distinguishes a live child from an orphan.
 
+**Check for orphans AFTER a restart is complete, not only after a crash (#125).** A restart that *looked*
+clean left two instance processes running behind a new supervisor on 2026-11-01, and the symptom appeared
+hours later as tasks with no result — which is why this check belongs at the end of every deploy rather than
+in an incident runbook. Since #130 the children self-terminate within ~2 s of losing their supervisor, so a
+survivor now means the watchdog did not work (or someone started an instance by hand) rather than "the build
+was from before we fixed that":
+
+```bash
+pgrep -fl "factory/main.ts"                       # survivors of the previous generation
+ps -eo pid,ppid,lstart,command | grep factory/main.ts | grep -v grep
+# PPID must equal the CURRENT supervisor's pid (fleet/data/routes.json.lock); an old START time is a survivor
+lsof -- factory-instances/lalanikarim_drydock/engram-data/agent.sqlite   # who shares the durable store
+ls -la factory-instances/*/engram-data/*.sqlite*  # stray -wal/-shm next to a running store means two openers
+cat factory-instances/*/orphan-events.log         # the watchdog's own record, if it ever fired
+```
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
@@ -621,6 +637,15 @@ cat factory-instances/lalanikarim_drydock/orphan-events.log
 
 A non-empty `orphan-events.log` means the safety net fired at least once: something was serving work with no supervisor, then stopped. Check whether another instance is on that store (`pgrep -fl factory/main.ts`) before restarting, and treat a growing file as a sign the supervisor keeps dying.
 
+**Restart budget: N restarts per repo, then the supervisor gives up — and what that costs.** On 2026-11-02 this fired for real during a deploy: both instances failed to boot because the inference host was unreachable, the budget exhausted in ~50 s, `giveUp()` asked everything to shut down, the adapter died with it, and every public webhook delivery hit a closed port — which GitHub records as a failed delivery and does **not** retry. The comment above `giveUp()` says "the operator must restart manually", and that is accurate; what it does not say is that deliveries are lost between the give-up and the human noticing. Check `inference` on `/health` before concluding an outage was caused by the code you just deployed.
+
+**Known gaps.**
+- **Inference reachability is probed and reported (#133).** The adapter probes the endpoint(s) every enabled repo pins and puts the result on `GET /health` as `inference: {state, reachable, total, checkedAt}` — state only, no provider id or hostname, because that response is reachable through the funnel. Per-provider detail (which host, what failed: `no-route` / `refused` / `dns` / `http-401` / `timeout`) is on `GET /health/inference`, **loopback-only**, 404 elsewhere. Tune with `INFERENCE_PROBE_INTERVAL_MS` (default 60000) and `INFERENCE_PROBE_TIMEOUT_MS` (default 5000). State *changes* are announced through the Telegram notifier, so an outage is heard when it happens rather than inferred from a stalled task. What this still cannot see: a host that answers `/models` but has not loaded the pinned model — and `status:"ok"` continues to mean "the listener lives", not "work will complete".
+- The supervisor exits after its restart budget, taking the adapter with it; there is no decay window, so an outage longer than ~10 × boot time stops trying permanently (#133).
+- A second supervisor is still refused only by the lock file; nothing detects a manually-started instance that never takes the lock.
+- `orphan-events.log` has no rotation (it grows one short line per event, so it is slow — but it is never inspected automatically).
+- The watchdog notices within its poll interval (~1 s), which is far shorter than any GitHub retry window but not zero.
+
 **Verify, don't assume:**
 
 ```bash
@@ -632,3 +657,52 @@ pgrep -fl "factory/main.ts|adapter.ts"   # nothing left holding an Engram store
 **Restart:** `nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> log 2>&1 & disown`. If the funnel URL changed while it was down, re-point the webhooks (§4) — GitHub does not retry deliveries that failed against the old URL, and §7 is how you find out which ones.
 
 **Recovery if orphans do exist** (a pre-watchdog build, or a `SIGKILL` plus a hung child): see [`orphan-recovery-2026-11-01.md`](orphan-recovery-2026-11-01.md) — kill the old tree, confirm nothing shares the Engram store, then start one supervisor. Two harnesses over one durable store is the failure this whole section exists to prevent; the lock catches a second supervisor, and it does not catch anything else.
+
+## 11. Backup and restore — the drill, not the intention (P0-4, 2026-11-02)
+
+Everything the factory knows lives in four sqlite stores plus a config directory that is deliberately not in git:
+
+| what | where |
+|---|---|
+| durable harness state (conversations, entries, tasks, submissions, documents) | `factory-instances/<owner>_<repo>/engram-data/agent.sqlite` |
+| per-repo runtime config (`testCommand`, model pin, budgets) | `$DRYDOCK_CONFIG_DIR/<owner>_<repo>.json` (default `~/.drydock/configs/`) |
+| fleet file + live routes | `fleet/fleet.local.json`, `fleet/data/routes.json` |
+| standing lessons | `factory-instances/<owner>_<repo>/lessons.md` |
+
+**Run the drill** (backup → verify → restore → boot from the restore):
+
+```bash
+node gates/backup-drill.mjs --keep 5              # backup + verify + restore drill
+node gates/backup-drill.mjs --keep 5 --boot       # also boots an instance against the restored store
+```
+
+`--boot` needs a reachable inference endpoint — a factory instance refuses to start without its model (correct behavior, and see #133 for why that fact is currently invisible). Without it the drill still proves everything except "the application accepts this store".
+
+**What each step asserts, and why:**
+
+1. **`VACUUM INTO`, never `cp`.** The stores are in WAL mode: copying `agent.sqlite` alone can capture a database whose newest transactions are still sitting in `-wal`, and it restores as an *older* store with no indication anything is missing. `VACUUM INTO` folds the WAL in and produces one self-contained file.
+2. **`PRAGMA integrity_check` on the copy**, not the source — a snapshot of corrupt data is corrupt and exits 0.
+3. **Restore into a scratch tree and compare observable effects**: row counts per table and per-kind document counts against the manifest written at backup time. Counts, not exit codes — "the copy command succeeded" says nothing about what was copied.
+4. **The restored store must be writable** (an `INSERT` inside a transaction that is rolled back). A harness does not read its database and stop; it commits within seconds of starting.
+5. **`--boot` starts a real instance against the restored tree only**, via `FACTORY_INSTANCES_ROOT` — the same isolation seam the gates use. This is also the guard against the runbook's own worst case (§10: two harnesses over one store): the drill can never touch the live stores because it never points at them.
+
+**Verified run (2026-11-02, real state, real model host):**
+
+```
+[1] snapshot each durable store (sqlite backup API, not cp)
+  ok    lalanikarim_drydock: integrity_check ok, … bytes
+        conversations=15 entries=460 tasks=430 submissions=28 documents=89 document_revisions=90
+[3] restore drill: rebuild a working tree from the backup alone and verify it
+  ok    lalanikarim_drydock: all table counts match (15, 460, 430, 28, 89, 90)
+  ok    lalanikarim_drydock: document kinds match (6 kinds)
+  ok    lalanikarim_drydock: writable (insert inside a rolled-back transaction)
+[4] booting an instance against the RESTORED store (lalanikarim/drydock)
+  ok    restored instance is serving with 15 conversation(s) recovered (backup held 15)
+BACKUP DRILL PASSED
+```
+
+**Where backups go, and the limit that matters.** Default `~/drydock-backups/<timestamp>/`, mode `0700`. They contain webhook secrets and instance tokens (`fleet.local.json`, `routes.json`) — treat the directory as secret material, never commit it, never sync it to a shared drive unencrypted.
+
+And the honest limit: **that directory is on the same physical disk as the stores.** The drill protects against operator error, a bad migration, and store corruption — it does not survive the machine dying. Off-host copies (encrypted, e.g. `age` + object storage) are the remaining gap; until then "we have backups" means "we can recover from our own mistakes", which is what P0-4 claimed and nothing more.
+
+**Scheduling:** unattended runs belong to launchd like the delivery sweep (`com.drydock.redeliver`). Not installed yet — a backup job nobody has watched is how you find out it has been failing for a month, so if you schedule it, schedule `--keep` pruning and check the manifest after the first few runs.
