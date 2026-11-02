@@ -369,16 +369,37 @@ Two properties that are the reason for the split, both worth remembering when ch
 
 Where an event went:
 
-```bash
-# Named conversations, newest intake first
-# routes.json is a top-level list; the instance token is per route
-curl -s -H "Authorization: Bearer $(python3 -c "import json;print(json.load(open('fleet/data/routes.json'))[0]['token'])")" \
-  http://127.0.0.1:64926/conversations | python3 -c "import json,sys;[print(c['id'], c['name'], c['model']) for c in json.load(sys.stdin)['conversations'] if str(c['name']).startswith('intake')]"
+Two quoting traps in the store will silently return nothing if you guess — both were guessed wrong here before being verified, and a query that returns no rows looks exactly like "the feature recorded nothing":
 
-# The durable (kind,subject) → conversation map and the handled-request tail. The column is `record`
-# (verified against the live store: documents(id, kind, family, key_value, scope_kind, owner_id, …, record)).
+- `documents.kind` stores the kind **JSON-encoded**, quotes included: it is `"factory.intake-ledger"`, not `factory.intake-ledger`. Use `json_quote('…')` rather than escaping quotes inside shell quoting.
+- `documents.record` holds only the doc **envelope** (id, kind, scope, createdAt). The state lives in `document_revisions.content` — one `base` row plus `delta` rows, newest `seq` last. Reading `record` and concluding "it's empty" is reading the wrong table.
+
+```bash
+# routes.json is a top-level list; port and token are per route (they change on every restart)
+PORT=$(python3 -c "import json;print(json.load(open('fleet/data/routes.json'))[0]['target'].split(':')[-1].strip('/'))")
+TOKEN=$(python3 -c "import json;print(json.load(open('fleet/data/routes.json'))[0]['token'])")
+
+# Intake conversations, by their stable names (`intake refine:#133`, `intake issue:#4`)…
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/conversations \
+  | python3 -c "import json,sys;[print(c['id'], repr(c.get('name'))) for c in json.load(sys.stdin)['conversations'] if str(c.get('name','')).startswith('intake')]"
+
+# …the durable (kind,subject) → conversation map and the handled-request tail…
 sqlite3 factory-instances/lalanikarim_drydock/engram-data/agent.sqlite \
-  "select substr(record,1,400) from documents where kind='factory.intake-ledger'"
+  "select r.seq, r.kind, substr(r.content,1,200) from documents d
+     join document_revisions r on r.document_id = d.id
+    where d.kind = json_quote('factory.intake-ledger') order by r.seq;"
+# 8072|base|{"entries":{"refine:#133":1023},"requests":[]}
+# 8075|delta|[["s",["requests"],[{"id":"issue-133-refine","key":"refine:#133","conversationId":1023,…
+
+# …and the thing #122 is actually about: which tools a given conversation can call. `tools` on the agent
+# doc is a hard kernel filter, so this is proof, not a log line to believe.
+sqlite3 factory-instances/lalanikarim_drydock/engram-data/agent.sqlite \
+  "select json_extract(r.content,'\$.tools') from documents d
+     join document_revisions r on r.document_id = d.id
+      and r.seq = (select max(seq) from document_revisions where document_id = d.id)
+    where d.kind = json_quote('pi.agent')
+      and json_extract(d.record,'\$.scope.conversationId') = 1023;"
+# ["refine_issue"]        ← a refine conversation: one tool, cannot delegate
 ```
 
 The boot log states the posture once at startup: `intake routing — issue/pr-feedback open an orchestration
