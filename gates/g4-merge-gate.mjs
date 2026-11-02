@@ -40,6 +40,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, api, postTask, waitForApproval, decideApproval } from "./lib.ts";
+import { checkEvidenceBody, REVIEW_PASS_RE, VERIFICATION_PASS_RE } from "../factory/pr-evidence.ts";
+
 
 const pExecFile = promisify(execFile);
 async function sh(cmd, args, opts = {}) {
@@ -107,22 +109,18 @@ async function verifySingleMerge({ preMainSha, expectedHeadSha }) {
   }
 }
 
-const EVIDENCE_SECTIONS = [
-  "## Diff summary",
-  "## Independent review (read-only subagent)",
-  "Reviewer concerns:",
-  "## Test suite (host-verified at PR creation)",
-  "## Worker report (transcript excerpt)",
-];
 
+// Evidence sections and pass regexes come from factory/pr-evidence.ts — production's contract, not a copy
+// kept in sync by hand. A local list here drifted from the emitted heading and turned three completed,
+// correctly-merged runs into red gates on 2026-11-02.
 async function checkEvidence(pr) {
-  const missing = EVIDENCE_SECTIONS.filter((s) => !(pr.body ?? "").includes(s));
   const body = pr.body ?? "";
+  const { ok, missing } = checkEvidenceBody(body);
   return {
-    ok: missing.length === 0 && /## Independent review[^\n]*\nPASS/.test(body) && /PASS — \d+ tests, \d+ passed, 0 failed/.test(body),
+    ok,
     missing,
-    reviewPass: /## Independent review[^\n]*\nPASS/.test(body),
-    testCounts: /PASS — \d+ tests, \d+ passed, 0 failed/.test(body),
+    reviewPass: REVIEW_PASS_RE.test(body),
+    testCounts: VERIFICATION_PASS_RE.test(body),
   };
 }
 

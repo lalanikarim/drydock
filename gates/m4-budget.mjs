@@ -19,6 +19,13 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, postTask, rootConversationId, waitForToolResult, waitForApproval, decideApproval } from "./lib.ts";
+import { checkEvidenceBody } from "../factory/pr-evidence.ts";
+
+// The evidence contract belongs to production, not to this gate: see factory/pr-evidence.ts. A local copy of
+// the required-section list drifted from the heading open_draft_pr actually emits and turned three completed,
+// correctly-merged runs into red gates on 2026-11-02 (the properties under test — exactly-once merge, isolation
+// under SIGKILL, clean budget abort — all passed; the string did not).
+const checkEvidence = (pr) => checkEvidenceBody(pr.body);
 
 const pExecFile = promisify(execFile);
 async function sh(cmd, args, opts = {}) {
@@ -52,19 +59,7 @@ baseCfg.budgets = { ...(baseCfg.budgets ?? {}), wallSecsPerIssue: budgetSecs };
 const cfgPathA = join(runDir, "factory-config-a.json");
 writeFileSync(cfgPathA, JSON.stringify(baseCfg, null, 2));
 
-const EVIDENCE_SECTIONS = [
-  "## Diff summary",
-  "## Independent review (read-only subagent)",
-  "Reviewer concerns:",
-  "## Test suite (host-verified at PR creation)",
-  "## Worker report (transcript excerpt)",
-];
 
-function checkEvidence(pr) {
-  const missing = EVIDENCE_SECTIONS.filter((s) => !(pr.body ?? "").includes(s));
-  const body = pr.body ?? "";
-  return { ok: missing.length === 0 && /## Independent review[^\n]*\nPASS/.test(body) && /PASS — \d+ tests, \d+ passed, 0 failed/.test(body), missing };
-}
 
 async function prForHead(repo, branch) {
   const out = await sh("gh", ["pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--json", "number,state,isDraft,url,headRefOid,mergeCommit,body"], { env: GH_ENV });
