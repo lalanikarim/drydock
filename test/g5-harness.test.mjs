@@ -14,10 +14,12 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { classifyFixPattern, addedLines, changedFiles, detectsSharedRule, detectsTypedError, formatClassification } from "../gates/fix-pattern.mjs";
 import { armBranch, contractFor, preflightArms } from "../gates/g5-traps.mjs";
+
 
 const FX = join(import.meta.dirname, "fixtures", "g5");
 const diff = (name) => readFileSync(join(FX, name), "utf8");
@@ -186,3 +188,49 @@ test("every seeded trap has a contract, and unknown issues fall back rather than
   }
   assert.ok(contractFor(999_999).domainPaths.length, "unknown trap still classifies — the gate must not crash mid-experiment");
 });
+
+// ── does the lesson actually reach the worker? (the negative result depends on this) ─────────────────────
+//
+// G5's conclusion is "the lesson did not change behavior". That is only meaningful if arm B's prompt contained the
+// lesson, so the last inch of the chain — lessons file → `readLessons` → `workerPrompt` — is asserted here rather
+// than assumed. worker.ts is already imported by other tests in this suite (worker-scope-prompt, worker-rework).
+
+const { readLessons } = await import("../factory/lessons.ts");
+const { workerPrompt } = await import("../factory/worker.ts");
+const { LESSON_TEXT, lessonsContent } = await import("../gates/g5-traps.mjs");
+
+test("arm A's lessons file reads as no lessons; arm B's reads as exactly one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "g5-lessons-"));
+  const a = join(dir, "a.md");
+  const b = join(dir, "b.md");
+  writeFileSync(a, lessonsContent(false));
+  writeFileSync(b, lessonsContent(true));
+  assert.equal(readLessons(a), "", "an empty file must read as no lessons, not as an empty trusted section");
+  assert.equal(readLessons(b), LESSON_TEXT);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a lesson present in the file appears in the worker prompt; an empty file adds no section", () => {
+  const withLesson = workerPrompt({ issueNumber: 63, issueText: "body", lessons: readLessons(writeTemp(lessonsContent(true))) });
+  assert.match(withLesson, /Standing factory lessons from prior review findings/);
+  assert.match(withLesson, /fix the rule where the error originates/);
+
+  const without = workerPrompt({ issueNumber: 62, issueText: "body", lessons: readLessons(writeTemp(lessonsContent(false))) });
+  assert.doesNotMatch(without, /Standing factory lessons/, "an empty lessons file must not add an empty trusted section");
+});
+
+test("the lesson is a standing rule, not an instruction for this run's bug", () => {
+  // A lesson that names the fixture's file, symbol, or issue number stops being knowledge and becomes the answer.
+  // G5 would then measure instruction-following while claiming to measure the feedback loop.
+  assert.doesNotMatch(LESSON_TEXT, /\.(mjs|ts|js)\b/, "no source filenames");
+  assert.doesNotMatch(LESSON_TEXT, /issue #\d+/);
+  assert.doesNotMatch(LESSON_TEXT, /invoices|statusCode: 400|store\.add/i, "no fixture-specific identifiers");
+  assert.match(LESSON_TEXT, /^- \[\d{4}-\d{2}-\d{2}\] /, "note_lesson's own line shape, so it is indistinguishable from a recorded lesson");
+});
+
+function writeTemp(content) {
+  const dir = mkdtempSync(join(tmpdir(), "g5-lesson-"));
+  const p = join(dir, "lessons.md");
+  writeFileSync(p, content);
+  return p;
+}

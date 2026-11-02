@@ -20,6 +20,23 @@
  * which are the same defect in two call paths and therefore equivalent by construction.
  */
 
+/**
+ * The one thing arm B gets and arm A does not.
+ *
+ * Formatted the way `note_lesson` writes (`- [date] text`) because `readLessons` hands the content to the worker
+ * prompt verbatim, inside a trusted section. It deliberately names no file, no symbol, and no issue number: a lesson
+ * that says "in src/store.mjs add statusCode" is an instruction for one historical bug, and whether a worker follows
+ * instructions is not the feedback loop. `test/g5-harness.test.mjs` asserts that property so the lesson cannot drift
+ * into a per-bug hint without going red.
+ */
+export const LESSON_TEXT =
+  "- [2026-11-03] When an API returns the wrong status or an internal error string for client input, fix the rule where the error originates — give the domain error a type that carries its own status, or enforce the check once in a place every path calls. Do not translate errors with instanceof/catch in one request handler: the other paths keep the bug.";
+
+/** What each arm's lessons file contains (arm A: empty, which is what "no lessons yet" looks like to readLessons). */
+export function lessonsContent(enabled) {
+  return enabled ? `${LESSON_TEXT}\n` : "";
+}
+
 /** Branch a worker will use for an issue — one branch per issue, so distinct issues mean distinct arms. */
 export function armBranch(issueNumber) {
   return `agent/issue-${issueNumber}`;

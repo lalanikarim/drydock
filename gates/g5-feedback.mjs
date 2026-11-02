@@ -51,7 +51,7 @@ import { tmpdir } from "node:os";
 import { startIntakeServer } from "../factory/intake.ts";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, waitForToolResult } from "./lib.ts";
 import { classifyFixPattern, formatClassification } from "./fix-pattern.mjs";
-import { contractFor, preflightArms, armBranch } from "./g5-traps.mjs";
+import { contractFor, preflightArms, armBranch, lessonsContent } from "./g5-traps.mjs";
 
 const exec = promisify(execFile);
 const argv = process.argv.slice(2);
@@ -67,17 +67,6 @@ const KEEP = argv.includes("--keep");
 const ALLOW_STALE = argv.includes("--allow-stale-branches");
 const TIMEOUT_MS = Number(process.env.G5_TIMEOUT_MS ?? 45 * 60_000);
 const POLL_MS = 20_000;
-
-/**
- * The one thing arm B gets and arm A does not.
- *
- * Formatted the way `note_lesson` writes (`- [date] text`) because that content is handed to the worker prompt
- * verbatim by `readLessons`. It names no file, no issue, and no fixture: a lesson that says "in src/store.mjs add
- * statusCode" is an instruction for one historical bug, and whether a worker follows instructions is not the feedback
- * loop.
- */
-const LESSON_TEXT =
-  "- [2026-11-03] When an API returns the wrong status or an internal error string for client input, fix the rule where the error originates — give the domain error a type that carries its own status, or enforce the check once in a place every path calls. Do not translate errors with instanceof/catch in one request handler: the other paths keep the bug.";
 
 const ARMS = [
   { label: "A", kind: "baseline", issue: ISSUE_A, lessons: false },
@@ -104,7 +93,7 @@ async function gh(args, opts = {}) {
 /** Both arms get a lessons file — only arm B's has content. Same config shape either way. */
 function writeLessonsFile(runDir, label, enabled) {
   const p = join(runDir, `g5-lessons-${label}.md`);
-  writeFileSync(p, enabled ? `${LESSON_TEXT}\n` : "");
+  writeFileSync(p, lessonsContent(enabled));
   return p;
 }
 
@@ -283,7 +272,7 @@ async function main() {
 
   // Facts first; the pure rule set in g5-traps.mjs decides. Separating them is what makes the isolation rules
   // unit-testable without touching GitHub.
-  const facts = { lessonsFileExists: LESSON_TEXT.trim().length > 0, existingBranches: [], issueStates: {} };
+  const facts = { lessonsFileExists: lessonsContent(true).trim().length > 0, existingBranches: [], issueStates: {} };
   const haveIssues = ARMS.every((a) => String(a.issue ?? "").trim() !== "");
   const baseCfg = defaultConfigPath(REPO);
   facts.baseConfigReadable = existsSync(baseCfg);
@@ -300,7 +289,7 @@ async function main() {
   if (problems.length) die("preflight:\n  - " + problems.join("\n  - "));
 
   const runDir = mkdtempSync(join(tmpdir(), `g5-${Date.now()}-`));
-  const results = { startedAt: new Date().toISOString(), repo: REPO, baseConfig: baseCfg, lessonText: LESSON_TEXT, arms: [] };
+  const results = { startedAt: new Date().toISOString(), repo: REPO, baseConfig: baseCfg, lessonText: lessonsContent(true).trim(), arms: [] };
   log(`preflight ok — arms ${ARMS.map((a) => `#${a.issue}`).join(" + ")}, run dir ${runDir}`);
   try {
     for (const arm of ARMS) {
