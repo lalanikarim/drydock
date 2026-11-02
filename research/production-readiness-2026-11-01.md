@@ -9,7 +9,7 @@
 > `/factory/intake`, which opens a conversation per `(kind, subject)` with only that kind's tools (§5.29 of
 > the plan). The live end-to-end proof is still owed: it needs inference, and **`aurora.infinidigm:8888` was
 > unreachable** while this was authored (`ping: sendto: No route to host`) — which also means no factory work
-> can run at all until that endpoint answers. Sections marked DONE keep their original findings — they are
+> can run at all until that endpoint answers. **P0-4 is closed by an executed drill, not an intention**: `gates/backup-drill.mjs` snapshots with `VACUUM INTO`, checks integrity on the copy, restores into a scratch tree, compares row and per-kind document counts, proves the restored store is writable, and (with `--boot`) starts a real instance from the restored data — 15 conversations recovered. Runbook §11. The remaining gap is stated there: backups live on the same disk as the stores. Deploying #132 while inference was down also revealed that a dead model host prevents instances from booting at all and, after 10 restart attempts, takes the supervisor and adapter down with it — evidence posted to #133; the fleet is offline until aurora returns or config fails over to spark. Sections marked DONE keep their original findings — they are
 > why the fix looks the way it does.
 
 **Purpose:** start a fresh session from one file. Everything below was verified by running commands on
