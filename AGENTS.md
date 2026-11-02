@@ -40,6 +40,20 @@ So, for code that touches anything this repo does not control — the GitHub API
 - Stage only the files you intentionally changed (explicit paths, never `git add -A`).
 - Push your branch and let the human open/merge the PR — agents do not merge.
 
+**Verify a merge before deleting anything (learned the hard way, 2026-11-02).** `gh pr merge --admin` returning a
+5xx does **not** mean the merge failed — GitHub may have accepted it and be processing asynchronously. Deleting the
+head branch of a PR that is not confirmed merged closes the PR **unmerged**, and recovering means re-pushing the
+branch, `gh pr reopen`, then clearing a stale "Merge already in progress" state before anything will land. So:
+
+- Confirm outcome by reading state, never by exit code: `gh pr view <n> --json state,mergedAt,mergeCommit`.
+- Delete a remote branch only after that says `state=MERGED`, and only when nothing above it points at that branch.
+- Never chain a branch delete onto a merge with `&&`/`;` in one shell line — the delete runs on the failure path,
+  which is precisely when it does the damage. Same rule as R6/R10: verify what actually happened, not that the
+  command returned cleanly.
+- If a merge wedges, land it with the verified async API instead of retrying blindly:
+  `gh api -X PUT repos/OWNER/REPO/pulls/<n>/merge-async --input <file>` (`--input` takes a **file**, not an inline
+  string; `bypass_rules:true`, and only for the bottom-most unmerged layer).
+
 ### Stacked PRs (several changes in flight at once)
 
 Use the official `gh stack` extension (`gh extension install github/gh-stack`). Do **not** hand-roll a stack by cutting several branches off `main` and writing "Blocked by #NN" in the PR body. That is not a stack, and it fails in three specific ways: each layer's diff contains the layers below it (or conflicts with them), nothing on GitHub knows the intended merge order, and every merge leaves the remaining branches stale until someone rebases them by hand.
