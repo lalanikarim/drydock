@@ -1077,6 +1077,19 @@ code that matters, and if consecutive gates start producing results that make no
 product failure. Do not "fix" this by disabling auto-merge in place; that trades an integrity risk for silently
 losing coverage.
 
+**5. G5 needs an equivalent trap *pair*, and a green fixture suite.** Invocation is
+`npx tsx gates/g5-feedback.mjs --repo lalanikarim/factory-fixture --issue-a <n> --issue-b <n>`; there are no defaults,
+and preflight refuses: the same issue twice, a trap that is not open, an existing `agent/issue-N` branch (stale state
+the worker would inherit — inspect it, then pass `--allow-stale-branches`), and an unreadable runtime config. The pair
+must be **the same defect in two different code paths** — one issue per arm, because one issue means one branch means
+arm B measures arm A's commit, which is exactly how #145 reported "attribution=strong" over a measurement of nothing.
+Seed traps from the running app the way item 1 says, and write them as **symptom plus required contract only**: an
+issue that says "fix this in the domain layer" measures instruction-following, not whether the lesson changed
+behavior. Run `node --test` in the fixture first — on a red baseline the worker's verification step means nothing and
+the reviewer may refuse for reasons unrelated to the trap (fixture #60/#61 were exactly that). Both arms consume their
+traps, and a merged arm moves fixture `main`, so a re-run needs a freshly authored pair; `gates/g5-traps.mjs` records
+which issues are currently wired up and why.
+
 **Order that worked (2026-11-02, `main` = `398385f` → `626de7a`):** G0 → G3 → G1 → G2 → M1 → M2 → M4 → G4, with G5
 last because it is the slowest and the most fixture-hungry. Results went 7 green on first pass (G0 20/20, G3 both arms, G1 draft PR
 in 190 s, G2 1/1 with zero human edits, M1 both repos simultaneously, M2 isolation, M4 budget abort), G5 and G4-T2

@@ -6,3 +6,6 @@ gates/data/
 .env
 fleet/data/
 fleet/fleet.local.json
+
+# Gate/experiment run artifacts written into the checkout (gates/g5-feedback.mjs)
+g5-results.json

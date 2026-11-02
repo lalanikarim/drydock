@@ -1,0 +1,29 @@
+commit 7bdb147943ef5bcaa3bfe7b0aebed70df087b0dc
+Author: factory-worker <factory-worker@localhost>
+Date:   Sun Oct 25 09:29:13 2026 +0000
+
+    Return 400 with JSON error for invalid POST /invoices bodies
+
+diff --git a/src/invoices.mjs b/src/invoices.mjs
+index 0ab475a..373189d 100644
+--- a/src/invoices.mjs
++++ b/src/invoices.mjs
+@@ -23,7 +23,17 @@ function sendJson(res, status, body) {
+ 
+ export async function createInvoice(store, req, res) {
+   const body = await readJsonBody(req);
+-  const invoice = store.add(body);
++  let invoice;
++  try {
++    invoice = store.add(body);
++  } catch (err) {
++    // Client input errors (missing/invalid customerId, amountCents, status)
++    // are rejected with a client-facing 400, not a server error.
++    if (err instanceof TypeError) {
++      throw Object.assign(new Error(err.message), { statusCode: 400 });
++    }
++    throw err;
++  }
+   sendJson(res, 201, invoice);
+ }
+ 
