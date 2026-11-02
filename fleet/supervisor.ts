@@ -469,7 +469,19 @@ async function statusFleet(fleetPath: string): Promise<void> {
     console.log(`\nfailed-delivery sweep: ${sweep.reason === "never" ? "NEVER RECORDED" : sweep.reason.toUpperCase()} — run fleet/redeliver-failed.mjs with --state-file ${sweepPath}`);
     return;
   }
-  const st = sweep.state as { at: string; mode?: string; inspected?: number; undelivered?: number; queued?: number; since?: string | null; acknowledged?: number };
+  const st = sweep.state as {
+    at: string;
+    mode?: string;
+    inspected?: number;
+    undelivered?: number;
+    queued?: number;
+    since?: string | null;
+    acknowledged?: number;
+    // Present when the sweep ran with --from-registry (#107). Without it a finding on one repo reads as a
+    // fleet-wide finding, and "which repo?" is the first question anyone asks.
+    targets?: Array<{ repo: string; hookId?: number; inspected?: number; undelivered?: number; acknowledged?: number }>;
+    untracked?: string[];
+  };
   const ageMin = Math.round((Date.now() - Date.parse(st.at)) / 60_000);
   const stale = ageMin > 60 ? " ⚠ older than 1h" : "";
   // The window matters as much as the count: "undelivered 35" across all retained history is housekeeping,
@@ -479,6 +491,16 @@ async function statusFleet(fleetPath: string): Promise<void> {
   // acknowledging 16 is a different claim than "0 undelivered" on a clean hook.
   const acked = st.acknowledged ? `, ${st.acknowledged} acknowledged` : "";
   console.log(`\nfailed-delivery sweep: ${ageMin} min ago (${st.mode ?? "?"}) — inspected ${st.inspected ?? "?"}, undelivered ${st.undelivered ?? "?"}, queued ${st.queued ?? 0}, ${window}${acked}${stale}`);
+  // Per-repo breakdown, and an explicit line for enabled repos the sweep cannot see at all: a control that
+  // covers two of three repos and reports "clean" is how engram stayed unswept without anyone noticing.
+  if (Array.isArray(st.targets)) {
+    for (const t of st.targets) {
+      console.log(`  ${t.repo}: inspected ${t.inspected ?? "?"}, undelivered ${t.undelivered ?? 0}${t.acknowledged ? `, ${t.acknowledged} acknowledged` : ""}`);
+    }
+  }
+  if (Array.isArray(st.untracked) && st.untracked.length) {
+    console.log(`  ⚠ not swept (no webhookId in the registry): ${st.untracked.join(", ")}`);
+  }
 }
 
 // CLI guard: importing this module (tests pull in checkRegistryPolicy) must not consume argv or

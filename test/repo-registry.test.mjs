@@ -315,3 +315,51 @@ test("the supervisor copies prFeedback onto the route it hands the adapter", asy
   assert.equal(drydock.prFeedback, true, "policy has to reach the adapter or it enforces nothing");
   assert.equal("prFeedback" in fixture, false, "a repo that never opted in gets no field, so routes stay byte-stable");
 });
+
+// ---- webhookId: which hook's deliveries the sweep must cover (#107) -------------------------------
+//
+// Onboarding a repo used to leave its failed-delivery sweep untouched, because the sweep kept its own copy of
+// "which repos exist" in an installed launchd plist. The id now lives here so that "enabled but unswept" is a
+// question the registry can answer.
+
+const { sweepTargets, missingWebhookIds } = await import("../factory/repo-registry.ts");
+
+const regWith = (repos) => validateRegistry({ defaults: { eligibilityLabel: "agent", autoMerge: true, enabled: true }, repos });
+
+test("webhookId is accepted as a number and stays absent when unrecorded", () => {
+  const r = regWith([
+    { repo: "a/one", webhookId: 703101252 },
+    { repo: "a/two" },
+  ]);
+  assert.equal(r.repos[0].webhookId, 703101252);
+  assert.ok(!("webhookId" in r.repos[1]), "no default invented — 'nobody recorded it' must stay representable");
+});
+
+test("a webhookId that is a string is rejected: it would sweep nothing forever and say it was clean", () => {
+  assert.throws(
+    () => regWith([{ repo: "a/one", webhookId: "703101252" }]),
+    /webhookId must be a positive integer GitHub hook id \(not a string\)/,
+  );
+  assert.throws(() => regWith([{ repo: "a/one", webhookId: 0 }]), /webhookId/);
+  assert.throws(() => regWith([{ repo: "a/one", webhookId: -3 }]), /webhookId/);
+  assert.throws(() => regWith([{ repo: "a/one", webhookId: 1.5 }]), /webhookId/);
+});
+
+test("sweepTargets covers enabled repos with an id; missingWebhookIds names the rest", () => {
+  const r = regWith([
+    { repo: "a/deployed", webhookId: 1 },
+    { repo: "a/unrecorded", enabled: true },
+    { repo: "a/retired", enabled: false, autoMerge: false, webhookId: 2 },
+  ]);
+  assert.deepEqual(sweepTargets(r), [{ repo: "a/deployed", webhookId: 1 }]);
+  assert.deepEqual(missingWebhookIds(r), ["a/unrecorded"], "enabled with no id is the blind spot worth alarming on");
+});
+
+test("the real registry records a hook id for every deployed repo", () => {
+  // A pin, deliberately: deleting these turns the scheduled sweep back into the version that quietly ignored
+  // a repo. Engram was in exactly that state from the day it was onboarded.
+  const targets = sweepTargets(loadRegistry(join(ROOT, "factory/repo-registry.json")));
+  const byRepo = Object.fromEntries(targets.map((t) => [t.repo, t.webhookId]));
+  assert.equal(byRepo["lalanikarim/drydock"], 703101252);
+  assert.equal(byRepo["lalanikarim/engram"], 706043067);
+});

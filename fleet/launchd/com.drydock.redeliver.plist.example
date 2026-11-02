@@ -1,83 +1,73 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Failed-delivery sweep as a launchd job (#110). TEMPLATE — copy it, fill in every
-  __PLACEHOLDER__, and install:
+  drydock failed-delivery sweep (#107, #133) — source of truth for the installed unit.
 
-    cp fleet/launchd/com.drydock.redeliver.plist.example \
-       ~/Library/LaunchAgents/com.drydock.redeliver.plist
-    # edit: repo, hook id, paths, interval
-    launchctl load ~/Library/LaunchAgents/com.drydock.redeliver.plist
-    launchctl start com.drydock.redeliver          # run once, now
-    tail -f /Users/__USER__/Library/Logs/drydock-redeliver.log
-    launchctl unload ~/Library/LaunchAgents/com.drydock.redeliver.plist   # stop
+  This file used to be referenced by fleet/enable-self-work.md and never committed, so the installed job was
+  the only copy of "what gets swept". That is how engram was onboarded, started receiving webhooks, and stayed
+  unswept: the target list lived here and nowhere the factory could see it. Targets are now DERIVED from
+  factory/repo-registry.json (`--from-registry`), so adding an enabled repo without a `webhookId` produces a
+  loud line in this job's log instead of silence.
 
-  Why launchd and not cron (the decision #110 was waiting on): a laptop sleeps. `cron` skips the jobs it
-  would have run during sleep and never catches up, which is precisely the window in which webhook
-  deliveries fail. launchd's StartInterval timer resumes when the machine wakes, and KeepAlive=false
-  means each interval is one short-lived process rather than a daemon to supervise.
+  Report-only: no --apply. Detection is automated; recovery stays a human call with `--only <id>`, because
+  acting on a schedule can resurrect work for an issue that closed hours ago.
 
-  Two properties chosen on purpose:
+  Exit code: 0 = every swept repo clean, 1 = undelivered events found in at least one, 2 = usage/credential
+  problem OR nothing was swept at all (a sweep that examined zero repos is not a passing sweep).
 
-  * **Report-only.** No --apply. A scheduled sweep that acts can resurrect work for an issue closed hours
-    ago; recovery stays a human decision made with `--only <id>`. The job's value is detection.
-  * **Exit code means something.** 0 = window clean, 1 = undelivered events needing attention, 2 = usage or
-    credential problem. launchd ignores it; the log and any mail wrapper do not. This was broken for a day
-    (main() returned a code nothing propagated), which is why the check asserts on process exit and not on a
-    return value.
+  --experimental-strip-types is required: the sweep imports factory/repo-registry.ts. Dropping the flag makes
+  the job die at import time with a syntax error, and launchd reports that as an ordinary non-zero exit.
 
-  The token comes from the environment launchd gives the job; on this machine `gh auth token` is the
-  resolution path (see resolveToken in fleet/redeliver-failed.mjs), so no secret is stored in the plist.
+  Token: resolved from GITHUB_TOKEN/GH_TOKEN, else `gh auth token` tried as `gh`, /opt/homebrew/bin/gh,
+  /usr/local/bin/gh — launchd does not inherit a login shell's PATH. No secret lives here.
+
+  Install / verify (see runbook §7):
+    cp fleet/launchd/com.drydock.redeliver.plist.example ~/Library/LaunchAgents/com.drydock.redeliver.plist
+    plutil -lint ~/Library/LaunchAgents/com.drydock.redeliver.plist
+    launchctl bootout gui/$(id -u)/com.drydock.redeliver 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drydock.redeliver.plist
+    launchctl kickstart -k gui/$(id -u)/com.drydock.redeliver
+    tail -30 ~/Library/Logs/drydock-redeliver.log        # must name EVERY deployed repo
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.drydock.redeliver</string>
 
-  <!-- Absolute paths everywhere: launchd gives you no login shell, so neither PATH nor version-manager
-       shims exist here. Use `readlink -f "$(command -v node)"` for the real binary. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/__USER__/Projects/drydock/fleet/redeliver-failed.mjs</string>
-    <string>--repo</string>
-    <string>lalanikarim/drydock</string>
-    <string>--hook</string>
-    <string>__HOOK_ID__</string>
-
-    <!-- Rolling window. Without it the job reports ancient retained history forever and exit 1 stops
-         meaning "something is failing now". Accepts 24h / 90m / 7d / 30s or an absolute timestamp. -->
+    <string>/Users/karim/.hermes/node/bin/node</string>
+    <string>--experimental-strip-types</string>
+    <string>/Users/karim/Projects/drydock/fleet/redeliver-failed.mjs</string>
+    <string>--from-registry</string>
     <string>--since</string>
     <string>24h</string>
-
-    <!-- Acknowledge list: ids a human reviewed and chose not to re-drive (one per line, # comments).
-         Excluded from the exit code but still counted as `acknowledged` in the state file. Optional; a
-         missing file means no acknowledgements, never silence. -->
     <string>--skip-file</string>
-    <string>/Users/__USER__/Projects/drydock/fleet/data/acknowledged-deliveries.txt</string>
-
+    <string>/Users/karim/Projects/drydock/fleet/data/acknowledged-deliveries.txt</string>
     <string>--state-file</string>
-    <string>/Users/__USER__/Projects/drydock/fleet/data/last-sweep.json</string>
+    <string>/Users/karim/Projects/drydock/fleet/data/last-sweep.json</string>
   </array>
 
-  <!-- 900s = 15 minutes. Each run is one authenticated API call per page of delivery history; the
-       window of silent loss grows with the interval, so this is a cost/detection trade, not a default
-       to leave at an hour. -->
+  <!-- Each run is one authenticated API call per page of delivery history, per repo. The window of silent
+       loss grows with the interval, so this is a cost/detection trade rather than a default. -->
   <key>StartInterval</key>
   <integer>900</integer>
 
-  <!-- Fire immediately on load so the first state file appears without waiting 15 minutes. -->
   <key>RunAtLoad</key>
   <true/>
 
   <key>WorkingDirectory</key>
-  <string>/Users/__USER__/Projects/drydock</string>
+  <string>/Users/karim/Projects/drydock</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/__USER__/Library/Logs/drydock-redeliver.log</string>
+  <string>/Users/karim/Library/Logs/drydock-redeliver.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/__USER__/Library/Logs/drydock-redeliver.log</string>
+  <string>/Users/karim/Library/Logs/drydock-redeliver.log</string>
 
   <key>KeepAlive</key>
   <false/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
 </dict>
 </plist>
