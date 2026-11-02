@@ -191,8 +191,11 @@ are not).
   **#78 stays open with a narrower residual: `lalanikarim/collective` and `lalanikarim/modelarena` are still
   reachable-but-unmanaged.** Also unresolved by onboarding: #41 was "hold until engram is a managed repo", so it
   is now internal work rather than an upstream PR.
-- **Fixture protection posture (queue 8b):** both fixtures have **no branch protection at all** and
-  `autoMerge: true`. Decide: protect them, or mark them permanently disposable.
+- **Fixture protection posture (queue 8b) — DECIDED 2026-11-02: accepted, recorded as R14.** Both fixtures
+  have **no branch protection at all** and `autoMerge: true`. The operator chose to live with it: the unattended
+  battery needs auto-merge (turning it off removes `merge_pr` from the toolset, so G1/G4 and #67 stop at a draft),
+  and rulesets are unavailable on this plan (`403 Upgrade to GitHub Pro`). What makes the acceptance defensible
+  is scope — fixtures hold disposable targets, no product code, and feed no deployment.
 - **Listener exposure (P2, queue item 7):** funnel currently stays published between bursts by operator
   instruction. If that becomes per-burst, document the open/close procedure and the delivery loss it causes.
 - **#64 end-to-end ping:** transport verified live (`{"ok":true,"status":200,"attempts":1}`) but no production
@@ -223,6 +226,10 @@ boot; hermetic CI (no model endpoint, no containers, no fixture mutation).
 **Standing risk that stays accepted:** R13/#95 — untrusted text is fenced (`<untrusted>`), not sandboxed. A
 hostile issue can waste a run or fail one cleanly; it cannot widen what a run may touch. AGENTS.md is
 self-writable by operator decision; enforcement reads the registry at process start, never workspace files.
+
+**Also standing, accepted 2026-11-02:** R14 — the fixture repos are unprotected on `main` and auto-merge.
+The blast radius is bounded by what lives there (throwaway targets), not by any control we enforce. Do not point a
+fixture at code that matters without re-opening this row.
 
 ---
 

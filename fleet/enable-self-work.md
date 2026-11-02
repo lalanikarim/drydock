@@ -820,6 +820,17 @@ issues; M4 additionally takes `M4_BUDGET_SECS` (default 120) and asserts its A-s
 first`. Point it at whatever drafts the chain produced today via `G4_T1_ISSUE` / `G4_T2_ISSUE`; the defaults (4 and 2)
 were consumed in October.
 
+**4. Fixture `main` is unprotected — accepted, not forgotten (R14).** Both fixtures merge with no required checks
+and no reviews (`protection.enabled:false`, `enforcement_level:"off"`; the protection and rulesets APIs answer
+`403 Upgrade to GitHub Pro` on this plan), and they inherit `autoMerge:true` from the registry defaults. The operator
+accepted this on 2026-11-02 because auto-merge is what makes G1/G4 and #67 run unattended — setting
+`autoMerge:false` removes `merge_pr` from the instance's toolset and stops them at a draft PR. Operationally that
+means **a battery run can land a bad commit with nothing between it and `main`**, so: never point a fixture entry at
+code that matters, and if consecutive gates start producing results that make no sense, check
+`gh api repos/<fixture>/commits?per_page=5` before suspecting the code under test — a poisoned fixture reads as a
+product failure. Do not "fix" this by disabling auto-merge in place; that trades an integrity risk for silently
+losing coverage.
+
 **Order that worked (2026-11-02, `main` = `398385f` → `626de7a`):** G0 → G3 → G1 → G2 → M1 → M2 → M4 → G4, with G5
 last because it is the slowest and the most fixture-hungry. Results went 7 green on first pass (G0 20/20, G3 both arms, G1 draft PR
 in 190 s, G2 1/1 with zero human edits, M1 both repos simultaneously, M2 isolation, M4 budget abort), G5 and G4-T2
