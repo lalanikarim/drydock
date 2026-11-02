@@ -498,6 +498,22 @@ Any `factory/main.ts` whose `PPID` is `1` — or anything other than the lock ow
 it (children honour `SIGTERM`; it is supervisors that don't, #110) and confirm exactly one remains. The count
 alone is not evidence; the `PPID` column is what distinguishes a live child from an orphan.
 
+**Check for orphans AFTER a restart is complete, not only after a crash (#125).** A restart that *looked*
+clean left two instance processes running behind a new supervisor on 2026-11-01, and the symptom appeared
+hours later as tasks with no result — which is why this check belongs at the end of every deploy rather than
+in an incident runbook. Since #130 the children self-terminate within ~2 s of losing their supervisor, so a
+survivor now means the watchdog did not work (or someone started an instance by hand) rather than "the build
+was from before we fixed that":
+
+```bash
+pgrep -fl "factory/main.ts"                       # survivors of the previous generation
+ps -eo pid,ppid,lstart,command | grep factory/main.ts | grep -v grep
+# PPID must equal the CURRENT supervisor's pid (fleet/data/routes.json.lock); an old START time is a survivor
+lsof -- factory-instances/lalanikarim_drydock/engram-data/agent.sqlite   # who shares the durable store
+ls -la factory-instances/*/engram-data/*.sqlite*  # stray -wal/-shm next to a running store means two openers
+cat factory-instances/*/orphan-events.log         # the watchdog's own record, if it ever fired
+```
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
@@ -599,6 +615,15 @@ cat factory-instances/lalanikarim_drydock/orphan-events.log
 ```
 
 A non-empty `orphan-events.log` means the safety net fired at least once: something was serving work with no supervisor, then stopped. Check whether another instance is on that store (`pgrep -fl factory/main.ts`) before restarting, and treat a growing file as a sign the supervisor keeps dying.
+
+**Restart budget: N restarts per repo, then the supervisor gives up — and what that costs.** On 2026-11-02 this fired for real during a deploy: both instances failed to boot because the inference host was unreachable, the budget exhausted in ~50 s, `giveUp()` asked everything to shut down, the adapter died with it, and every public webhook delivery hit a closed port — which GitHub records as a failed delivery and does **not** retry. The comment above `giveUp()` says "the operator must restart manually", and that is accurate; what it does not say is that deliveries are lost between the give-up and the human noticing. Check `inference` on `/health` before concluding an outage was caused by the code you just deployed.
+
+**Known gaps.**
+- **Inference reachability is probed and reported (#133).** The adapter probes the endpoint(s) every enabled repo pins and puts the result on `GET /health` as `inference: {state, reachable, total, checkedAt}` — state only, no provider id or hostname, because that response is reachable through the funnel. Per-provider detail (which host, what failed: `no-route` / `refused` / `dns` / `http-401` / `timeout`) is on `GET /health/inference`, **loopback-only**, 404 elsewhere. Tune with `INFERENCE_PROBE_INTERVAL_MS` (default 60000) and `INFERENCE_PROBE_TIMEOUT_MS` (default 5000). State *changes* are announced through the Telegram notifier, so an outage is heard when it happens rather than inferred from a stalled task. What this still cannot see: a host that answers `/models` but has not loaded the pinned model — and `status:"ok"` continues to mean "the listener lives", not "work will complete".
+- The supervisor exits after its restart budget, taking the adapter with it; there is no decay window, so an outage longer than ~10 × boot time stops trying permanently (#133).
+- A second supervisor is still refused only by the lock file; nothing detects a manually-started instance that never takes the lock.
+- `orphan-events.log` has no rotation (it grows one short line per event, so it is slow — but it is never inspected automatically).
+- The watchdog notices within its poll interval (~1 s), which is far shorter than any GitHub retry window but not zero.
 
 **Verify, don't assume:**
 
