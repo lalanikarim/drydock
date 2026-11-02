@@ -20,6 +20,8 @@
 // losing a status note must never turn a successful push into a failed run, and never the other way
 // around (the push happens first, so the report can only describe reality, not cause it).
 
+import { issueLink } from "./provenance.ts";
+
 import type { VerificationEvidence } from "./verification.ts";
 
 export interface PrReportFacts {
@@ -77,7 +79,7 @@ export function buildPrReport(facts: PrReportFacts): string {
     );
   }
   if (facts.reviewVerdict) lines.push(`| review | ${facts.reviewVerdict} |`);
-  if (facts.runStopped) lines.push(`| retry budget | **run stopped** — further attempts on this issue are refused without doing work ([#100](https://github.com/lalanikarim/drydock/issues/100)) |`);
+  if (facts.runStopped) lines.push(`| retry budget | **run stopped** — further attempts on this issue are refused without doing work ${issueLink(100)} |`);
 
   if (facts.outcome === "refused" && facts.refusalReason) {
     lines.push("", "**Why**", "", short(facts.refusalReason));
@@ -87,7 +89,7 @@ export function buildPrReport(facts: PrReportFacts): string {
     "",
     facts.outcome === "refused"
       ? "_Nothing on the branch or the PR changed. Comment `/factory <directive>` again with a different instruction, or widen this repo's policy in `factory/repo-registry.json` if the request genuinely needs it._"
-      : "_Replied automatically by the factory after a `/factory` comment ([#96](https://github.com/lalanikarim/drydock/issues/96))._",
+      : `_Replied automatically by the factory after a \`/factory\` comment ${issueLink(96)}._`,
   );
   return lines.join("\n");
 }

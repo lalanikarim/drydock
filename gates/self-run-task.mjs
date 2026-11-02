@@ -28,12 +28,23 @@ const flag = (name, dflt) => {
   return i >= 0 ? argv[i + 1] : dflt;
 };
 
-const repo = flag("repo", "lalanikarim/drydock");
+// No default repository, on purpose. This script runs ONE REAL TASK through the production pipeline —
+// worktree, branch, worker, PR against whatever it is pointed at — and it used to fall back to
+// `lalanikarim/drydock`, i.e. the live managed repo. A tool whose forgotten flag means "do the thing to
+// production" has its default pointing the wrong way. Name the target explicitly or set SELF_RUN_REPO.
+const repo = (flag("repo", "") || (process.env.SELF_RUN_REPO ?? "")).trim();
+if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+  console.error(
+    "error: --repo <owner/name> is required (or set SELF_RUN_REPO); there is no default because this " +
+      "script runs a real task against the target repo, and the historical default was the live managed repo.",
+  );
+  process.exit(2);
+}
 const issueNumber = Number(flag("issue", "0"));
 const timeoutMin = Number(flag("timeout-min", "45"));
 const allowExisting = argv.includes("--allow-existing");
 if (!issueNumber) {
-  console.error("usage: gates/self-run-task.mjs --issue <n> [--repo owner/name] [--timeout-min 45] [--allow-existing]");
+  console.error("usage: gates/self-run-task.mjs --repo <owner/name> --issue <n> [--timeout-min 45] [--allow-existing]");
   process.exit(2);
 }
 
