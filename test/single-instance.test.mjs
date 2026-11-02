@@ -93,9 +93,11 @@ test("defaultLockPath keeps one lock per routes file, so a second fleet is allow
 test("the supervisor takes the lock before writing routes and refuses to proceed without it (source pin)", () => {
   const src = fsRead(new URL("../fleet/supervisor.ts", import.meta.url), "utf8");
   const acquireAt = src.indexOf("acquireInstanceLock(lockPath");
-  const writeAt = src.indexOf("writeRoutes();");
+  // Matched by shape, not by the literal `writeRoutes();`: #143 annotated every call site with WHY it is
+  // writing, and the boot write in particular has to stay strict (nothing to fall back on yet).
+  const writeAt = src.search(/writeRoutes\("boot", \{ strict: true \}\)/);
   assert.ok(acquireAt > 0, "runFleet must take the instance lock");
-  assert.ok(writeAt > 0);
+  assert.ok(writeAt > 0, "the boot routes write must exist and stay strict (#143)");
   assert.ok(acquireAt < writeAt, "the lock must be taken BEFORE the shared routes file is written");
   assert.match(src, /if \(!lock\.acquired\)[\s\S]{0,200}process\.exit\(1\)/, "a refused lock must stop the process");
   assert.match(src, /lock\.release\(\)/, "shutdown must release the lock a restart would need");

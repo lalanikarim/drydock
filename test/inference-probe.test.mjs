@@ -202,14 +202,17 @@ test("/health reports inference state without naming providers, hosts or repos",
     inferenceStatus: () => ({ state: "unreachable", reachable: 0, total: 2, checkedAt: 123 }),
     inferenceDetails: () => [{ id: "aurora", baseUrl: undefined, host: "aurora.infinidigm", reachable: false, reason: "no-route", checkedAt: 123, latencyMs: 5 }],
   });
-  const res = await fetch(`http://127.0.0.1:${srv.port}/health`);
-  const body = await res.json();
-  assert.equal(res.status, 200);
-  assert.deepEqual(body.inference, { state: "unreachable", reachable: 0, total: 2, checkedAt: 123 });
-  const text = JSON.stringify(body);
-  assert.ok(!text.includes("aurora"), "public health must not name a provider");
-  assert.ok(!text.includes("infinidigm"), "public health must not name an internal host");
-  srv.server.close();
+  try {
+    const res = await fetch(`http://127.0.0.1:${srv.port}/health`);
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.deepEqual(body.inference, { state: "unreachable", reachable: 0, total: 2, checkedAt: 123 });
+    const text = JSON.stringify(body);
+    assert.ok(!text.includes("aurora"), "public health must not name a provider");
+    assert.ok(!text.includes("infinidigm"), "public health must not name an internal host");
+  } finally {
+    srv.server.close();
+  }
 });
 
 test("/health/inference requires a bearer token — a peer address is not authorization (#136 review)", async () => {
@@ -224,6 +227,7 @@ test("/health/inference requires a bearer token — a peer address is not author
     adminToken: "operator-token",
   });
   const url = `http://127.0.0.1:${srv.port}/health/inference`;
+  try {
 
   // The real-world hostile case: a Tailscale Funnel request arrives from loopback with forwarded headers
   // attached. It used to be served (HTTP 200, internal hostname + model inventory) on the strength of the
@@ -241,19 +245,29 @@ test("/health/inference requires a bearer token — a peer address is not author
   assert.equal(ok.status, 200);
   const body = await ok.json();
   assert.equal(body.providers[0].host, "aurora.infinidigm", "the authorized operator view still names hosts");
-  srv.server.close();
+  } finally {
+    srv.server.close();
+  }
 });
 
 test("with no admin token configured the detail route does not exist at all", async () => {
   const { startIntakeServer } = await import("../factory/intake.ts");
   const without = await startIntakeServer({ port: 0, webhookSecret: "s3cret", dispatch: async () => ({}) });
-  const missing = await fetch(`http://127.0.0.1:${without.port}/health/inference`);
-  assert.equal(missing.status, 404, "unconfigured → closed, not open-by-default");
-  const evenWithToken = await fetch(`http://127.0.0.1:${without.port}/health/inference`, { headers: { authorization: "Bearer anything" } });
-  assert.equal(evenWithToken.status, 404, "no configured token means nothing can authorize");
-  const plain = await (await fetch(`http://127.0.0.1:${without.port}/health`)).json();
-  assert.deepEqual(plain, { status: "ok" }, "with no probe configured, health claims nothing about inference");
-  without.server.close();
+  try {
+    const missing = await fetch(`http://127.0.0.1:${without.port}/health/inference`);
+    assert.equal(missing.status, 404, "unconfigured → closed, not open-by-default");
+    const evenWithToken = await fetch(`http://127.0.0.1:${without.port}/health/inference`, { headers: { authorization: "Bearer anything" } });
+    assert.equal(evenWithToken.status, 404, "no configured token means nothing can authorize");
+
+    // Health is EXTENSIBLE on purpose (#143 added `startedAt`), so assert the invariant — nothing about
+    // inference when no probe is configured — instead of pinning the whole object shape. A deepEqual here
+    // was also how one extra field turned into a hung suite: it threw before the socket closed.
+    const plain = await (await fetch(`http://127.0.0.1:${without.port}/health`)).json();
+    assert.equal(plain.status, "ok");
+    assert.ok(!("inference" in plain), "with no probe configured, health claims nothing about inference");
+  } finally {
+    without.server.close();
+  }
 });
 
 test("the alert for an outage is a sentence an operator can act on, and carries no secrets", () => {
@@ -261,4 +275,27 @@ test("the alert for an outage is a sentence an operator can act on, and carries 
   assert.match(msg, /inference unreachable \(0\/2 endpoint\(s\)\)/);
   assert.match(msg, /no-route/);
   assert.ok(!/Bearer|sk-/.test(msg));
+});
+
+test("/health says when it booted, and which build only when the supervisor stamped one (#143)", async () => {
+  const { startIntakeServer } = await import("../factory/intake.ts");
+  const srv = await startIntakeServer({ port: 0, webhookSecret: "s3cret", dispatch: async () => ({}) });
+  const before = Date.now();
+  try {
+    const plain = await (await fetch(`http://127.0.0.1:${srv.port}/health`)).json();
+    assert.ok(plain.startedAt, "startedAt is always present — the staleness check needs it");
+    assert.ok(!Number.isNaN(Date.parse(plain.startedAt)), `startedAt must parse as a date, got ${plain.startedAt}`);
+    assert.ok(Date.parse(plain.startedAt) <= before + 5_000, "startedAt is in the past");
+    assert.ok(!("build" in plain), "no DRYDOCK_BUILD_SHA in the environment → no build claim");
+
+    process.env.DRYDOCK_BUILD_SHA = "deadbee";
+    const stamped = await (await fetch(`http://127.0.0.1:${srv.port}/health`)).json();
+    assert.deepEqual(stamped.build, { sha: "deadbee" }, "the supervisor's commit is reported so `curl` can be compared with `git log -1`");
+
+    const text = JSON.stringify(stamped);
+    assert.ok(!/aurora|infinidigm|repo/i.test(text), "even the staleness fields disclose nothing about what is configured");
+  } finally {
+    delete process.env.DRYDOCK_BUILD_SHA;
+    srv.server.close();
+  }
 });

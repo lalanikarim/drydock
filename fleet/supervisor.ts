@@ -28,13 +28,14 @@
 //   node --experimental-strip-types fleet/supervisor.ts status <fleet.json>
 
 import type { ChildProcess } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { loadRootEnv, resolveWebhookSecret, webhookSecretVar } from "../factory/env-file.ts";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
-import { loadRegistry, missingRuntimeConfigs, requireEnabledRepo } from "../factory/repo-registry.ts";
+import { loadRegistry, loadRegistryTolerant, missingRuntimeConfigs, requireEnabledRepo, DEFAULT_REGISTRY_PATH } from "../factory/repo-registry.ts";
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 import { readSweepState } from "./redeliver-failed.mjs";
 import { defaultConfigPathFor } from "../factory/factory-config.ts";
@@ -195,6 +196,26 @@ function rel(fleetPath: string, p: string): string {
 async function runFleet(fleetPath: string): Promise<void> {
   const fleet = loadFleet(fleetPath);
 
+  // #143: the fleet died once because nobody could tell that a supervisor two days older than the tree it
+  // reads was about to reject a field that new code had just added. Log what is running, in a form an
+  // operator (or a gate) can compare against `git log -1` and `sha256sum factory/repo-registry.json`. The
+  // sha also goes to children via DRYDOCK_BUILD_SHA so /health reports it and staleness is visible remotely.
+  const buildSha = (() => {
+    try {
+      return execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || "unknown";
+    } catch {
+      return "unknown"; // a checkout without git (tarball, vendored copy) must not fail the boot
+    }
+  })();
+  if (!process.env.DRYDOCK_BUILD_SHA) process.env.DRYDOCK_BUILD_SHA = buildSha;
+  let registryDigest = "unreadable";
+  try {
+    registryDigest = createHash("sha256").update(readFileSync(DEFAULT_REGISTRY_PATH)).digest("hex").slice(0, 12);
+  } catch {
+    /* boot's strict read reports the real reason */
+  }
+  console.log(`[supervisor] build ${buildSha} · registry sha256:${registryDigest} · started ${new Date().toISOString()}`);
+
   // Pre-flight (#127-era config-out-of-tree): every repo in this fleet needs runtime config in
   // $DRYDOCK_CONFIG_DIR. Checked before the lock and before any route is written, so a fresh machine gets one
   // message naming every path it must create — instead of children that boot, fail, and respawn on a
@@ -266,18 +287,63 @@ async function runFleet(fleetPath: string): Promise<void> {
   // The routes file lists ALL factories from boot (secret known up front) so
   // the adapter validates cleanly before any instance is ready; `target` is
   // filled in when an instance reports its ephemeral port and removed on exit.
-  const writeRoutes = () => {
+  //
+  // #143 — this closure runs from a child's "exit" handler and from restart timers, and it used to call
+  // `loadRegistry()` with no error handling. When #140 added `webhookId`, a supervisor running the previous
+  // build re-read the registry after a child died, hit `registry.repos[2]: unknown field: webhookId`, threw
+  // inside that handler, and took every factory in the fleet down with it. Three separate mistakes in one
+  // line: parsing policy strictly on a reload (a field it had not met was treated as invalid), letting that
+  // throw escape a recovery path, and having no answer for "so what do we serve now?". Now:
+  //
+  //   * reloads are tolerant of unknown fields (warnings logged, never fatal);
+  //   * ANY failure keeps the last-good routes file in place instead of leaving policy half-written;
+  //   * failures announce on edges — first one and every 10th, plus a recovery line — because an alert that
+  //     repeats every minute is not an alert, and silence here means stale routing forever;
+  //   * boot is still strict: without a routes file there is nothing to keep serving, so it must not proceed.
+  let routesDegraded = false;
+  let lastGoodRoutes: { hash: string; at: string } | null = null;
+  const writeRoutes = (why: string, opts: { strict?: boolean } = {}) => {
     if (!fleet.adapter) return;
     const routesFile = rel(fleetPath, fleet.adapter.routesFile);
-    const routes = buildRoutes(fleet.factories, bases, loadRegistry());
+    let registry: ReturnType<typeof loadRegistryTolerant>;
+    try {
+      registry = loadRegistryTolerant(DEFAULT_REGISTRY_PATH, (m) => {
+        console.warn(`[supervisor] registry ignored a field (reload from ${why}): ${m}`);
+      });
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (opts.strict) {
+        console.error(`[supervisor] FATAL: cannot read policy at boot (${msg}) — no routes file exists yet, refusing to start`);
+        process.exit(1);
+      }
+      if (!routesDegraded) {
+        console.error(`[supervisor] routes reload failed (${why}): ${msg}`);
+        console.error(
+          lastGoodRoutes
+            ? `[supervisor] SERVING STALE POLICY — keeping routes written at ${lastGoodRoutes.at} (hash ${lastGoodRoutes.hash.slice(0, 16)}); fix the registry and restart children to adopt changes`
+            : "[supervisor] no previous routes file to fall back on — existing adapter keeps whatever it last validated",
+        );
+        routesDegraded = true;
+      } else {
+        console.error(`[supervisor] routes still failing (${why}) — still serving ${lastGoodRoutes ? `hash ${lastGoodRoutes.hash.slice(0, 16)}` : "the adapter's last validated file"}`);
+      }
+      return;
+    }
+    const routes = buildRoutes(fleet.factories, bases, registry);
     const hash = writeRoutesFile(routesFile, routes);
-    console.log(`[supervisor] wrote ${routes.length} route(s) to ${routesFile} (hash ${hash.slice(0, 16)})`);
+    if (routesDegraded) {
+      console.log(`[supervisor] routes recovered after a failure — ${routes.length} route(s), hash ${hash.slice(0, 16)}`);
+      routesDegraded = false;
+    } else {
+      console.log(`[supervisor] wrote ${routes.length} route(s) to ${routesFile} (hash ${hash.slice(0, 16)})`);
+    }
+    lastGoodRoutes = { hash, at: new Date().toISOString() };
   };
 
   // #69: the routes file is written BEFORE anything is spawned. The old seed-if-missing logic let a
   // leftover file from a previous run survive — the adapter then started against stale policy and
   // never re-read it. Overwriting unconditionally means every start begins from the current fleet.
-  writeRoutes();
+  writeRoutes("boot", { strict: true });
 
   /**
    * Stop supervising and leave (#127). Non-zero exit on purpose: the old code set a flag and stayed alive,
@@ -346,7 +412,7 @@ async function runFleet(fleetPath: string): Promise<void> {
       if (m) {
         readySent = true;
         bases.set(f.repo, `http://127.0.0.1:${m[1]}`);
-        writeRoutes();
+        writeRoutes(`ready:${f.repo}`);
       }
     });
     child.on("exit", (code, signal) => {
@@ -371,8 +437,9 @@ async function runFleet(fleetPath: string): Promise<void> {
     const a = fleet.adapter!;
     // Rewrite immediately before spawning: the adapter hashes this file at start and on every
     // request (#69). A fresh write here means a restarted adapter always adopts current policy,
-    // even if something external touched the file while it was down.
-    writeRoutes();
+    // even if something external touched the file while it was down. Not strict: an adapter restart is
+    // exactly the wrong moment to discover policy and die over a field shape (#143).
+    writeRoutes("adapter-spawn");
     const routesFile = rel(fleetPath, a.routesFile);
     const args = ["--experimental-strip-types", join(REPO_ROOT, "factory", "adapter.ts"), String(a.port), routesFile, a.logPath ? rel(fleetPath, a.logPath) : join(dirname(routesFile), "intake-adapter.jsonl")];
     console.log(`[supervisor] starting ${key} (port ${a.port}) — attempt ${restarts.get(key)}`);

@@ -197,17 +197,41 @@ function validateOracleBoot(raw: unknown, repo: string): OracleBoot | null {
   return boot;
 }
 
+export interface RegistryParseOptions {
+  /**
+   * Ignore fields this build does not know instead of failing (#143).
+   *
+   * Strict is right at BOOT — starting a fleet on policy nobody has read is how a typo silently turns off
+   * auto-merge. It is WRONG on reload: the supervisor parses here from a child-exit path, so one throw
+   * taken by an additive field in a new build (the `webhookId` case, #140) kills every factory in the fleet
+   * over a key that was perfectly safe to ignore. "Unknown to me" is not the same as "invalid".
+   */
+  tolerateUnknownFields?: boolean;
+  /** Where tolerance warnings go. Callers must log them; silently dropping a field is its own bug. */
+  onWarning?: (message: string) => void;
+}
+
 /** Validate and normalize a registry object. Pure — no filesystem access (loadRegistry does that). */
-export function validateRegistry(raw: unknown): Registry {
+export function validateRegistry(raw: unknown, opts: RegistryParseOptions = {}): Registry {
+  const tolerate = opts.tolerateUnknownFields === true;
+  const warn = (message: string) => opts.onWarning?.(message);
+  /** An unknown field: fatal at boot, a logged warning on reload. */
+  const unknownField = (message: string): void => {
+    if (tolerate) warn(message);
+    else throw new Error(message);
+  };
+
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("repo registry must be a JSON object");
   const obj = raw as Record<string, unknown>;
   for (const key of Object.keys(obj)) {
-    if (!["$comment", "defaults", "repos"].includes(key)) throw new Error(`unknown registry field: ${key}`);
+    if (!["$comment", "defaults", "repos"].includes(key)) unknownField(`unknown registry field: ${key}`);
   }
 
   const d = (obj.defaults ?? {}) as Record<string, unknown>;
   for (const key of Object.keys(d)) {
-    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification", "prFeedback", "refine", "refineLabel"].includes(key)) throw new Error(`unknown registry defaults field: ${key}`);
+    if (!["eligibilityLabel", "autoMerge", "enabled", "requireVerification", "prFeedback", "refine", "refineLabel"].includes(key)) {
+      unknownField(`unknown registry defaults field: ${key}`);
+    }
   }
   const defaults = {
     eligibilityLabel: typeof d.eligibilityLabel === "string" && d.eligibilityLabel.trim() ? d.eligibilityLabel.trim() : REGISTRY_DEFAULTS.eligibilityLabel,
@@ -235,7 +259,10 @@ export function validateRegistry(raw: unknown): Registry {
         );
       }
       if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "webhookId", "note"].includes(key)) {
-        throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
+        // `configFile` stays fatal in BOTH modes (below): it was replaced by a convention, so ignoring it
+        // would mean running with credentials nobody pointed at. A rename that changes behavior is not
+        // something tolerance gets to swallow.
+        unknownField(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
     if (typeof r.repo !== "string" || !REPO_RE.test(r.repo)) throw new Error(`registry.repos[${i}].repo must be "owner/name", got: ${JSON.stringify(r.repo)}`);
@@ -316,6 +343,27 @@ export function loadRegistry(path: string = DEFAULT_REGISTRY_PATH): Registry {
     throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}`);
   }
   return validateRegistry(raw);
+}
+
+/**
+ * Reload-time loader for long-lived processes (#143): unknown fields become warnings instead of a crash.
+ *
+ * `loadRegistry` stays the boot-time default on purpose — strictness where a human is about to act, tolerance
+ * where a daemon would otherwise trade one unexpected key for the whole fleet. Absent or unparseable policy is
+ * STILL an error here: tolerance covers fields this build has not met, never missing or corrupt files, because
+ * continuing on "{}" would quietly deregister every repository.
+ */
+export function loadRegistryTolerant(
+  path: string = DEFAULT_REGISTRY_PATH,
+  onWarning?: (message: string) => void,
+): Registry {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}`);
+  }
+  return validateRegistry(raw, { tolerateUnknownFields: true, onWarning });
 }
 
 /**
