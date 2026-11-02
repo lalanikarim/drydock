@@ -1,5 +1,9 @@
 // Behavior oracles for G2, keyed by LABEL rather than issue number.
 //
+// Library, not a CLI — deliberately no invocation example: running this file does nothing. Exercised by
+// gates/g2-worker-quality.mjs (which reads the probes off the fixture repo's labels) and asserted in
+// test/repo-registry.test.mjs via `loadProbes`.
+//
 // Why: the previous design hardcoded `issueNumber === 16` blocks inside the gate, which coupled
 // the harness to specific fixture issues and — worse — only discovered a missing oracle AFTER an
 // expensive worker run (`RUN FAIL — no behavior check defined for issue #34`). With labels, the
