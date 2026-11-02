@@ -9,6 +9,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { createSign } from "node:crypto";
+import { registryRepoNames } from "./registry-targets.mjs";
 
 const API = "https://api.github.com";
 
@@ -133,14 +134,23 @@ const truncated = page > 30;
 
 // Read probes against the repos the factory cares about — read-only, no side effects.
 /**
- * Probe every repository policy says is managed — read from `factory/repo-registry.json`, not frozen here.
+ * Probe every repository policy says is managed — read from `factory/repo-registry.json`, never frozen
+ * here, and with NO hardcoded floor.
  *
- * A hardcoded trio meant that onboarding a repo required editing this probe, and forgetting left it
- * reporting the old world: "Managed repos" would list three while the registry named four, next to a
- * policy comparison that DID read the registry. Two different answers in one report is how a probe stops
- * being evidence. The trio stays as a floor so a registry read failure still probes what matters.
+ * There used to be one ("so a registry read failure still probes what matters"), which was the same bug
+ * it claimed to prevent: when `engram` was onboarded the registry half noticed and the frozen half did
+ * not, so a single report carried two answers about what this fleet manages. A probe that cannot read
+ * policy has exactly one honest output — exit 2 — because a stale subset looks identical to a passing
+ * check in the transcript where someone decides the fleet is healthy.
  */
-const targets = [...new Set(["lalanikarim/drydock", "lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", ...managedRepoNames()])];
+let targets;
+try {
+  targets = registryRepoNames();
+} catch (e) {
+  console.error(`FATAL: ${e.message}`);
+  process.exit(2);
+}
+const managedSet = new Set(targets);
 const reads = {};
 for (const full of targets) {
   const issues = await gh(`/repos/${full}/issues?per_page=1`, { token: installToken, accept: "application.github+json" });
@@ -155,24 +165,10 @@ const missing = Object.entries(want).filter(([k, level]) => {
   return level === "write" ? have !== "write" : !have;
 });
 
-/**
- * Repositories the factory's own policy (factory/repo-registry.json) says it works in. Read straight
- * from the JSON rather than importing repo-registry.ts so this probe runs under plain `node`.
- *
- * Why the comparison matters: the registry gates ROUTES — an issue in an unmanaged repo is never
- * dispatched — but it does nothing about CREDENTIAL REACH. If the installation can write a repo the
- * policy does not mention, that gap is invisible from either side alone, and one of those repos is
- * the vendored kernel whose commit this project pins.
- */
-function managedRepoNames() {
-  try {
-    const registry = JSON.parse(readFileSync(new URL("../factory/repo-registry.json", import.meta.url), "utf8"));
-    return new Set((registry.repos ?? []).map((r) => r.repo));
-  } catch (e) {
-    console.error(`(could not read factory/repo-registry.json: ${e.message})`);
-    return new Set();
-  }
-}
+// The comparison above needs the same set the probe used; `managedSet` is that set, derived once from
+// policy. Keeping a second reader here would re-create the drift this file exists to catch: the registry
+// gates ROUTES, but it does nothing about CREDENTIAL REACH, and only the diff between the two reveals a
+// repo the installation can write that policy never mentions (one of which is the pinned vendored kernel).
 
 /** What the installation may do in each repo the factory actually manages. */
 const targetRepos = {};
@@ -210,7 +206,7 @@ const report = {
   accessible_private_count: repos.filter((r) => r.private).length,
   managed_repositories: targetRepos,
   reachable_but_unmanaged: (() => {
-    const managed = managedRepoNames();
+    const managed = managedSet;
     return repos.filter((r) => !managed.has(r.full_name)).map((r) => r.full_name);
   })(),
   accessible_repositories_sample: repos.slice(0, 10).map((r) => r.full_name),
