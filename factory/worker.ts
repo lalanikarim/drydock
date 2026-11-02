@@ -30,6 +30,13 @@ import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
 import { runSetupInContainer, type SetupPolicy } from "./setup-sandbox.ts";
 import { readLessons } from "./lessons.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
+import {
+  BudgetLedgerDoc,
+  budgetEntry,
+  budgetShortCircuitPayload,
+  isBudgetStopped,
+  noteBudgetAbort,
+} from "./budget-ledger.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
 import type { PathScope } from "./path-scope.ts";
@@ -343,11 +350,30 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           // task outcome and the audit log.
           const waitResult = await awaitIdleWithinBudget(handle, ctx, wallSecsPerIssue);
           if (waitResult === "overrun") {
+            const reason = `wall-clock budget exceeded (${wallSecsPerIssue}s)`;
             console.error(`[factory.worker] BUDGET: issue #${task.input.issueNumber} exceeded wallSecsPerIssue=${wallSecsPerIssue}s — aborting run; partial branch preserved`);
             try { await handle.abort(ctx); } catch (e) { console.error(`[factory.worker] budget abort: ${(e as Error).message}`); }
+            // #141: COUNT it, durably. Before this the retry cap was the word "once" in a prompt and no
+            // task kept a number, so an over-budget issue was delegated again immediately — across a
+            // restart too, which is how one issue reached a third attempt at full wall cost. The note goes
+            // in the SAME commit as the outcome: an abort that is recorded but not terminal (or vice versa)
+            // is a counter that lies exactly when it matters.
+            let note = { attempts: 1, terminal: false } as { attempts: number; terminal: boolean };
             await runtime.commit(
-              () => ({ status: "completing", outcome: { status: "aborted", reason: `wall-clock budget exceeded (${wallSecsPerIssue}s)` } }),
+              async (tx) => {
+                const doc = await tx.doc(BudgetLedgerDoc);
+                note = noteBudgetAbort(doc, task.input.issueNumber, { reason });
+                return {
+                  status: "completing",
+                  outcome: { status: "aborted", reason, budgetAborted: true, attempts: note.attempts, retryable: false },
+                };
+              },
               ctx,
+            );
+            console.error(
+              note.terminal
+                ? `[factory.worker] BUDGET: issue #${task.input.issueNumber} attempt ${note.attempts} — STOPPED. Further delegate calls for this issue are refused without doing work; the levers (raise wallSecsPerIssue, split the issue) belong to a human.`
+                : `[factory.worker] BUDGET: issue #${task.input.issueNumber} attempt ${note.attempts} recorded; one more identical abort stops the issue`,
             );
             return;
           }
@@ -390,6 +416,7 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: ToolTask; 
     name: "delegate",
     description:
       "Run the sandboxed worker for one GitHub issue. It clones the repo on branch agent/issue-<n>, implements the fix, runs the test suite, and commits. Returns the worker's final report. " +
+      "If this issue has already aborted twice on its wall-clock budget, the call is refused WITHOUT creating a task and returns {refused:true, runStopped:true, retryable:false}: report that to the human — re-delegating cannot succeed and costs nothing but returns the same payload. " +
       "For rework of an existing pull request, pass `feedback` (the PR number, the directive kind parsed at intake, and the reviewer's instruction verbatim): the worker then checks out the PR's current branch instead of starting from the default branch, and re-verifies that the PR is open and factory-owned before touching it.",
     parameters: Type.Object({
       issueNumber: Type.Integer(),
@@ -403,6 +430,16 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: ToolTask; 
     }),
     replay: "unsafe", // spawns a child task; the harness tracks it durably
     execute: async (args, api: ToolExecutionApi, ctx: Context) => {
+      // #141 — the loop breaks HERE, not in prose. A stopped issue gets its payload without a task being
+      // created: no clone, no setup container, no worker generation, no reviewer. That is the difference
+      // between "the model was asked to stop" and "this issue cannot cost another budget".
+      const ledger = await api.snapshot(BudgetLedgerDoc, ctx);
+      if (isBudgetStopped(ledger, args.issueNumber)) {
+        const payload = budgetShortCircuitPayload(args.issueNumber, budgetEntry(ledger, args.issueNumber)!);
+        console.error(`[factory.delegate] issue #${args.issueNumber} refused without work: stopped by the wall-budget ledger after ${payload.attempts} aborts`);
+        return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
+      }
+
       const id = await api.createTask(
         taskDef,
         { issueNumber: args.issueNumber, ...(args.feedback ? { feedback: args.feedback } : {}), ...modelRef },
@@ -411,13 +448,31 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: ToolTask; 
       );
       const settled = await api.waitForTask(id, ctx);
       const outcome = settled.state.outcome;
+      if (outcome.status === "completed") {
+        return {
+          output: [{ type: "text" as const, text: JSON.stringify({ report: (outcome.result as { answer: string }).answer }) }],
+        };
+      }
+      // A budget abort is reported as terminal, with the attempt count the worker recorded. `retryable:
+      // false` is host state, not a request: on the next abort the short-circuit above makes retry
+      // structurally impossible rather than impolite.
+      const extra = outcome as Record<string, unknown>;
       return {
         output: [
           {
             type: "text" as const,
-            text: JSON.stringify(
-              outcome.status === "completed" ? { report: (outcome.result as { answer: string }).answer } : { error: outcome.error?.message ?? outcome.reason ?? outcome.status },
-            ),
+            text: JSON.stringify({
+              error: outcome.error?.message ?? outcome.reason ?? outcome.status,
+              ...(extra.budgetAborted === true
+                ? {
+                    budgetAborted: true,
+                    attempts: typeof extra.attempts === "number" ? extra.attempts : 1,
+                    retryable: false,
+                    hint:
+                      "The worker exceeded its wall-clock budget. Do not re-delegate the same issue at the same budget: one more identical abort stops the issue for the rest of this instance's life, and the fix (raise wallSecsPerIssue, or split the issue) is an operator decision.",
+                  }
+                : {}),
+            }),
           },
         ],
       };

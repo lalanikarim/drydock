@@ -21,6 +21,8 @@ import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts
 import { CONFIG_DIR_ENV, loadFactoryConfig, resolveFactoryConfigPath } from "./factory-config.ts";
 import { factoryPipeline, intakeToolNames, orchestratorInstructions, refinerInstructions } from "./pipeline.ts";
 import { createIntakeRoute } from "./intake-router.ts";
+import { createRunControlRoute } from "./run-control.ts";
+import { BudgetLedgerDoc, budgetSummary } from "./budget-ledger.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
 import { assertModelAvailable, defaultMismatchWarning } from "./model-catalog.ts";
 import { createGitAuth } from "./github-auth.ts";
@@ -313,8 +315,9 @@ async function main() {
     // wasn't registered ("unanswered / no_model", 2026-10-30). The repo config's modelId now decides,
     // for the orchestrator as well as for worker/reviewer tasks.
     rootAgent: rootAgentChange,
-    // The factory's own intake endpoint, behind the kernel's bearer auth (#122).
-    routes: [createIntakeRoute({ repo, agents: intakeAgents, modelRef })],
+    // The factory's own endpoints, behind the kernel's bearer auth (#122): intake, and run control —
+    // POST /factory/runs/abort is the operator lever #141 was missing (#120 can't be documented until it exists).
+    routes: [createIntakeRoute({ repo, agents: intakeAgents, modelRef }), createRunControlRoute({ repo })],
   }).then(async (instance) => {
     // Check the model against the catalog THIS instance actually built, before announcing readiness.
     // Announcing ready and then settling every task as "unanswered / no_model" is what made a config
@@ -365,7 +368,7 @@ async function main() {
     // whose handles were half-released. Teardown races are exactly the class of bug this repo keeps
     // finding late, so the guard lives here rather than in each caller.
     let closing: Promise<void> | null = null;
-    const shutdown = (signal: string) => {
+    const shutdown = async (signal: string) => {
       if (closing) {
         // The operator asked twice; the first close is not progressing in their eyes. Bound it and go.
         console.log(`[factory] ${signal} received while already closing — exiting now`);
@@ -382,6 +385,16 @@ async function main() {
         console.log(`[factory] ${repo}: refusals this process: ${ledger.length} (${parts}); runs stopped: ${refusalBudget.stoppedIssues().join(", ") || "none"}`);
         const stoppedSummary = refusalBudget.summary();
         if (stoppedSummary !== "no runs stopped by the refusal budget") console.log(stoppedSummary);
+      }
+      // Wall-budget ledger on the way out (#141), next to the refusal ledger it complements: which issues
+      // stopped costing full budgets, and how often an operator had to intervene.
+      try {
+        const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
+        const budgetState = await instance.harness.snapshot(BudgetLedgerDoc, BACKGROUND_CONTEXT);
+        const line = budgetSummary(budgetState);
+        if (!line.startsWith("no runs stopped")) console.log(`[factory] ${repo}: ${line}`);
+      } catch {
+        /* a shutdown summary must never be the reason a close fails */
       }
       if (keepAlive) clearInterval(keepAlive);
       closing = instance

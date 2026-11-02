@@ -546,6 +546,35 @@ ls -la factory-instances/*/engram-data/*.sqlite*  # stray -wal/-shm next to a ru
 cat factory-instances/*/orphan-events.log         # the watchdog's own record, if it ever fired
 ```
 
+## 7b. Stopping one run that will not finish (#141)
+
+A delegated task that overruns its wall budget is aborted by the worker itself, and that abort is now
+**counted per issue in a durable ledger**. Two identical overruns stop the issue: further `delegate` calls
+for it return `{refused:true, runStopped:true, retryable:false}` **without creating a task** — no clone, no
+setup container, no worker generation. That is what ends a loop that previously cost a full budget per
+attempt and outlived restarts, because the cap used to be the word "once" in a prompt.
+
+```bash
+TOKEN=$(grep -m1 API_TOKEN .env | cut -d= -f2-)
+# stop one task (id from a log line or GET /tasks), attributing it to its issue for the record:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"taskId":1437,"issueNumber":52,"reason":"watching it spin"}' \
+  https://karims-macbook-air-2.tail109ba6.ts.net/factory/runs/abort
+
+# or stop everything one conversation is doing:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"conversationId":42,"reason":"wrong approach entirely"}' \
+  https://karims-macbook-air-2.tail109ba6.ts.net/factory/runs/abort
+```
+
+Read the response instead of assuming it. `aborted:true` means an abort mark was committed; `settled:true`
+means the task reached `terminal` inside the route's 5 s window. `settled:false` is not an error — the run is
+still winding down, so check the task again before concluding anything. An **operator** abort is recorded
+against the issue but never charged to the budget cap: using the stop button must not lock an issue out.
+
+To let a stopped issue run again (after splitting it, or raising `wallSecsPerIssue`), take the fleet down and
+clear its ledger entry — there is deliberately no "ignore the cap" verb.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
