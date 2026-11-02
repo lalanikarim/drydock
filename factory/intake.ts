@@ -11,7 +11,7 @@
 
 import http from "node:http";
 import type { InferenceAggregate, ProbeResult } from "./inference-probe.ts";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { isPrCommentEvent, parseFactoryDirective, prFeedbackRequestId, prNumberFromEvent, type ParsedDirective } from "./pr-feedback.ts";
 import {
   isRefineCommentEvent,
@@ -364,7 +364,17 @@ function readBoundedBody(req: http.IncomingMessage, cap: number): Promise<{ body
  * (plan §3.2 / gate M3) — signature validity doubles as per-repo
  * authorization. In this mode dispatch is called as dispatch(repo, event).
  */
-export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret, routes, dispatch, logPath, eligibilityLabel = AGENT_LABEL, routesDriftCheck, inferenceStatus, inferenceDetails }: {
+/**
+ * Compare a secret without leaking length or content through timing: hash both sides to fixed width first,
+ * so a short token and a long one cost the same. Used for the operator detail route's bearer token.
+ */
+function constantTimeEqual(supplied: string, expected: string): boolean {
+  const a = createHash("sha256").update(supplied).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret, routes, dispatch, logPath, eligibilityLabel = AGENT_LABEL, routesDriftCheck, inferenceStatus, inferenceDetails, adminToken }: {
   port?: number;
   host?: string;
   webhookSecret?: string;
@@ -385,8 +395,13 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
    * first probe completes — "not yet measured" must not render as "reachable".
    */
   inferenceStatus?: () => InferenceAggregate | null;
-  /** Per-provider probe detail for the loopback-only /health/inference view. */
+  /** Per-provider probe detail, served by `/health/inference` — which requires `adminToken`. */
   inferenceDetails?: () => readonly ProbeResult[];
+  /**
+   * Bearer token for the operator-only detail route. Unset means the route does not exist: default posture
+   * is closed, because that response names internal hosts and inventories loaded models.
+   */
+  adminToken?: string;
 }): Promise<{ server: http.Server; port: number; host: string }> {
   if (routes) validateRoutes(routes);
   const hasAuth = Boolean(webhookSecret) || Boolean(routes?.length);
@@ -409,13 +424,19 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
         res.writeHead(200, { "content-type": "application/json" });
         return res.end(JSON.stringify(body));
       }
-      // Loopback-only detail (#133): which provider, which host, what failed. Names internal hostnames, so
-      // it answers nothing to a caller that is not on this machine — and returns 404 rather than 403 so the
-      // endpoint's existence is not advertised through the funnel.
+      // Operator detail (#133): provider ids, internal hostnames, the loaded-model inventory — configuration
+      // disclosure by any measure.
+      //
+      // This used to gate on the peer address being loopback, and that was WRONG. A Tailscale Funnel
+      // connection terminates at the adapter FROM 127.0.0.1, so on 2026-11-02 the published endpoint answered
+      // an unauthenticated curl with `aurora.infinidigm` and 27 model ids — verified live through the funnel,
+      // HTTP 200, 1001 bytes. An address chosen by whatever proxy sits in front is not an authorization
+      // signal. A bearer token is required now, and with no token configured the route does not exist at all:
+      // closed by default, and 404 rather than 403 so nothing advertises that it is here.
       if (req.method === "GET" && url.pathname === "/health/inference") {
-        const peer = req.socket.remoteAddress ?? "";
-        const loopback = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
-        if (!loopback || !inferenceDetails) {
+        const supplied = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ""))?.[1];
+        const authorized = Boolean(adminToken) && Boolean(supplied) && constantTimeEqual(supplied!, adminToken!);
+        if (!authorized || !inferenceDetails) {
           res.writeHead(404, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: "not found" }));
         }

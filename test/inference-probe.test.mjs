@@ -212,26 +212,47 @@ test("/health reports inference state without naming providers, hosts or repos",
   srv.server.close();
 });
 
-test("the detail view exists on loopback and is 404 when there is nothing to show", async () => {
+test("/health/inference requires a bearer token — a peer address is not authorization (#136 review)", async () => {
   const { startIntakeServer } = await import("../factory/intake.ts");
-  const withDetails = await startIntakeServer({
-    port: 0,
+  const details = [{ id: "aurora", host: "aurora.infinidigm", reachable: true, checkedAt: 1, latencyMs: 2, loadedModelIds: ["m1"] }];
+  const srv = await startIntakeServer({
+    port: 0, // binds 127.0.0.1 — exactly what a funnel connection ALSO looks like from the server's side
     webhookSecret: "s3cret",
     dispatch: async () => ({}),
     inferenceStatus: () => ({ state: "reachable", reachable: 1, total: 1, checkedAt: 1 }),
-    inferenceDetails: () => [{ id: "spark", host: "spark.infinidigm", reachable: true, checkedAt: 1, latencyMs: 2 }],
+    inferenceDetails: () => details,
+    adminToken: "operator-token",
   });
-  const res = await fetch(`http://127.0.0.1:${withDetails.port}/health/inference`);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.providers[0].id, "spark");
+  const url = `http://127.0.0.1:${srv.port}/health/inference`;
 
+  // The real-world hostile case: a Tailscale Funnel request arrives from loopback with forwarded headers
+  // attached. It used to be served (HTTP 200, internal hostname + model inventory) on the strength of the
+  // address alone.
+  const anon = await fetch(url);
+  assert.equal(anon.status, 404, "no token → not found, even though the peer address IS loopback");
+  const forwarded = await fetch(url, { headers: { "x-forwarded-for": "1.2.3.4", "x-real-ip": "1.2.3.4", "forwarded": "for=1.2.3.4" } });
+  assert.equal(forwarded.status, 404, "forwarding headers must not be treated as a trust signal in either direction");
+  const wrong = await fetch(url, { headers: { authorization: "Bearer not-the-token" } });
+  assert.equal(wrong.status, 404, "a wrong token is the same answer as no token — nothing to discover");
+  const schemeless = await fetch(url, { headers: { authorization: "operator-token" } });
+  assert.equal(schemeless.status, 404, "raw token without the Bearer scheme is not accepted");
+
+  const ok = await fetch(url, { headers: { authorization: "Bearer operator-token" } });
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  assert.equal(body.providers[0].host, "aurora.infinidigm", "the authorized operator view still names hosts");
+  srv.server.close();
+});
+
+test("with no admin token configured the detail route does not exist at all", async () => {
+  const { startIntakeServer } = await import("../factory/intake.ts");
   const without = await startIntakeServer({ port: 0, webhookSecret: "s3cret", dispatch: async () => ({}) });
   const missing = await fetch(`http://127.0.0.1:${without.port}/health/inference`);
-  assert.equal(missing.status, 404, "no prober → the route does not exist (and never advertises itself)");
+  assert.equal(missing.status, 404, "unconfigured → closed, not open-by-default");
+  const evenWithToken = await fetch(`http://127.0.0.1:${without.port}/health/inference`, { headers: { authorization: "Bearer anything" } });
+  assert.equal(evenWithToken.status, 404, "no configured token means nothing can authorize");
   const plain = await (await fetch(`http://127.0.0.1:${without.port}/health`)).json();
   assert.deepEqual(plain, { status: "ok" }, "with no probe configured, health claims nothing about inference");
-  withDetails.server.close();
   without.server.close();
 });
 
