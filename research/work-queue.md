@@ -9,7 +9,32 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 > cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
 > newer document references by number (queue 7, 8b, 11, 13).
 
-# Fifth refresh — 2026-11-03 (current)
+# Sixth refresh — 2026-11-03 (later) (current)
+
+Against `main` = `5b3afb6`. Suite **465 pass / 0 fail**. Fleet still on `e4d89e1`: #165 added a ledger module and a gate that nothing in the runtime imports, so no restart was warranted — running code unchanged is a reason not to deploy, not a reason to deploy anyway.
+
+- **#161 shipped (#165)** — settlements are now counted, classified, and gated on a window (`gates/settlement-window.mjs`, runbook §7d, checklist row 12). First-ever count of production: `completed=48 failing=4 aborted=6 unanswered=0` across four stores. Watermark semantics: ids only increase (shared allocator), an alarming window does **not** advance, and zero stores examined exits 2.
+- **#164 filed from that first run** — two `factory.worker` tasks faulted with `erased(...).abort is not a function`, invisible since 2026-11-02. Call site traced into `pi-durable` (`scheduler.js:1297`, `erased(task) → task.definition`); our definitions have carried `abort` since the first pipeline commit, so the faulting case is a reservation whose definition isn't resolvable — which makes #157 and #164 plausibly one bug seen from two sides.
+- **Four column/query contracts were verified against production before any of it was written**, each of which yields a permanently green report if guessed: text columns are JSON-encoded, `$.state.status` is `terminal` for failures too, submissions carry no timestamp, and sparse task ids are the shared allocator rather than pruning.
+
+| # | Item | Owner | Why this rank | Done when |
+|---|---|---|---|---|
+| 1 | **#145 — G5's two arms share one branch/PR** | 🤖 | The battery reports a number it did not measure (attribution off a no-op diff). Needs two equivalent trap issues so arms get separate branches. Blocks any feedback-loop claim. | Distinct branches per arm, non-empty diffs asserted, lesson-arm pass impossible when step B produced zero commits. |
+| 2 | **#147 — G4 T2 stalled once (900 s), passed in 48 s on re-run** | 🤖 | Turns a flake into a diagnosable event; the `settled` reporting from #153 gives it somewhere to come from. | Timeout path prints a task snapshot; test asserts the diagnostic exists. |
+| 3 🆕 | **#164 — `erased(...).abort is not a function` on worker teardown** | 🤖 | Two faults found only because something finally counted settlements. Likely shares a root with #157; the fix in `pi-durable` is small (`definition?.abort`, else treat as stale) but needs reproduction first. | Reproduced, owner decided (kernel vs ours), and either fixed or upstreamed with the stack — not closed on a hypothesis. |
+| 4 | **#157 — after SIGKILL the store still says a dead task is `running`** | 🤖 | State honesty. Compensated by the abort verb; do it next to #164 because they are probably one bug. | Boot reconciles non-terminal reservations whose owner is gone and logs what it settled. |
+| 5 | **#161 follow-up — route a `no_model` settlement into the #160 inference edge** | 🤖 | The ledger alarms on it; live notification needs instance → adapter across a process boundary. Deferred deliberately, not forgotten. Zero `no_model` rows have ever been recorded, so this is preparedness, not triage. | A settlement whose reason names model resolution triggers the inference alert path, proven with a real submission rather than a stub. |
+| 6 | **§3.9 T1 partial-run recovery (C4)** | 🤖 | Pairs with #141's durable stop: preserve branch, mark resumable, requeue once with the diff as context. | A resumed run consumes its prior diff and does not re-implement landed work. |
+| 7 | **#110 — shutdown can leave a child handle open** | 🤖 | Mitigated three times over; no symptom since. | Reproduce with the coordinator in place, or close as superseded with reasoning. |
+| 8 | **E4 per-task token annotation (§5.17)** | 🤖 | Battery numbers were assembled by hand (G2: 281,520 tokens). | Every task row carries its own count without reconstruction. |
+| 9 | **C5 release checklist** | 🤖 | Now also carries the alert drill (§8) and settlement window (§7d). | One page, commands run as written. |
+| 10 | **#78 App reach residual · #42 Target 2 doc · #41 upstream PR** | 🧑 | Credential/click/upstream work; #41 on hold per its own note. | Unchanged. |
+
+**Accepted, not queued:** fixture protection posture (R14). **Battery: 8 of 9 green**, unchanged; G5 needs rank 1 before a re-run means anything, and fixtures are consumables — seed before running.
+
+---
+
+# Fifth refresh — 2026-11-03 (superseded by the sixth)
 
 Against `main` = `e4d89e1`, fleet restarted onto it (down in 3 s, lock released, `/health` → `{status: ok, build.sha: e4d89e1, inference: reachable}`, funnel 200, 2 children, zero orphans, zero sandboxes). Suite **448 pass / 0 fail**.
 
