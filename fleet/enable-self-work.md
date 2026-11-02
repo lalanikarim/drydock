@@ -575,6 +575,131 @@ against the issue but never charged to the budget cap: using the stop button mus
 To let a stopped issue run again (after splitting it, or raising `wallSecsPerIssue`), take the fleet down and
 clear its ledger entry — there is deliberately no "ignore the cap" verb.
 
+If an abort does not stick, or the instance itself is wedged, continue to **§7c (containment)**.
+
+## 7c. When an abort is not enough: containment (#120)
+
+§7b stops a *run*. This section is for the cases where that is not sufficient: the instance itself is wedged, or
+the store no longer describes reality. Every command here was run against production on 2026-11-02, including two
+containment kills; the numbers are observed, not expected.
+
+### First decide what is actually in flight — three views, because they disagree
+
+```bash
+# 1) fleet-level: which repos are up, and whether the delivery sweep sees them
+node --experimental-strip-types fleet/supervisor.ts status fleet/fleet.local.json
+
+# 2) durable truth per instance: non-terminal tasks and how old they are
+DIR=factory-instances/lalanikarim_engram/engram-data      # <owner>_<repo>, not the repo path
+sqlite3 "file:$DIR/agent.sqlite?mode=ro"   "select id, conversation_id as conv, kind, status, abort_requested as abrt,
+          cast((strftime('%s','now')*1000 - json_extract(record,'$.startedAt'))/1000 as int) as age_s
+   from tasks where status != 'terminal' order by age_s desc limit 10;"
+
+# 3) the instance's own view: conversations with work queued or open
+TOKEN=$(python3 -c "import json;print([r for r in json.load(open('fleet/data/routes.json')) if 'engram' in r['repo']][0]['token'])")
+PORT=$(python3 -c "import json;print([r for r in json.load(open('fleet/data/routes.json')) if 'engram' in r['repo']][0]['target'])")
+curl -sS -H "Authorization: Bearer $TOKEN" "$PORT/conversations" | python3 -c "
+import json,sys
+items=json.load(sys.stdin)
+busy=[c for c in items if c.get('openSubmissions')]
+print('conversations:', len(items), '| with open submissions:', len(busy), [(c['id'], c.get('name')) for c in busy])"
+```
+
+They disagree on purpose. `status` in the store is a **reservation**, not a heartbeat: since #157 it can say
+`running` for a task whose process was killed. The HTTP view knows what the live instance is doing; the store knows
+what it intended. When (2) shows something old and (3) shows nothing, you have a stale reservation — go to Step 1.
+
+A useful threshold: `age_s` past this repo's `wallSecsPerIssue` with status still `running` is not a slow run, it is
+a run that will not finish on its own.
+
+### Step 1 — abort it (this also cleans up after a kill)
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"taskId":28,"reason":"will not finish"}' "$PORT/factory/runs/abort"
+# {"aborted":true,"mark":"marked","statusBefore":"running","statusAfter":"terminal","settled":true}
+```
+
+`settled:false` right after an abort is **normal**, not a hang: the mark is committed and the invocation is winding
+down. Re-read the task before escalating. Use `conversationId` instead of `taskId` to stop everything one issue's
+conversation is doing.
+
+This step also fixes #157: a reservation whose owner was SIGKILLed is still abortable, and aborting it makes the
+store honest again — verified on exactly that specimen (`28|running|0` → `28|terminal|1|aborted`, no conversation
+left busy). Do not reach for SQL writes; there is a verb.
+
+### Step 2 — contain one instance (kill the group, not the pid)
+
+Each child's **pgid equals its pid** (#127), so one negative signal reaches the whole tree including a worker's
+container tooling:
+
+```bash
+PID=$(pgrep -f 'factory/main[.]ts lalanikarim/engram' | head -1); echo $PID   # check before killing
+kill -9 -$PID
+```
+
+Observed, from the log:
+
+```text
+[supervisor] factory:lalanikarim/engram exited (SIGKILL) — restarting in 5s
+[supervisor] starting factory:lalanikarim/engram — attempt 2
+```
+
+Back to two children inside ~8 s. **The replacement listens on a new ephemeral port** (`54160` → `57294` in the run
+below) while its token persists, so read `fleet/data/routes.json` again rather than reusing a URL from your shell
+history — a cached port is how you end up "fixing" a repo that is not broken. The supervisor's own lock is untouched,
+because the supervisor survived; that is the point of doing this per-repo.
+
+The budget: 10 restarts at 5 s backoff (`MAX_RESTARTS`, `RESTART_BACKOFF_MS`). Exceeding it makes the supervisor
+**exit non-zero on purpose** — so a scheduler or launchd sees a dead thing instead of a healthy pid quietly serving
+nothing (the #107 failure mode).
+
+After Step 1's abort did not stick and Step 2 has run, sweep for reservations the dead process left behind (#157)
+and abort them.
+
+### Step 3 — take the fleet down (only when more than one repo is wrong)
+
+```bash
+SUP=$(cat fleet/data/routes.json.lock)      # the lock file holds the owner pid — use it
+ps -p "$SUP" -o pid,command | cut -c1-80    # confirm it is the supervisor before signalling
+kill -TERM "$SUP"                            # bounded: children and their groups go together
+```
+
+Observed: both children gone in **3 s**, `fleet/data/routes.json.lock` released, zero orphans, zero sandboxes. A
+second signal means "now": it exits immediately and SIGKILLs the groups (§10). Restart with
+
+```bash
+set -a; . ./.env; set +a
+nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> fleet/data/supervisor.log 2>&1 &
+```
+
+If it refuses to start saying `supervisor already running as pid N`, believe it: either the old one is alive (kill
+that pid) or it crashed and left the lock, in which case reclaim is automatic — that path is covered by #143's tests.
+
+### After any containment: prove you left nothing behind
+
+```bash
+pgrep -fl 'factory/main[.]ts' || echo "no factory processes"     # brackets: see the trap below
+podman ps --format '{{.Names}}' | grep sbx || echo "no sandboxes"
+curl -sS http://127.0.0.1:9700/health                             # build sha + inference state
+```
+
+### Parking a repo deliberately
+
+There is no runtime per-repo stop verb, and killing a child always respawns it. To keep a repo down, remove its
+entry from the `factories` array in `fleet/fleet.local.json` (a deployment file, not checked in) and restart the
+supervisor. Disabling it in `factory/repo-registry.json` is the other lever and also stops its webhook route; use
+that when the reason is policy rather than a fire.
+
+### Two traps that cost real time on 2026-11-02
+
+- **`pgrep -f` matches your own command line.** Searching for `engram-sbx` reports a "leaked sandbox" that is this
+  shell. Use brackets: `'engram[-]sbx'`, `'factory/main[.]ts'`.
+- **`pgrep … | head -1` can hand you the wrapper, not the process.** Twice in one session `pgrep -f
+  'fleet/supervisor[.]ts' | head -1` returned the bash wrapper running the command, so `kill -TERM` signalled a dead
+  pid, the real supervisor kept the lock, and the restart refused with a message that blamed the new process. Read
+  the owner from `fleet/data/routes.json.lock`, or anchor the pattern: `pgrep -f '^node --experimental-strip-types fleet/supervisor[.]ts'`.
+
 ## Rollback
 
 Two independent switches, and both are worth using — disabling the hook stops *work*, unpublishing stops *exposure*:
@@ -648,6 +773,7 @@ delivery path is unverified is a notification feature you find out about by not 
 | 7 | Webhook points at the current funnel URL | `gh api repos/<repo>/hooks --jq '.[].config.url'` | URL matches `tailscale funnel status` |
 | 8 | No sandbox sidecar outlived a previous run | `podman ps --filter name=engram-sbx --format "{{.Names}} {{.Status}}"` | empty — a container bound to a worktree is an orphan too (§10) |
 | 9 | The running supervisor is on the commit you think it is | `curl -s localhost:9700/health \| jq '{build,startedAt}'` vs `git log -1 --format=%h` | `build.sha` equals trunk; if not, restart. Also grep `fleet/data/supervisor.log` for `SERVING STALE POLICY` (#150) — that means policy edits are not live |
+| 10 | You can name the supervisor pid without guessing | `cat fleet/data/routes.json.lock` | a live pid owned by this deployment — `pgrep -f … \| head -1` has twice returned a shell wrapper instead (§7c traps) |
 
 Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
 
