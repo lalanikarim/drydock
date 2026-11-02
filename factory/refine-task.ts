@@ -275,9 +275,10 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
         );
       },
 
-      abort: async (task: any, runtime: any, ctx: Context) => {
-        await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "refinement aborted" } }), ctx);
-      },
+    },
+    // Top-level TaskDefinition member, not a phase (#164).
+    abort: async (task: any, runtime: any, ctx: Context) => {
+      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "refinement aborted" } }), ctx);
     },
   });
 }

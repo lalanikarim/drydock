@@ -274,11 +274,13 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
           // Container teardown is owned by the core (run_end → dispose).
         }
       }),
-      abort: guarded("ABORT", async (task, runtime, ctx) => {
-        const convId = task.state.checkpoint?.convId;
-        if (convId) verdictRegistry.delete(convId);
-        await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "reviewer aborted" } }), ctx);
-      }),
     },
+    // Top-level TaskDefinition member, not a phase (#164): nested under `phases` the kernel never saw it and an abort
+    // mark threw `erased(...).abort is not a function`.
+    abort: guarded("ABORT", async (task, runtime, ctx) => {
+      const convId = task.state.checkpoint?.convId;
+      if (convId) verdictRegistry.delete(convId);
+      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "reviewer aborted" } }), ctx);
+    }),
   });
 }
