@@ -9,7 +9,31 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 > cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
 > newer document references by number (queue 7, 8b, 11, 13).
 
-## Open now, ranked
+# Third refresh — 2026-11-02 (current)
+
+Against `main` = `b21da81`, after the P0 push (#122 transcript scoping, #127/#130 process-group ownership and bounded shutdown, config-out-of-tree, backup drill, inference probe, `/health/inference` auth fix, registry-derived sweep targets, evidence contract #144, config-driven targets #149, supervisor config resilience #150). Nine-gate battery: **8 of 9 green** (G5 red on a harness defect, #145). Fleet live on trunk: `/health` → `{status: ok, build.sha: b21da81, inference: reachable}`, funnel 200, zero orphans.
+
+Everything below the line is the 2026-11-01 table — history, not the queue.
+
+| # | Item | Owner | Why this rank | Done when |
+|---|---|---|---|---|
+| 1 | **#141 — wall-budget aborts retried forever; no `abort` verb** | 🤖 | The only remaining **unbounded-cost** defect: a 2400 s budget abort re-delegates with no attempt counter, and an operator has "ask the model politely" or "kill the fleet" as levers. Proven live on 2026-11-02 (tasks 1158 → 1297 → 1437; `POST /tasks/:id/abort` → 404). | Durable per-issue attempt count, distinct `aborted_budget` outcome that does not re-dispatch, and an operator abort endpoint that asserts on observable effect (task terminal, child gone). |
+| 2 | **Fixture protection posture** (was queue 8b) | 🧑 | Now load-bearing rather than theoretical: the battery merged PRs into both fixture repos tonight, which have **no branch protection at all** and inherit `autoMerge: true` from registry defaults — and rulesets return `403 Upgrade to GitHub Pro` on this plan, so "add protection" is not available without a plan change. | You decide: accept explicitly in writing, or move fixtures somewhere rulesets exist, or flip `autoMerge:false` per fixture entry. |
+| 3 | **#133 (second half) — inference edge alerts wired to delivery** | 🤖 | Probe + aggregate state ship (`/health`, `/health/inference`). What's missing is a notification on the *edge*, so an outage during unattended hours reaches Telegram instead of waiting for someone to curl. Shares plumbing with #64. | State transition logs AND sends once; recovery sends once; no repeat-every-minute spam. |
+| 4 | **#147 — G4 T2 crashed-retry stalled once (900 s), passed in 48 s on re-run** | 🤖 | A crash-recovery gate that is occasionally non-deterministic and emits nothing but `submitted-retry` then silence. In production the same stall reads as "nobody approved yet". | Timeout path prints a task snapshot; test asserts the diagnostic exists; next occurrence yields a cause, not a shrug. |
+| 5 | **#145 — G5's two arms share one branch/PR** | 🤖 | Tonight's G5 "attribution" was measured off a no-op diff: the gate can currently report success it did not measure. Two issues per arm + a broader root-fix detector. | Arms get distinct branches, non-empty diffs asserted, and the lesson arm's pass is impossible when step B produced zero commits. |
+| 6 | **§3.9 T1 partial-run recovery (C4)** | 🤖 | Pairs with #141: preserve the branch, mark resumable, requeue once with the diff as context. Today a mid-run death starts over from scratch. | A resumed run consumes its prior diff and does not re-implement landed work. |
+| 7 | **#120 — stuck-run guidance in the runbook** | 🤖🧑 | Partly improved (runbook §12, `/health` build sha, sweep breakdown). The actual "this run will not finish, stop it" procedure is still prose-with-no-lever until #141 ships an abort verb. | A §-numbered procedure whose commands exist and work. |
+| 8 | **#64 — Telegram PR-created notification end-to-end** | 🧑 | Three events wired; no verified end-to-end send from production. Cheap to close with one real event. | One captured delivery in the operator's Telegram, referenced in the issue. |
+| 9 | **#110 — shutdown left a child handle open (root cause unknown)** | 🤖 | Symptoms mitigated twice over (#127 process groups, #130 coordinator, second-signal-exits). Root cause still unnamed; priority dropped accordingly. | Reproduce with the coordinator in place, or close as superseded with reasoning. |
+| 10 | **E4 per-task token annotation (§5.17)** | 🤖 | Offline accounting ships (`factory/usage.ts`, `gates/m5-token-report.mjs`); per-task attribution is partial. Tonight's battery produced real per-run numbers by hand — G2 run: 281,520 tokens. | Every task row carries its own token count without post-hoc reconstruction. |
+| 11 | **C5 release checklist** | 🤖 | Close now: runbook §12 (battery prerequisites) + the staleness curl landed. Remaining: encode "full battery before pin bump or posture change" plus the restart step in one page. | One page, referenced from the plan, with commands that run as written. |
+| 12 | **#78 — App reach residual** | 🧑 | Verified today by `gates/github-app-check.mjs`: **2** reachable-but-unmanaged repos (`modelarena`, `collective`) remain installed. Policy-visible gap, low urgency. | Installation narrowed, or the residual recorded as accepted with reasoning. |
+| 13 | **#42 Target 2 design doc · #41 upstream kernel PR** | 🧑 | Design/upstream work, no production risk. #41 stays on hold per its own note. | Unchanged from those issues. |
+
+**Closed since the 2026-11-01 refresh:** #122 (transcript poisoning — structural kernel filter, live-proved), #125, #127, and PRs #128–#132, #134–#140, #142, #144, #146, #148, #149, #150.
+
+## Superseded: 2026-11-01 table
 
 | # | Item | Owner | Depends on | Done when |
 |---|---|---|---|---|
