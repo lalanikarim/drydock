@@ -27,6 +27,27 @@ So, for code that touches anything this repo does not control — the GitHub API
 - Where a fake is unavoidable, make it **hostile in the direction reality is**: refuse what reality refuses (`403` on `/user`, `422` on `page=`), and keep precision-sensitive values as strings end to end.
 - A green suite over an assumed contract is a claim about your test, not about production. Corollary for gates that trust an exit code: **verify what the command collected** — "not collected" and "passing" are the same color (R6b, R10).
 
+## Secrets and operator identifiers in git
+
+**This repository is public.** A secret here is not "a file that should have been ignored", it is published.
+
+- Credentials (bot tokens, webhook secrets, model API keys, App private keys) live in `.env`, launchd
+  `EnvironmentVariables`, or `$DRYDOCK_CONFIG_DIR` — never in a tracked file, never in an issue or PR body.
+- **Operator identifiers count too.** A Telegram chat id is not a secret by itself, but it names the destination a
+  token writes to: leaked together with any token it means "message the operator", and it identifies a personal
+  account in a public diff. `test/notify-telegram.test.mjs` shipped the real one from 2026-11-01 until #162 —
+  GitGuardian ran on that PR and said nothing, because its patterns are for credentials, not identifiers. Do not
+  expect a scanner to cover this.
+- **Tests use invented values.** `"123456789"` for a chat id, `"123456:AA-secrets-not-for-logs"` for a token. An
+  assertion about what we put on the wire is equally strong with fake data; if a test only passes with the real
+  value, it is not testing our code.
+- Before pasting command output into an issue, PR, or report: read it once looking for tokens, chat ids, and
+  private URLs. Drill output and `ps eww` dumps both contain live values — quote the shape, not the value.
+- Flagged, deliberately not fixed (operator decision): tracked docs name the Tailscale funnel host and the internal
+  inference host (`aurora.infinidigm`). Those are reachability facts about a home network sitting in a public repo.
+  They are also load-bearing in the runbooks, so redacting them is a judgment call about documentation value, not
+  a mechanical cleanup.
+
 ## Research workflow
 
 1. Search/read primary sources (vendor docs, engineering blogs, GitHub repos) before writing or editing claims.
