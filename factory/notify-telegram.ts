@@ -43,13 +43,26 @@ export type NotifyEvent =
       repo: string;
       issueNumber: number;
       commentUrl?: string | null;
+    }
+  | {
+      /**
+       * Infrastructure alert, not per-issue (#133). The fleet had no way to say "the inference host is down"
+       * and needed an outage to discover that; this is the event that makes the edge audible. `detail` must be
+       * operator-safe text — reasons and counts, never keys or URLs with credentials.
+       */
+      kind: "inference_state";
+      state: "reachable" | "degraded" | "unreachable" | "unknown";
+      reachable: number;
+      total: number;
+      detail?: string;
     };
 
 const SHORT = (s: string | null | undefined, n = 9): string => (s ? String(s).slice(0, n) : "");
 
 /** One-line, plain-text message for an event. No parse_mode is used anywhere, so no escaping is needed. */
 export function renderNotifyMessage(e: NotifyEvent): string {
-  const name = e.repo.includes("/") ? e.repo.split("/")[1] : e.repo;
+  // Infrastructure events (inference_state) have no repo — prefixing one would print "undefined:".
+  const name = "repo" in e ? (e.repo.includes("/") ? e.repo.split("/")[1] : e.repo) : "";
   switch (e.kind) {
     case "pr_opened": {
       const v = e.verification;
@@ -60,6 +73,10 @@ export function renderNotifyMessage(e: NotifyEvent): string {
     case "run_stopped": {
       const detail = e.detail ? ` — ${e.detail}` : "";
       return `${name}: run stopped for issue #${e.issueNumber}: ${e.reason}${detail}`;
+    }
+    case "inference_state": {
+      const detail = e.detail ? ` — ${e.detail}` : "";
+      return `factory: inference ${e.state} (${e.reachable}/${e.total} endpoint(s))${detail}`.trim();
     }
     case "refine_posted": {
       return `${name}: refinement brief posted on issue #${e.issueNumber}${e.commentUrl ? ` ${e.commentUrl}` : ""}`.trim();

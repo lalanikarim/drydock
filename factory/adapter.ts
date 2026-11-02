@@ -31,6 +31,12 @@ import { fetchIssueState } from "./gh-read.ts";
 import { startParentWatchdog, SUPERVISOR_PID_ENV } from "./parent-watchdog.ts";
 import { authorizePrFeedback, fetchPrFacts, prNumberFromEvent, renderPrFeedbackContent, type PrFacts } from "./pr-feedback.ts";
 import { createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { loadRegistry, enabledRepos } from "./repo-registry.ts";
+import { resolveFactoryConfigPath } from "./factory-config.ts";
+import { InferenceProber, resolvePinnedProviders } from "./inference-probe.ts";
+import { createNotifier } from "./notify-telegram.ts";
 
 /**
  * sha256 of a routes file. The supervisor and the adapter both report this hash in their startup
@@ -261,6 +267,52 @@ export function makeRouteDispatch(
   };
 }
 
+/**
+ * Build the inference prober for this deployment (#133): probe exactly the endpoints the ENABLED repos pin,
+ * resolve credentials from `<agentDir>/models.json` the same way the kernel does, and announce state changes
+ * through the existing Telegram notifier. Returns undefined when there is nothing to probe — health then says
+ * nothing about inference rather than implying it is fine.
+ */
+export function buildInferenceProber({ log, intervalMs }: { log: (line: string) => void; intervalMs?: number }): InferenceProber | undefined {
+  const agentDir = process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  let modelsJsonText: string | undefined;
+  try {
+    modelsJsonText = readFileSync(join(agentDir, "models.json"), "utf8");
+  } catch {
+    /* no catalog file: providers resolve from env, and the $env probe below still answers the question */
+  }
+  let repos: string[];
+  try {
+    repos = enabledRepos(loadRegistry()).map((e) => e.repo);
+  } catch (e) {
+    log(`inference probe disabled — registry unreadable: ${(e as Error).message}`);
+    return undefined;
+  }
+  const providers = resolvePinnedProviders({
+    repos,
+    readRuntimeConfig: (repo) => JSON.parse(readFileSync(resolveFactoryConfigPath(repo), "utf8")),
+    modelsJsonText,
+    defaultBaseUrl: process.env.OPENAI_BASE_URL,
+    defaultApiKey: process.env.OPENAI_API_KEY,
+  });
+  if (providers.length === 0) {
+    log("inference probe disabled — no enabled repo pins a resolvable provider");
+    return undefined;
+  }
+  const notifier = createNotifier({ token: process.env.TELEGRAM_BOT_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID, log });
+  return new InferenceProber({
+    providers,
+    intervalMs: intervalMs ?? Number(process.env.INFERENCE_PROBE_INTERVAL_MS ?? 60_000),
+    timeoutMs: Number(process.env.INFERENCE_PROBE_TIMEOUT_MS ?? 5_000),
+    // Only the edge is announced. A flapping endpoint would otherwise send a message per minute, and an
+    // alert that fires constantly is not an alert.
+    onTransition: (next) => {
+      void notifier?.({ kind: "inference_state", state: next.state, reachable: next.reachable, total: next.total });
+    },
+    log,
+  });
+}
+
 // Standalone entrypoint.
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
@@ -274,6 +326,8 @@ if (isMain) {
   // Hash the same bytes we just parsed, so startup and per-request checks compare like with like.
   const startupHash = routesFileHash(routesFile);
   const logPath = process.argv[4] ?? "data/intake-adapter.jsonl";
+  const prober = buildInferenceProber({ log: (line) => console.log(`[adapter] ${line}`) });
+  prober?.start();
   startIntakeServer({
     port,
     host: process.env.ADAPTER_HOST ?? "127.0.0.1", // reachable only behind a TLS proxy with ADAPTER_HOST set
@@ -281,6 +335,8 @@ if (isMain) {
     dispatch: makeRouteDispatch(routes),
     logPath,
     routesDriftCheck: makeRoutesDriftCheck({ routesFile, startupHash, liveRoutes: routes }),
+    inferenceStatus: prober ? () => prober.current() : undefined,
+    inferenceDetails: prober ? () => prober.details() : undefined,
   }).then(({ server, port: actualPort, host }) => {
     // Both hashes are printed because they answer different questions: routes-hash is "which bytes am
     // I serving?" and policy-hash is "which authority am I serving under?" — a target-only refresh
@@ -297,6 +353,7 @@ if (isMain) {
       }
       closing = true;
       console.log(`adapter: ${reason} — closing`);
+      prober?.stop();
       server.close();
       process.exit(0);
     };
