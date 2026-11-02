@@ -617,6 +617,8 @@ delivery path is unverified is a notification feature you find out about by not 
 | 5 | App permission posture | `node gates/github-app-check.mjs` | every managed repo answers `200` on both read and write probes; `Can merge? YES` |
 | 6 | Nothing already holds the lock or the port | `cat fleet/data/routes.json.lock` (a bare pid; `ps -p <pid>` must fail), `lsof -nP -i :9700` | lock file absent or stale, listener port free |
 | 7 | Webhook points at the current funnel URL | `gh api repos/<repo>/hooks --jq '.[].config.url'` | URL matches `tailscale funnel status` |
+| 8 | No sandbox sidecar outlived a previous run | `podman ps --filter name=engram-sbx --format "{{.Names}} {{.Status}}"` | empty — a container bound to a worktree is an orphan too (§10) |
+| 9 | The running supervisor is not older than the tree it reads | `ps -p $(cat fleet/data/routes.json.lock) -o lstart=` vs `git log -1 --format=%ci` | daemon started after the last change to shared config shape — see #143 before restarting a single child |
 
 Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
 
@@ -664,7 +666,16 @@ A non-empty `orphan-events.log` means the safety net fired at least once: someth
 cat fleet/data/routes.json.lock   # gone, or a pid `ps -p` cannot find
 lsof -nP -i :9700                 # listener released
 pgrep -fl "factory/main[.]ts|adapter[.]ts"   # nothing left holding an Engram store
+podman ps --filter name=engram-sbx --format "{{.Names}} {{.Status}}"   # no sandbox outlived the instance
 ```
+
+**Node processes are not the whole tree.** A worker's code runs in a Podman sidecar whose init is `sleep infinity`,
+and if an instance dies while one is being created, the container survives it. Observed 2026-11-02 during a
+deliberate shutdown: `engram-sbx-b28c40f3`, bound to
+`factory-instances/lalanikarim_drydock/work/issue-120:/sandbox`, still `Up … (starting)` after the supervisor,
+both instances and the adapter were gone. `RestartPolicy=no`, so it never respawns and it is bounded (~7 MB), but
+nothing here looked for it — which made "no orphans" a true statement about processes and a misleading one about
+the machine. Clean up: `podman ps -aq --filter name=engram-sbx | xargs -r podman rm -f`.
 
 **Why the bracket in `factory/main[.]ts`:** `pgrep -f` matches full command lines, and the command line of the
 shell running the check *contains* the pattern — so `pgrep -fl "factory/main.ts"` counts the check itself. Seen
@@ -672,6 +683,17 @@ on 2026-11-02 reporting "3" instances where two existed, which is exactly the ki
 orphan check look like it found something when it found nothing. The bracket matches a literal dot without
 matching the pattern text. Same trap applies to `supervisor.ts run`: a `bash -c` wrapper left over from
 launching the fleet matches it too, so compare pids against `routes.json.lock` rather than counting lines.
+
+**Before restarting a single child: is the supervisor older than the config?** On 2026-11-02 a merged PR added one
+field (`webhookId`) to `factory/repo-registry.json` while the running supervisor predated that PR. The next registry
+re-read — triggered by an ordinary child restart, inside `writeRoutes()` in the child-exit handler — threw
+`registry.repos[2]: unknown field: webhookId`, and because nothing catches it there, the throw took down both
+instances and the adapter. Until #143 lands (tolerant reload + keep-last-good routes + a version stamp on the
+daemon), treat a **shape** change to shared runtime config as a supervisor restart: change shape → restart
+supervisor → only then touch individual children. There is no version endpoint yet, so "is my daemon current?" means
+comparing its start time against `git log -1 --format=%ci` (checklist row 9). The recovery half worked as designed:
+the next boot printed `reclaimed stale supervisor lock (previous pid … is not running)` and no process orphans were
+left behind.
 
 **Restart:** `nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> log 2>&1 & disown`.
 It reads `.env` at the repo root (gitignored), and since #138 that file should define `ADAPTER_ADMIN_TOKEN` —
@@ -729,3 +751,41 @@ BACKUP DRILL PASSED
 And the honest limit: **that directory is on the same physical disk as the stores.** The drill protects against operator error, a bad migration, and store corruption — it does not survive the machine dying. Off-host copies (encrypted, e.g. `age` + object storage) are the remaining gap; until then "we have backups" means "we can recover from our own mistakes", which is what P0-4 claimed and nothing more.
 
 **Scheduling:** unattended runs belong to launchd like the delivery sweep (`com.drydock.redeliver`). Not installed yet — a backup job nobody has watched is how you find out it has been failing for a month, so if you schedule it, schedule `--keep` pruning and check the manifest after the first few runs.
+
+## 12. Running the gate battery (what has to be true first)
+
+Nine gates: `gates/g{0..5}-*.mjs`, `gates/m{1,2,4}-*.mjs`. They are not self-provisioning, and two missing
+prerequisites on 2026-11-02 both looked like product failures until the logs were read. A full pass is roughly half
+a day of wall time; run them **sequentially** — one inference endpoint serializes generations anyway, and several
+gates mutate the same fixture repo. Capture per-gate exit codes and logs rather than trusting "the script finished":
+two of tonight's nine failures were fast exits (`exit 2`) that a naive loop would have scored as done.
+
+**1. Fixture issues are consumables.** A gate needs an **open** issue describing work that is genuinely not
+implemented; a completed run merges it, so the battery eats its own targets. Symptom: G5 times out with
+`no matching open_draft_pr result within 900000ms`, or M-gates report `evidence=false` over an empty diff. Check
+first — `gh issue list --repo lalanikarim/factory-fixture --state open --json number,title`, same for
+`factory-fixture-2`. Seed from the **running app**, not from imagination: start it (`npm start`; the invoices
+fixture listens on :3000 regardless of `PORT`) and `curl` candidates until something is verifiably absent, then put
+the transcript in the issue body — that is what makes the worker's job unambiguous and what proves the gap was real.
+Label seeds `battery-seed`; do **not** label them `agent`, because G2 discovers targets by `agent` and requires each
+to carry exactly one `probe:<key>` oracle label, so an `agent`-labeled seed with no probe fails G2 for a reason that
+has nothing to do with the code under test.
+
+**2. M-gates need repo B named.** `M_REPO_A/M_ISSUE_A` and `M_REPO_B/M_ISSUE_B` are required (B has no default; the
+gate exits 2 saying so). Use `lalanikarim/factory-fixture-2` as B. M1 merges one PR per repo, so it consumes two
+issues; M4 additionally takes `M4_BUDGET_SECS` (default 120) and asserts its A-side produced **no** PR.
+
+**3. G4 targets existing draft PRs, not issues.** It refuses with `no open draft PR for agent/issue-N — run G2/G3
+first`. Point it at whatever drafts the chain produced today via `G4_T1_ISSUE` / `G4_T2_ISSUE`; the defaults (4 and 2)
+were consumed in October.
+
+**Order that worked (2026-11-02, `main` = `398385f` → `626de7a`):** G0 → G3 → G1 → G2 → M1 → M2 → M4 → G4, with G5
+last because it is the slowest and the most fixture-hungry. Results went 6 green (G0 20/20, G3 both arms, G1 draft PR
+in 190 s, G2 1/1 with zero human edits, M1 both repos simultaneously, M2 isolation, M4 budget abort), G5 and G4-T2
+red — and those two reds are harness defects with their own issues (#145 for G5's arms sharing one branch; the T2
+retry-after-SIGKILL stall still under investigation), not silent passes.
+
+**Evidence convention:** gates must not keep private copies of what a factory PR should contain. `factory/pr-evidence.ts`
+owns the required sections and pass regexes, production builds bodies from it and gates check through
+`checkEvidenceBody()` — see #144, which exists because four duplicated lists drifted and three gates failed on one
+stale heading while exactly-once merge, isolation and budget abort were all passing underneath.
