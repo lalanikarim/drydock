@@ -618,7 +618,7 @@ delivery path is unverified is a notification feature you find out about by not 
 | 6 | Nothing already holds the lock or the port | `cat fleet/data/routes.json.lock` (a bare pid; `ps -p <pid>` must fail), `lsof -nP -i :9700` | lock file absent or stale, listener port free |
 | 7 | Webhook points at the current funnel URL | `gh api repos/<repo>/hooks --jq '.[].config.url'` | URL matches `tailscale funnel status` |
 | 8 | No sandbox sidecar outlived a previous run | `podman ps --filter name=engram-sbx --format "{{.Names}} {{.Status}}"` | empty — a container bound to a worktree is an orphan too (§10) |
-| 9 | The running supervisor is not older than the tree it reads | `ps -p $(cat fleet/data/routes.json.lock) -o lstart=` vs `git log -1 --format=%ci` | daemon started after the last change to shared config shape — see #143 before restarting a single child |
+| 9 | The running supervisor is on the commit you think it is | `curl -s localhost:9700/health \| jq '{build,startedAt}'` vs `git log -1 --format=%h` | `build.sha` equals trunk; if not, restart. Also grep `fleet/data/supervisor.log` for `SERVING STALE POLICY` (#150) — that means policy edits are not live |
 
 Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
 
@@ -688,10 +688,22 @@ launching the fleet matches it too, so compare pids against `routes.json.lock` r
 field (`webhookId`) to `factory/repo-registry.json` while the running supervisor predated that PR. The next registry
 re-read — triggered by an ordinary child restart, inside `writeRoutes()` in the child-exit handler — threw
 `registry.repos[2]: unknown field: webhookId`, and because nothing catches it there, the throw took down both
-instances and the adapter. Until #143 lands (tolerant reload + keep-last-good routes + a version stamp on the
-daemon), treat a **shape** change to shared runtime config as a supervisor restart: change shape → restart
-supervisor → only then touch individual children. There is no version endpoint yet, so "is my daemon current?" means
-comparing its start time against `git log -1 --format=%ci` (checklist row 9). The recovery half worked as designed:
+instances and the adapter. **#150 fixed the failure mode** (shipped `b21da81`, running in production): reloads are now
+tolerant of fields an older build has not met, and a hard read failure keeps serving last-good routes instead of
+killing the fleet. Both paths were proven live in an isolated worktree before merge:
+
+```bash
+# additive unknown field → adopted, named in the log, supervisor alive
+[supervisor] registry ignored a field (reload from adapter-spawn): registry.repos[0]: unknown field: aFieldFromTomorrow
+# corrupt policy → NOT adopted; last-good bytes kept, one loud edge
+[supervisor] routes reload failed (adapter-spawn): cannot read repo registry at …: Expected property name or '}' …
+[supervisor] SERVING STALE POLICY — keeping routes written at 2026-11-02T12:42:39.524Z (hash 509b2706c8eb43b1); fix the registry and restart children to adopt changes
+```
+
+So a shape change no longer requires stopping the fleet first — but **if the supervisor log carries `SERVING STALE
+POLICY`, your policy edit is not live** (it is a log line, not a `/health` field — grep `fleet/data/supervisor.log`),
+and restarting individual children will not adopt it either; fix the file, then restart. "Is my daemon current?" is now a single curl instead of comparing start times (checklist row 9):
+`curl -s localhost:9700/health | jq '{build,startedAt}'` → compare `build.sha` with `git log -1 --format=%h`. The recovery half worked as designed:
 the next boot printed `reclaimed stale supervisor lock (previous pid … is not running)` and no process orphans were
 left behind.
 

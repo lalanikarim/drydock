@@ -70,4 +70,25 @@ Rules here:
 - Remote branches are deleted on merge. The local stack stays listed by `gh stack view`, marked `merged`; that is bookkeeping, not debris to clean up.
 - `unit-suite` was required and green on **each layer independently** — the review bypass did not extend to CI, which is exactly the split we want.
 
-`gh stack merge` states that *"Bypassing merge requirements is not supported for stacks"* and has **not** been tested against the admin bypass (it offers no dry run, so testing it means merging). Prefer landing from the UI. If a CLI path does refuse someday, merge layers individually — do **not** answer it by dropping the review requirement.
+`gh stack merge` states that *"Bypassing merge requirements is not supported for stacks"* — **now tested (stack #151, 2026-11-02), and it is true:**
+
+```console
+$ gh stack merge 150 --merge-method merge --yes
+Merging #149, #150 into main via merge...
+✗ merge failed: At least 1 approving review is required by reviewers with write access.
+Stack merges are atomic, so nothing was merged.        ← atomicity held; nothing partially landed
+
+$ gh pr merge 149 --admin --merge
+GraphQL: This pull request is part of a stack and must be merged using the asynchronous merge REST API.
+```
+
+So a stacked PR cannot be landed with `gh pr merge` at all — not even with `--admin`. The documented path that **does** honor an admin's existing bypass, without weakening branch protection (which remains forbidden):
+
+```bash
+# ONE layer per call, BOTTOM-UP: only the bottom-most unmerged PR in a stack may bypass.
+gh api -X PUT repos/OWNER/REPO/pulls/<bottom>/merge-async \
+  --input '{"merge_method":"merge","bypass_rules":true,"sha":"<head sha of that branch>"}'
+# → {"status":"pending","uuid":"…","bypass_rules":true}; poll with `gh pr view <n> --json state,mergedAt`
+```
+
+Merging the bottom layer makes GitHub retarget the next PR to `main` on its own (observed: #150's base went from `chore/config-driven-targets` → `main`), and both layers' remote branches were deleted on merge. Repeat per layer. Landing from the web UI still works and remains the default choice; this is the CLI fallback, and it is a **bypass the human already holds**, never an edit to the review requirement itself.
