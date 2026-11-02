@@ -76,7 +76,7 @@ test("probe edges deliver one alert each — outage, degradation, and the recove
     // Wired the way the adapter wires it: transition → notifier. No timers involved; check() drives the edges.
     const notifier = createNotifier({
       token: TOKEN,
-      chatId: "675626",
+      chatId: "123456789",
       env: { TELEGRAM_API_BASE: tg.base },
       log: (l) => logs.push(l),
     });
@@ -132,7 +132,7 @@ test("probe edges deliver one alert each — outage, degradation, and the recove
     // Exactly four alerts — no per-minute spam while the state sat unchanged.
     assert.equal(tg.messages.length, 4, tg.messages.map((m) => m.text).join(" | "));
     for (const m of tg.messages) {
-      assert.equal(m.chat_id, "675626");
+      assert.equal(m.chat_id, "123456789");
       assert.match(m.url, /^\/bot/);
     }
 

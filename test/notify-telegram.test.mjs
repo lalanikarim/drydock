@@ -20,7 +20,10 @@ const { openDraftPrTool } = await import("../factory/open-draft-pr.ts");
 const { RefusalBudget } = await import("../factory/refusal-budget.ts");
 
 const TOKEN = "123456:AA-secrets-not-for-logs";
-const CHAT = "8355675626";
+// A syntactically valid Telegram chat id, and not anybody's. This line held the operator's real chat id until
+// 2026-11-03 — in a public repository. Nothing needs the real value: every assertion here is about what we put on
+// the wire, so an invented id tests exactly as well. `TELEGRAM_CHAT_ID` belongs in `.env`/launchd and nowhere in git.
+const CHAT = "123456789";
 
 function res(status, body = "") {
   return { ok: status >= 200 && status < 300, status, text: async () => body };

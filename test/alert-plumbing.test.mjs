@@ -84,7 +84,7 @@ test("the same event retried on the same path still dedupes; different reasons d
 test("outage then recovery sends TWO messages; repeating the same state sends one", async () => {
   const { calls, fetchImpl } = fakeTelegram([{ ok: true, messageId: 10 }, { ok: true, messageId: 11 }, { ok: true, messageId: 12 }]);
   const lines = [];
-  const notify = createNotifier({ token: TOKEN, chatId: "675626", fetchImpl, log: (l) => lines.push(l) });
+  const notify = createNotifier({ token: TOKEN, chatId: "123456789", fetchImpl, log: (l) => lines.push(l) });
 
   const down = { kind: "inference_state", state: "unreachable", reachable: 0, total: 1 };
   const back = { kind: "inference_state", state: "reachable", reachable: 1, total: 1 };
@@ -95,7 +95,7 @@ test("outage then recovery sends TWO messages; repeating the same state sends on
   assert.equal(calls.length, 2, "one per distinct edge, not one per call");
   assert.match(calls[0].body.text, /inference unreachable \(0\/1/);
   assert.match(calls[1].body.text, /inference reachable \(1\/1/);
-  assert.equal(calls[0].body.chat_id, "675626");
+  assert.equal(calls[0].body.chat_id, "123456789");
 });
 
 test("a successful send is logged with Telegram's message id — silence used to hide health and misconfiguration alike", async () => {
