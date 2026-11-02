@@ -9,7 +9,33 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 > cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
 > newer document references by number (queue 7, 8b, 11, 13).
 
-# Sixth refresh — 2026-11-03 (later) (current)
+# Seventh refresh — 2026-11-03 (G5 measures for the first time) (current)
+
+Against `main` = `eb6f24a`. Suite **484 tests / 483 pass / 0 fail** (one pre-existing skip). Fleet stays on `e4d89e1`: #167 changed gates, tests and docs only, so there is nothing new to run in production — deploying unchanged code would be motion, not progress.
+
+- **#145 shipped (#167)** — G5's two arms are now required to be **different issues**, each diffed from its own merge base, with an empty diff a hard failure ("nothing measured") instead of a verdict. Fix classification is structural (`gates/fix-pattern.mjs`) and anchored to three **captured** diffs: the 7bdb147 handler patch, 33ac879's typed error, and PR #57's shared rule — the last of which the old one-regex detector could never have accepted. A third defect was found mid-rewrite: the override wrote `lessons:{enabled,file}`, `ghCliPath`, `pipelineModelId`, `reviewerModelId`, `refine`, none of which are config fields, so arm B would have run **lesson-less** even with isolated arms.
+- **The first real G5 measurement is a legitimate failure.** Baseline (fixture #62) → PR #64 in 233 s, `handlerPatch=true`; lessons arm (#63, equivalent defect in the batch path) → PR #65 in 98 s, also `handlerPatch=true`. Delivery was verified rather than assumed — arm B's durable store entry carries the trusted `Standing factory lessons` section verbatim — so **the lesson reached the worker and did not change what it did.** That finding is #168.
+- **Prerequisites that were silently broken:** fixture `main` was red (an exact-equality pin on error prose no spec fixes; fixture #60, fixed in fixture PR #61, suite now 123/123), and both historical traps had already been consumed — every error class in the fixture carries a status code now, so "add statusCode to the domain error" is not an available mistake. New pair authored from curl transcripts against the running app. Seeding rules are runbook §12 item 5.
+- **#169 filed** — `refusal` came back `unknown` for both arms even though both PRs landed: `open_draft_pr`'s outcome was never captured through the intake-driven path. Permanent unknown is the same blind spot as coercing to false, with better error handling.
+
+| # | Item | Owner | Why this rank | Done when |
+|---|---|---|---|---|
+| 1 | **#164 + #157 — worker teardown faults and stale reservations** | 🤖 | Production-side correctness: `erased(...).abort is not a function` on two workers, and reservations that outlive a SIGKILL'd owner. Plausibly one bug; both misreport what the fleet actually did. | Reproduced, owner decided (kernel vs ours), fixed or upstreamed with the stack — not closed on a hypothesis. |
+| 2 🆕 | **#168 — the lesson reached the prompt and changed nothing** | 🤖 | This is the question the feedback loop exists to answer, and it now has a harness that can answer it honestly. Cheapest experiment first: a lesson containing an imitable code shape, same trap pair. | Two hypotheses tested with per-arm artifacts recorded; conclusion stated either way, including "prompt-side lessons do not close this loop". |
+| 3 | **#147 — G4 T2 stalled once (900 s), passed in 48 s on re-run** | 🤖 | Turns a flake into a diagnosable event; #153's `settled` reporting gives it somewhere to come from. | Timeout path prints a task snapshot; test asserts the diagnostic exists. |
+| 4 🆕 | **#169 — G5's refusal state is permanently unknown** | 🤖 | Small, and it degrades the only outcome signal that distinguishes "chose not to open" from "never got there". | Reads the state correctly or derives it from observable effects, with a test over real subprocess/store artifacts. |
+| 5 | **#161 follow-up — route a `no_model` settlement into the #160 inference edge** | 🤖 | Preparedness, not triage: zero `no_model` rows have ever been recorded. | Triggers the inference alert path, proven with a real submission rather than a stub. |
+| 6 | **§3.9 T1 partial-run recovery (C4)** | 🤖 | Pairs with #141's durable stop: preserve branch, mark resumable, requeue once with the diff as context. | A resumed run consumes its prior diff and does not re-implement landed work. |
+| 7 | **#110 — shutdown can leave a child handle open** | 🤖 | Mitigated three times over; no symptom since. | Reproduce with the coordinator in place, or close as superseded with reasoning. |
+| 8 | **E4 per-task token annotation (§5.17)** | 🤖 | Battery numbers were assembled by hand (G2: 281,520 tokens). | Every task row carries its own count without reconstruction. |
+| 9 | **C5 release checklist** | 🤖 | Now also carries the alert drill (§8) and settlement window (§7d). | One page, commands run as written. |
+| 10 | **#78 App reach residual · #42 Target 2 doc · #41 upstream PR** | 🧑 | Credential/click/upstream work; #41 on hold per its own note. | Unchanged. |
+
+**Battery: 8 of 9 green, and G5's red is now a finding rather than a harness artifact.** Re-running it costs a freshly authored equivalent trap pair each time (runbook §12 item 5) — traps are consumables and a merged arm moves fixture `main`. **Accepted, not queued:** fixture protection posture (R14).
+
+---
+
+# Sixth refresh — 2026-11-03 (later) (superseded by the seventh)
 
 Against `main` = `5b3afb6`. Suite **465 pass / 0 fail**. Fleet still on `e4d89e1`: #165 added a ledger module and a gate that nothing in the runtime imports, so no restart was warranted — running code unchanged is a reason not to deploy, not a reason to deploy anyway.
 
