@@ -235,6 +235,7 @@ Concrete enough to check against `research/work-queue.md`: every in-flight item 
 | R10 | ~~Enumerated `npm test` silently skipped suites~~ — **CLOSED by #102**: discovery is structural and a guard fails on an empty or partial match | C1/C2-rev trust an exit code, so the suite list is load-bearing | The list had dropped `test/git-identity.test.mjs`: it passed when run directly and appeared in no CI job, which is part of how the #87 regression (#98) shipped green. Lesson generalizes R6(b): **a gate that trusts a command must also verify what that command collects** — "not collected" and "passing" are the same color. `test/suite-discovery.test.mjs` asserts pattern-based discovery, disk-vs-collected set equality, and non-zero collection |
 | R11 | A self-task can be **unsatisfiable by construction** while every individual control behaves correctly, and the run has no budget to notice | path scope + enumerated suites + no retry cap (#100) | Issue #99: worker adds a test → registering it needs `package.json` → allowlist refuses → root agent re-delegates → six full worker+review cycles on an identical refusal, stopped by hand. Three separate layers behaved; only the composition was wrong. Mitigations: #102 (the trap), #103 (worker is told its scope up front). **CLOSED by #100**: refusals are classified (`path_scope` non-retryable, `verification`/`review` retryable, `infrastructure` never charged) and two ceilings stop a run — 2 identical signatures or 4 counted refusals per issue — enforced at the top of `open_draft_pr` so a stopped run costs no clone, no test command and no reviewer inference. Residual: the budget is per-process memory (a restart clears it by design), and it cannot distinguish an unsatisfiable task from a merely hard one — only that a refusal repeated (§5.22) |
 | R6 | Two latent fail-open coercions found while implementing C1 — both now fixed, kept here as the lesson | registry validation | (a) `Boolean("false") === true`, so a JSON typo like `"autoMerge": "false"` would have **granted** merge rights; safety flags are now type-checked. (b) A nested `node --test` inheriting `NODE_TEST_CONTEXT` skips every file and exits 0 — a green verification with zero tests behind it; the child env is stripped and zero collected tests is treated as failure. Both were found by testing, not review: suspect this class of bug in any flag coerced with `Boolean()` or any gate that trusts an exit code alone |
+| R14 | **The fixture repos have no protection on `main`.** `lalanikarim/factory-fixture` and `factory-fixture-2` accept merges with no required checks and no reviews, and inherit `autoMerge: true`, so anything the factory lands there is landed unprotected — including by a run that was wrong. | **Accepted in writing on 2026-11-02 by the operator**, and it is load-bearing rather than convenient: `autoMerge:false` removes `merge_pr` from the toolset entirely (`factory/main.ts`, `factory/pipeline.ts`), so G1/G4 and #67 rework would stop at a draft PR and the gates that prove merge-gate behavior could not run unattended. GitHub rulesets answer `403 Upgrade to GitHub Pro` for these repos, so "add protection" is not on the current plan. | Scope is what keeps it survivable: fixtures hold disposable battery targets, no product code, and are a deployment source for nothing — and neither fixture is a supervisor child today, so the exposure exists only while a battery run has its instance up (which is exactly when merges happen). Revisit when the account gains rulesets, when a fixture is ever pointed at real code, or when a gate's claim starts *depending* on protection — and then move the fixtures to where protection exists instead of turning auto-merge off and losing the battery. |
 
 ---
 
@@ -318,3 +319,48 @@ Wiring `/factory` comments live produced an unrelated and more interesting findi
 **Deliberate non-action.** The 34 failures were reviewed and **not** re-driven: they belong to issues already resolved or closed by hand during the outage window, and bulk redelivery would have dispatched work for dead tickets. Recovery is surgical from here — that is why `--only` exists and why the default is a report.
 
 **Still open:** putting the sweep on a schedule (a cadence decision plus a cron/launchd unit), and explaining why a child handle keeps the loop alive at shutdown — today that is bounded to 3s by a ref'd deadline rather than understood.
+
+
+---
+
+## 2026-11-02 — accepting R14: unprotected fixture `main`
+
+The work queue's rank 1 asked for a decision on the two battery fixture repos. The operator's answer was to
+**live with no branch protection on their `main`**, so it becomes a recorded risk rather than a task, and the
+difference matters: a task implies someone can close it.
+
+**What was verified before writing it down** (not from memory — the record is only worth as much as its evidence):
+
+```console
+$ gh api repos/lalanikarim/factory-fixture/branches/main --jq '.protection'
+{"enabled":false,"required_status_checks":{"checks":[],"contexts":[],"enforcement_level":"off"}}
+
+$ gh api repos/lalanikarim/factory-fixture/branches/main/protection
+{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.", …}
+$ gh api repos/lalanikarim/factory-fixture/rulesets
+{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.", …}
+
+$ python3 -c "import json;print(json.load(open('factory/repo-registry.json'))['defaults'])"
+{'eligibilityLabel': 'agent', 'autoMerge': True, 'enabled': True}   # fixture entries do not override autoMerge
+```
+
+Identical on `factory-fixture-2`. So: protection is genuinely absent, protection is **not obtainable** on the
+current plan, and `autoMerge` is inherited `true`.
+
+**Why this is a trade and not an oversight.** The unattended battery depends on auto-merge. Setting
+`autoMerge:false` for a repo removes `merge_pr` from that instance's toolset entirely (`factory/main.ts` gates
+the tool list on the policy; `orchestratorInstructions`/`intakeToolNames` do the same), so G1, G4 and the #67
+rework flow would stop at a draft PR waiting for a human — which is precisely the thing the battery exists to
+prove happens without one. The alternative that keeps both properties is a host where rulesets exist, and that
+is a plan/organization change, not a code change.
+
+**What bounds the damage.** Fixtures contain throwaway targets written by the factory for the factory; nothing
+there is consumed by a deployment, and no real repo's history can be rewritten through them. The residual that
+remains after those bounds is *signal* rather than integrity: a bad merge into a fixture can make a gate look
+wrong in either direction, which is why fixture hygiene already shows up as harness defects (#145) instead of
+incidents.
+
+**Triggers to re-open this row:** a fixture pointed at code that matters; the account gaining rulesets; or a
+gate whose claim starting to depend on protection existing (at which point the gate is lying and must be fixed
+or moved). Do not answer any of these by flipping `autoMerge:false` in place — that trades an integrity risk for
+a silent loss of coverage, which is the worse of the two.
