@@ -16,6 +16,13 @@ import { defineTool, type Context, type ToolExecutionApi, type ToolTask } from "
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
 import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
+import {
+  DIFF_SUMMARY_HEADING,
+  REVIEW_HEADING,
+  REVIEWER_CONCERNS_HEADING,
+  VERIFICATION_HEADING,
+  WORKER_REPORT_HEADING,
+} from "./pr-evidence.ts";
 import { RefusalBudget, terminalRefusalPayload, type RefusalSignal } from "./refusal-budget.ts";
 import { buildPrReport, classifyPush, type PrReportFacts } from "./pr-report.ts";
 import type { Notifier } from "./notify-telegram.ts";
@@ -87,7 +94,7 @@ export interface ReviewVerdict {
 /** G4 evidence packager: every non-obvious section of the PR body, assembled from
  *  host-verified facts (diff, suite counts) plus the reviewer verdict and the
  *  worker's final report from the transcript. */
-function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification }: {
+export function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, workerReport, log, requireVerification }: {
   issueNumber: number;
   summary: string;
   verdict: ReviewVerdict;
@@ -104,22 +111,22 @@ function buildPrBody({ issueNumber, summary, verdict, tests, diffStatText, worke
     "",
     summary,
     "",
-    "## Diff summary",
+    DIFF_SUMMARY_HEADING,
     "```",
     diffStatText,
     "```",
     "",
-    "## Independent review (read-only subagent)",
+    REVIEW_HEADING,
     verdict.verdict === "pass" ? "PASS" : `FAIL (${verdict.verdict})`,
     evidence,
     "",
-    "Reviewer concerns:",
+    REVIEWER_CONCERNS_HEADING,
     concerns,
     "",
-    "## Verification (host-run at PR creation, decision C1)",
+    VERIFICATION_HEADING,
     formatVerificationEvidence(tests, { requireVerification }),
     "",
-    "## Worker report (transcript excerpt)",
+    WORKER_REPORT_HEADING,
     "```",
     workerReport ?? log,
     "```",
