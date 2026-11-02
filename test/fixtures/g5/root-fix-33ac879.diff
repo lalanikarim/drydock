@@ -1,0 +1,35 @@
+commit 33ac8799d5f05497adfda37f866443b877126a11
+Author: factory-worker <factory-worker@localhost>
+Date:   Wed Oct 28 21:21:50 2026 +0000
+
+    Return 400 for unknown status on PUT /invoices/:id/status via UnknownStatusError
+
+diff --git a/src/store.mjs b/src/store.mjs
+index 80c8707..4e625a1 100644
+--- a/src/store.mjs
++++ b/src/store.mjs
+@@ -19,6 +19,15 @@ export class InvalidTransitionError extends Error {
+   }
+ }
+ 
++export class UnknownStatusError extends Error {
++  constructor(status) {
++    super(`unknown status: ${status}`);
++    this.name = "UnknownStatusError";
++    this.statusCode = 400;
++    this.status = status;
++  }
++}
++
+ export class InvoiceNotFoundError extends Error {
+   constructor(id) {
+     super(`invoice ${id} not found`);
+@@ -71,7 +80,7 @@ export class LedgerStore {
+     const invoice = this.invoices.get(id);
+     if (!invoice) throw new InvoiceNotFoundError(id);
+     if (!STATUSES.has(status)) {
+-      throw new TypeError(`unknown status: ${status}`);
++      throw new UnknownStatusError(status);
+     }
+     if (!TRANSITIONS[invoice.status].has(status)) {
+       throw new InvalidTransitionError(invoice.status, status);

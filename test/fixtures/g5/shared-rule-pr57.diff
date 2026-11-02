@@ -1,0 +1,155 @@
+diff --git a/README.md b/README.md
+index 731f937..b2e58cc 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ Requires Node >= 22.19. No dependencies.
+ | Route | Method | Description |
+ |---|---|---|
+ | `/health` | GET | Liveness check |
+-| `/invoices` | POST | Create invoice `{ customerId, amountCents }` → `201` with the stored invoice |
++| `/invoices` | POST | Create invoice `{ customerId, amountCents, status? }` → `201` with the stored invoice; unknown body fields are rejected with `400` `{ "error": "unsupported field: <name>" }` naming the first offending key (same rule as `PATCH /invoices/:id`) |
+ | `/invoices/batch` | POST | Atomic bulk create `{ invoices: [ { customerId, amountCents }, … ] }` → `201` with `{ invoices: […] }` in request order; if any element is invalid nothing is created and the response is `400` naming the offending index (e.g. `"invoices[1]: amountCents must be a positive integer"`); empty array, non-array, or missing `invoices` → `400` |
+ | `/invoices` | GET | List invoices as `{ invoices, totalCount }`; `totalCount` is the number of invoices matching the active `?status=`/`?customer=` filters before `?limit=N`/`?offset=N` pagination (non-positive/non-integer `limit` or negative/non-integer `offset` → 400) |
+ | `/invoices/:id` | GET | Fetch one invoice |
+@@ -35,6 +35,11 @@ may not match every item — mismatches are tracked as GitHub issues.
+ 
+ - **Unknown invoice ids.** `GET /invoices/:id` for an id that does not exist
+   should return `404` with a JSON error body, not a server error.
++- **Unknown body fields.** `POST /invoices` and `PATCH /invoices/:id` must
++  reject bodies containing fields other than the ones they accept (`customerId`,
++  `amountCents`, `status` for create; `amountCents` for update) with `400`
++  `{ "error": "unsupported field: <name>" }` naming the first offending key in
++  body order. Rejected requests create or change nothing (no id consumed).
+ - **Status transitions.** Only `open -> paid` and `open -> voided` are valid;
+   anything else must be rejected with a client-facing error (4xx) and an
+   explanatory message.
+diff --git a/src/invoices.mjs b/src/invoices.mjs
+index a513369..dfa47a6 100644
+--- a/src/invoices.mjs
++++ b/src/invoices.mjs
+@@ -35,8 +35,41 @@ function sendJson(res, status, body) {
+   res.end(JSON.stringify(body));
+ }
+ 
++// Thrown when a request body contains a field the endpoint does not accept.
++class UnsupportedFieldError extends Error {
++  constructor(field) {
++    super(`unsupported field: ${field}`);
++    this.name = "UnsupportedFieldError";
++    this.statusCode = 400;
++    this.field = field;
++  }
++}
++
++// The body fields each invoice endpoint accepts. Both the create and update
++// paths go through rejectUnknownFields with these sets, so "is this field
++// allowed" lives in one place and cannot drift into two implementations.
++const CREATE_FIELDS = new Set(["customerId", "amountCents", "status"]);
++const UPDATE_FIELDS = new Set(["amountCents"]);
++
++// Rejects the first unknown body key (in JSON document order) with a 400
++// naming it: { "error": "unsupported field: <name>" }. Known-field
++// validation is left to store.add / store.setAmount.
++function rejectUnknownFields(body, allowed) {
++  for (const key of Object.keys(body)) {
++    if (!allowed.has(key)) {
++      throw new UnsupportedFieldError(key);
++    }
++  }
++}
++
+ export async function createInvoice(store, req, res) {
+   const body = await readJsonBody(req);
++  // Unknown fields are rejected before known-field validation so a typo'd
++  // field is named instead of silently dropped. Non-object bodies keep the
++  // existing behavior (store.add reports them).
++  if (body !== null && typeof body === "object" && !Array.isArray(body)) {
++    rejectUnknownFields(body, CREATE_FIELDS);
++  }
+   let invoice;
+   try {
+     invoice = store.add(body);
+@@ -143,11 +176,8 @@ export async function updateInvoiceAmount(store, req, res, id) {
+   if (body === null || typeof body !== "object" || Array.isArray(body)) {
+     throw Object.assign(new Error("request body must be a JSON object"), { statusCode: 400 });
+   }
+-  for (const key of Object.keys(body)) {
+-    if (key !== "amountCents") {
+-      throw Object.assign(new Error(`unsupported field: ${key}`), { statusCode: 400 });
+-    }
+-  }
++  // Same unknown-field rule as POST /invoices, from the shared helper.
++  rejectUnknownFields(body, UPDATE_FIELDS);
+   let invoice;
+   try {
+     invoice = store.setAmount(id, body.amountCents);
+diff --git a/test/api.test.mjs b/test/api.test.mjs
+index a243090..ea7b6b9 100644
+--- a/test/api.test.mjs
++++ b/test/api.test.mjs
+@@ -811,6 +811,65 @@ test("invalid create invoice bodies do not create invoices (regression)", async
+   assert.equal(after.body.invoiceCount, before.body.invoiceCount);
+ });
+ 
++test("POST /invoices with an unknown field returns 400 naming it and creates nothing", async () => {
++  const before = await api("GET", "/invoices");
++  const res = await api("POST", "/invoices", { customerId: "unknown-field-c1", amountCents: 100, foo: true });
++  assert.equal(res.status, 400);
++  assert.equal(res.body.error, "unsupported field: foo");
++  // Nothing created: list unchanged and no such customer exists.
++  const after = await api("GET", "/invoices");
++  assert.equal(after.body.totalCount, before.body.totalCount);
++  assert.ok(!after.body.invoices.some((i) => i.customerId === "unknown-field-c1"));
++});
++
++test("POST /invoices names the first unknown field in body order", async () => {
++  const res = await api("POST", "/invoices", { customerId: "c1", zeta: 1, amountCents: 100, alpha: 2 });
++  assert.equal(res.status, 400);
++  assert.equal(res.body.error, "unsupported field: zeta");
++});
++
++test("POST /invoices rejection does not consume an id", async () => {
++  const first = await api("POST", "/invoices", { customerId: "id-reserve-a", amountCents: 100 });
++  assert.equal(first.status, 201);
++  const rejected = await api("POST", "/invoices", { customerId: "id-reserve-b", amountCents: 100, dueDate: "2026-01-01" });
++  assert.equal(rejected.status, 400);
++  assert.equal(rejected.body.error, "unsupported field: dueDate");
++  const second = await api("POST", "/invoices", { customerId: "id-reserve-c", amountCents: 100 });
++  assert.equal(second.status, 201);
++  // The rejected request consumed no id: the next create gets first.id + 1.
++  assert.equal(second.body.id, first.body.id + 1);
++});
++
++test("POST /invoices still accepts exactly the known fields (customerId, amountCents, status)", async () => {
++  const res = await api("POST", "/invoices", { customerId: "known-fields-c1", amountCents: 75, status: "open" });
++  assert.equal(res.status, 201);
++  assert.equal(res.body.customerId, "known-fields-c1");
++  assert.equal(res.body.amountCents, 75);
++  assert.equal(res.body.status, "open");
++});
++
++test("POST /invoices known-field validation errors keep their messages and status codes", async () => {
++  const cases = [
++    [{}, "customerId must be a non-empty string"],
++    [{ customerId: "c1", amountCents: -5 }, "amountCents must be a positive integer"],
++    [{ customerId: "c1", amountCents: 100, status: "bogus" }, "unknown status: bogus"],
++  ];
++  for (const [body, message] of cases) {
++    const res = await api("POST", "/invoices", body);
++    assert.equal(res.status, 400);
++    assert.equal(res.body.error, message);
++  }
++});
++
++test("PATCH and POST reject unknown fields with the same message shape", async () => {
++  const created = await api("POST", "/invoices", { customerId: "shared-rule-c1", amountCents: 100 });
++  const post = await api("POST", "/invoices", { customerId: "c1", amountCents: 100, sneaky: true });
++  assert.equal(post.body.error, "unsupported field: sneaky");
++  const patch = await api("PATCH", `/invoices/${created.body.id}`, { amountCents: 500, sneaky: true });
++  assert.equal(patch.status, 400);
++  assert.equal(patch.body.error, "unsupported field: sneaky");
++});
++
+ test("oversized request body on POST /invoices is rejected with 413 and JSON error", async () => {
+   const res = await fetch(`http://127.0.0.1:${ctx.port}/invoices`, {
+     method: "POST",

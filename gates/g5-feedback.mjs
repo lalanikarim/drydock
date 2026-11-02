@@ -1,215 +1,317 @@
-// Phase 2 battery — Gate G5: feedback loop ("the same mistake doesn't recur").
-// Production entrypoint (factory/main.ts child processes via gates/lib.ts).
-//
-// The anchor finding (from a real prior run): on issue #11 (PR #12) the worker
-// fixed "validation errors surface as 500" with a HANDLER-LEVEL patch —
-// `catch (e) { if (e instanceof TypeError) throw Object.assign(new Error(...), { statusCode: 400 }) }`
-// in createInvoice — instead of giving the error class a statusCode like
-// InvoiceNotFoundError already has. The independent reviewer flagged exactly
-// this fragility ("if store.add ever throws a non-TypeError validation error,
-// it would again surface as 500").
-//
-// Similar issue for the re-run: fixture issue #13 — invalid status transitions
-// return 500 (InvalidTransitionError has no statusCode) against the README's
-// 4xx spec. The naive fix is the same handler-level patch; the corrected
-// behavior is a root-level fix (statusCode on the error class).
-//
-// Experiment:
-//   Step A (baseline, lessons file empty): work directive for issue #13.
-//     Record the reviewer verdict + objective classification of the fix pattern
-//     (rootFix vs handlerPatch) from a fresh clone's diff.
-//   Lesson: ensure one standing lesson is recorded via note_lesson (the
-//     orchestrator does this on refusal per its instructions; if it skipped,
-//     the battery — acting as the human driver — submits a trusted instruction
-//     to record the distilled finding. This is counted as an intervention.)
-//   Step B (lessons active): fresh store, same lessons file, work directive
-//     for issue #13 again. Expect review PASS and objective root-level fix.
-//
-// G5 passes when: the lesson was recorded durably AND step B's review passed
-// AND step B's diff shows the root-level fix (no handler patch). Attribution
-// strength is reported separately: "strong" if step A exhibited the handler
-// patch that then disappeared, "single-trial" otherwise.
-//
-// Usage: node --experimental-strip-types gates/g5-feedback.mjs  (env: G5_ISSUE=19)
-
+#!/usr/bin/env npx tsx
+/**
+ * G5 — does a recorded lesson change what the worker does?
+ *
+ * Run twice against the same model on two **equivalent** trap issues: arm A with an empty lessons file, arm B with one
+ * lesson recorded. If the feedback loop works, A reproduces the anti-pattern and B fixes the rule at its source.
+ *
+ * ```
+ * npx tsx gates/g5-feedback.mjs --repo lalanikarim/factory-fixture --issue-a 62 --issue-b 63
+ * npx tsx gates/g5-feedback.mjs --repo ... --issue-a .. --issue-b .. --keep     # keep clone/logs/lessons
+ * ```
+ * Roughly 10-40 minutes: two full worker+reviewer runs against the local inference node. It consumes its traps —
+ * whichever arm produces a PR has it merged into the fixture by the fixture's own policy, so re-running needs a fresh
+ * equivalent pair (see gates/g5-traps.mjs).
+ *
+ * ## Why this file was rewritten (#145)
+ *
+ * The previous version ran **both arms against one issue**. Arm A created `agent/issue-N` and its PR; arm B spawned a
+ * fresh instance for the same issue, which found the work already done and produced nothing. Arm B's diff was then
+ * computed as `origin/main..origin/agent/issue-N` — arm A's commit — so the two "arms" were one artifact measured
+ * twice, and the gate printed "attribution=strong" over a measurement of nothing.
+ *
+ * Two more defects lived here, both silent:
+ *
+ * - Its fix detector looked for one string in one file (`this.statusCode = 4\d\d` in `src/store.mjs`) — the shape
+ *   issue #19's fix happened to take. A correct fix that validated input once in a shared place could not satisfy it,
+ *   so the gate could never have passed on new data. Classification now lives in `gates/fix-pattern.mjs` and is tested
+ *   against three real captured diffs (`test/g5-harness.test.mjs`).
+ * - It wrote a config override containing `lessons: { enabled, file }`, plus `ghCliPath`, `pipelineModelId`,
+ *   `reviewerModelId`, `refine`. None of those are config fields; `loadFactoryConfig` throws on unknown fields at
+ *   boot. The field the worker reads is `lessonsFile`, so arm B would have run with no lesson even if everything else
+ *   had worked.
+ *
+ * ## What is enforced now
+ *
+ * - Two issues, two branches, two PRs — required, checked before anything spawns (`preflightArms` in g5-traps.mjs),
+ *   and the run fails if an arm produced an empty diff or both arms resolved to one artifact. "Nothing measured" is a
+ *   failure, never a pass.
+ * - Each arm's diff is `merge-base(main, its own branch)..its own branch`, captured per arm — never `main..branch`
+ *   after the fact, because A merging moves main underneath B and silently changes what B's diff contains.
+ * - A refusal is read from `open_draft_pr`'s tool result as three states (refused / not refused / unknown). Treating
+ *   "no outcome" as "did not refuse" made an unfinished run look clean.
+ * - Traps are described by symptom only, never by where the fix belongs — an issue that says "fix this in the domain
+ *   layer" measures instruction-following, not the lesson.
+ */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { loadFactoryEnv, spawnInstance, postTask, rootConversationId, waitForToolResult } from "./lib.ts";
-import { defaultConfigPathFor } from "../factory/factory-config.ts";
+import { tmpdir } from "node:os";
+import { startIntakeServer } from "../factory/intake.ts";
+import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, waitForToolResult } from "./lib.ts";
+import { classifyFixPattern, formatClassification } from "./fix-pattern.mjs";
+import { contractFor, preflightArms, armBranch } from "./g5-traps.mjs";
 
-const pexec = promisify(execFile);
-loadFactoryEnv();
-const fixturesRepo = process.env.FIXTURES_REPO ?? "lalanikarim/factory-fixture";
-
-const ISSUE = Number(process.env.G5_ISSUE ?? 19);
-const runDir = mkdtempSync(join(tmpdir(), "gates-g5-"));
-const LESSONS_FILE = join(runDir, "g5-lessons.md");
-
-// Distilled lesson used by the human-driver fallback when the orchestrator does
-// not record one itself. Derived from the PR #12 reviewer concern (issue #11).
-const FALLBACK_LESSON =
-  `Fix error-status bugs at the root: give the thrown error class a statusCode property (as InvoiceNotFoundError does for issue #11), not an instanceof/catch-and-rethrow patch in the route handler.`;
-
-let failures = [];
-function fail(msg) {
-  failures.push(msg);
-  console.error(`FAIL: ${msg}`);
-}
-
-const parseJsonLoose = (text) => {
-  const i = text.indexOf("{");
-  if (i < 0) return null;
-  try { return JSON.parse(text.slice(i)); } catch { return null; }
+const exec = promisify(execFile);
+const argv = process.argv.slice(2);
+const flagValue = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
 };
 
-/** Objective classification of the fix on agent/issue-N vs origin/main (fresh clone). */
-async function classifyFix({ issueNumber }) {
-  const dir = mkdtempSync(join(tmpdir(), "g5-clone-"));
+const REPO = flagValue("--repo") ?? process.env.G5_REPO;
+const ISSUE_A = flagValue("--issue-a") ?? process.env.G5_ISSUE_A;
+const ISSUE_B = flagValue("--issue-b") ?? process.env.G5_ISSUE_B;
+const KEEP = argv.includes("--keep");
+const ALLOW_STALE = argv.includes("--allow-stale-branches");
+const TIMEOUT_MS = Number(process.env.G5_TIMEOUT_MS ?? 45 * 60_000);
+const POLL_MS = 20_000;
+
+/**
+ * The one thing arm B gets and arm A does not.
+ *
+ * Formatted the way `note_lesson` writes (`- [date] text`) because that content is handed to the worker prompt
+ * verbatim by `readLessons`. It names no file, no issue, and no fixture: a lesson that says "in src/store.mjs add
+ * statusCode" is an instruction for one historical bug, and whether a worker follows instructions is not the feedback
+ * loop.
+ */
+const LESSON_TEXT =
+  "- [2026-11-03] When an API returns the wrong status or an internal error string for client input, fix the rule where the error originates — give the domain error a type that carries its own status, or enforce the check once in a place every path calls. Do not translate errors with instanceof/catch in one request handler: the other paths keep the bug.";
+
+const ARMS = [
+  { label: "A", kind: "baseline", issue: ISSUE_A, lessons: false },
+  { label: "B", kind: "with-lessons", issue: ISSUE_B, lessons: true },
+];
+
+const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
+
+function die(msg) {
+  console.error(`\n=== G5 FEEDBACK EXPERIMENT — FAIL ===\n${msg}\n`);
+  process.exit(1);
+}
+
+async function gh(args, opts = {}) {
   try {
-    await pexec("git", ["clone", "-q", `https://github.com/${fixturesRepo}.git`, dir], { timeout: 90_000 });
-    const branch = `origin/agent/issue-${issueNumber}`;
-    await pexec("git", ["fetch", "-q", "origin", `agent/issue-${issueNumber}:refs/remotes/${branch}`], { cwd: dir, timeout: 60_000 });
-    const storeDiff = (await pexec("git", ["diff", `origin/main..${branch}`, "--", "src/store.mjs"], { cwd: dir })).stdout;
-    const invoicesDiff = (await pexec("git", ["diff", `origin/main..${branch}`, "--", "src/invoices.mjs"], { cwd: dir })).stdout;
-    // root-level fix: a statusCode=4xx line added to src/store.mjs (error class carries the status)
-    const rootFix = /^\+\s+this\.statusCode\s*=\s*4\d\d/m.test(storeDiff);
-    // handler-level patch: new instanceof or catch-with-status in the route handler
-    const handlerPatch = /instanceof/.test(invoicesDiff) || (/^\+.*catch/m.test(invoicesDiff) && /400|409|statusCode/.test(invoicesDiff));
-    return {
-      rootFix,
-      handlerPatch,
-      storeDiff: storeDiff.slice(0, 1500),
-      invoicesDiff: invoicesDiff.slice(0, 1500),
-    };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    const { stdout } = await exec("gh", args, { env: { ...process.env, GH_MAX_CONCURRENCY: "1" }, ...opts });
+    return { out: stdout, code: 0 };
+  } catch (e) {
+    if (opts.allowFail) return { out: String(e.stdout ?? ""), err: String(e.stderr ?? e.message), code: 1 };
+    throw e;
   }
 }
 
-// Per-run factory config override: both steps share ONE lessons file even though
-// each gets a fresh instance root/store.
-// Runtime config is outside the tree now ($DRYDOCK_CONFIG_DIR); resolve it the way the factory does rather
-// than reaching for a path in the checkout that no longer exists.
-const baseCfgPath = new URL(`file://${defaultConfigPathFor(fixturesRepo)}`);
-const cfg = JSON.parse(readFileSync(baseCfgPath, "utf8"));
-cfg.lessonsFile = LESSONS_FILE;
-const cfgPath = join(runDir, "factory-config-override.json");
-writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+/** Both arms get a lessons file — only arm B's has content. Same config shape either way. */
+function writeLessonsFile(runDir, label, enabled) {
+  const p = join(runDir, `g5-lessons-${label}.md`);
+  writeFileSync(p, enabled ? `${LESSON_TEXT}\n` : "");
+  return p;
+}
 
-async function runStep({ label, issueNumber }) {
-  const instance = await spawnInstance({ repo: fixturesRepo, configPath: cfgPath });
-  let draftText = null;
-  let noteLessonResult = null;
-  let lessonIntervention = false;
+/** Deliver one issue through the real intake path, exactly as G2/G3 do. */
+async function deliverIssue({ instance, runDir, repo, issueNumber, label }) {
+  const dispatch = async ({ requestId, content }) => {
+    const res = await fetch(`${instance.base}/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${instance.token}` },
+      body: JSON.stringify({ requestId, content }),
+    });
+    if (!res.ok) throw new Error(`factory /tasks returned ${res.status}`);
+    return res.json();
+  };
+  const { server, port } = await startIntakeServer({ logPath: join(runDir, `intake-arm-${label}.jsonl`), dispatch });
+
+  const { out: titleOut } = await gh(["api", `repos/${repo}/issues/${issueNumber}`, "--jq", ".title"]);
+  const { out: bodyOut } = await gh(["api", `repos/${repo}/issues/${issueNumber}`, "--jq", ".body // \"\""]);
+  const event = {
+    action: "opened",
+    delivery_id: `g5-${label}-${issueNumber}-${Date.now()}`,
+    repository: { full_name: repo },
+    // The label is what makes intake treat this as work; identical in both arms.
+    issue: { number: Number(issueNumber), title: titleOut.trim(), body: bodyOut, labels: [{ name: "agent" }] },
+  };
+  const res = await fetch(`http://127.0.0.1:${port}/webhook/github`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-github-event": "issues", "x-github-delivery": event.delivery_id },
+    body: JSON.stringify(event),
+  });
+  const body = await res.json();
+  if (!body.accepted) {
+    server.close();
+    throw new Error(`arm ${label}: intake rejected issue #${issueNumber}: ${JSON.stringify(body)}`);
+  }
+  return { server, port };
+}
+
+/**
+ * Run one arm end to end and collect its artifacts.
+ *
+ * The refusal signal comes from `open_draft_pr`'s tool result, which carries either `{ refused, review }` or
+ * `{ prUrl }`. No result within the window is reported as `unknown`, not `false`: a run that never got there is not
+ * evidence that the worker chose to work.
+ */
+async function runArm({ runDir, repo, arm }) {
+  const cfg = JSON.parse(readFileSync(defaultConfigPath(repo), "utf8"));
+  // The ONLY difference between the arms. Everything else is byte-identical on purpose — this is a controlled
+  // experiment and any other divergence measures configuration instead of the lesson.
+  cfg.lessonsFile = writeLessonsFile(runDir, arm.label, arm.lessons);
+  const cfgPath = join(runDir, `factory-config-arm-${arm.label}.json`);
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+
+  log(`arm ${arm.label}: spawning instance (lessons=${arm.lessons ? "1 entry" : "empty file"})`);
+  const instance = await spawnInstance({ repo, configPath: cfgPath });
+  const t0 = Date.now();
+  let intake = null;
   try {
-    await postTask(instance.base, instance.token, `Work issue number: ${issueNumber}`, `g5-${label}-${randomUUID()}`);
+    intake = await deliverIssue({ instance, runDir, repo, issueNumber: arm.issue, label: arm.label });
+    log(`arm ${arm.label}: issue #${arm.issue} delivered`);
 
-    // open_draft_pr settles with either a refusal (review failed) or a prUrl.
     const convId = await rootConversationId(instance.base, instance.token);
-    draftText = await waitForToolResult(
-      instance.base, instance.token, convId, "open_draft_pr",
-      (t) => t.includes('"refused": true') || t.includes('"prUrl"'),
-      15 * 60_000,
-    );
-    const draftJson = parseJsonLoose(draftText) ?? {};
-
-    // If refused: the orchestrator should record a lesson via note_lesson.
-    if (draftJson.refused) {
+    const deadline = Date.now() + TIMEOUT_MS;
+    let outcome = null;
+    while (Date.now() < deadline) {
       try {
-        const rec = await waitForToolResult(instance.base, instance.token, convId, "note_lesson", () => true, 120_000);
-        noteLessonResult = parseJsonLoose(rec);
-      } catch { /* orchestrator did not record one — fallback below */ }
+        outcome = await waitForToolResult(instance.base, instance.token, convId, "open_draft_pr", () => true, 60_000);
+        break;
+      } catch {
+        process.stdout.write(".");
+      }
+    }
+    const wallSecs = Math.round((Date.now() - t0) / 1000);
+    if (outcome === null) log(`arm ${arm.label}: no open_draft_pr outcome after ${wallSecs}s — refusal state unknown`);
+
+    let refused = "unknown";
+    let review = null;
+    try {
+      const parsed = JSON.parse(outcome ?? "");
+      refused = parsed.refused === true ? "true" : parsed.refused === false ? "false" : "unknown";
+      review = parsed.review ?? null;
+    } catch {
+      /* no parsable outcome — stays unknown */
     }
 
-    // Human-driver fallback: ensure exactly one lesson is on the books.
-    const lessonsBefore = existsSync(LESSONS_FILE) ? readFileSync(LESSONS_FILE, "utf8").trim() : "";
-    if (!lessonsBefore) {
-      await postTask(instance.base, instance.token, `Record this standing lesson with note_lesson now: "${FALLBACK_LESSON}"`, `g5-${label}-lesson-${randomUUID()}`);
-      const rec = await waitForToolResult(instance.base, instance.token, convId, "note_lesson", () => true, 180_000);
-      noteLessonResult = parseJsonLoose(rec);
-      lessonIntervention = true;
-    }
+    const branch = armBranch(arm.issue);
+    const { out: prOut } = await gh(["pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--json", "number,url,state,isDraft,headRefOid"]);
+    const prs = JSON.parse(prOut || "[]");
+    const pr = prs[0] ?? null;
+    if (!pr) throw new Error(`arm ${arm.label}: no PR on ${branch} (refused=${refused}) — nothing to measure`);
 
-    return { label, draftJson, noteLessonResult, lessonIntervention };
+    // Diff from merge base to this arm's own head, captured now. `main..branch` after the fact silently changes when
+    // the other arm merges (#145).
+    const clone = join(runDir, `clone-${arm.label}`);
+    await exec("git", ["clone", "-q", `https://github.com/${repo}.git`, clone]);
+    await exec("git", ["-C", clone, "fetch", "-q", "origin", `refs/heads/${branch}:refs/remotes/origin/${branch}`, "refs/heads/main:refs/remotes/origin/main"]);
+    const { stdout: baseOut } = await exec("git", ["-C", clone, "merge-base", "origin/main", `origin/${branch}`]);
+    const mergeBase = baseOut.trim();
+    const { stdout: diff } = await exec("git", ["-C", clone, "diff", `${mergeBase}..origin/${branch}`]);
+    const { stdout: nameOnly } = await exec("git", ["-C", clone, "diff", "--name-only", `${mergeBase}..origin/${branch}`]);
+
+    const classification = classifyFixPattern(diff, contractFor(arm.issue));
+    log(`arm ${arm.label}: PR ${pr.url} in ${wallSecs}s — ${formatClassification(classification)}`);
+
+    return {
+      arm: arm.label,
+      kind: arm.kind,
+      issue: Number(arm.issue),
+      branch,
+      lessonsFile: cfg.lessonsFile,
+      lessonsPresent: arm.lessons,
+      wallSecs,
+      refused,
+      review,
+      prNumber: pr.number,
+      prUrl: pr.url,
+      prState: pr.state,
+      headSha: pr.headRefOid,
+      mergeBase,
+      filesTouched: nameOnly.trim().split("\n").filter(Boolean),
+      diffLines: diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length,
+      classification,
+      classified: formatClassification(classification),
+    };
   } finally {
+    if (intake) intake.server.close();
     await instance.close();
   }
 }
 
-async function main() {
-  console.log(`G5 feedback loop — issue #${ISSUE}, lessons file: ${LESSONS_FILE}`);
-  const t0 = Date.now();
+function verdict(results) {
+  const [a, b] = results.arms;
+  const fails = [];
 
-  // Preflight.
-  try {
-    await fetch(`${process.env.OPENAI_BASE_URL ?? ""}/models`, { signal: AbortSignal.timeout(8000) });
-  } catch (e) {
-    console.error(`inference unreachable: ${e.message}`);
-    process.exit(2);
+  // "Nothing measured" must never read as success — that is the #145 defect in one line.
+  for (const arm of [a, b]) if (!arm.classification.measured) fails.push(`arm ${arm.arm} produced an empty diff — nothing was measured`);
+
+  const distinctArtifacts = a.prNumber !== b.prNumber && a.issue !== b.issue && a.branch !== b.branch;
+  if (!distinctArtifacts) fails.push("both arms resolved to the same artifact — arms are not isolated (#145)");
+
+  if (a.classification.rootFix)
+    fails.push(
+      `arm A (baseline, no lessons) already produced a root fix: ${a.classified}\n  The trap no longer exercises the anti-pattern, so this experiment cannot measure the lesson. Author a fresh equivalent pair against current main (gates/g5-traps.mjs) and re-run.`,
+    );
+  if (b.classification.handlerPatch)
+    fails.push(
+      `arm B (with lessons) still patched a handler: ${b.classified}\n  Before concluding anything about the loop, check arm B's intake log and lessons file — the likelier cause is that the lesson never reached the prompt.`,
+    );
+
+  const attribution = distinctArtifacts && a.classification.measured && b.classification.measured ? "strong" : "weak";
+  results.verdict = fails.length ? "fail" : "pass";
+  results.attribution = attribution;
+  writeFileSync(join(process.cwd(), "g5-results.json"), JSON.stringify(results, null, 2));
+
+  console.log(`\n--- RESULTS (${attribution} attribution) ---`);
+  for (const arm of results.arms) {
+    const refusal = arm.refused === "true" ? " REFUSED" : arm.refused === "unknown" ? " refusal=unknown" : "";
+    console.log(`${arm.arm} (${arm.kind}) issue=#${arm.issue} PR=${arm.prNumber}${refusal} ${arm.wallSecs}s`);
+    console.log(`  ${arm.classified}`);
+    console.log(`  files: ${arm.filesTouched.join(", ") || "(none)"}`);
   }
 
-  // Step A — baseline, no lessons.
-  const a = await runStep({ label: "A", issueNumber: ISSUE });
-  console.log(`step A settled: refused=${a.draftJson.refused ?? "?"} prUrl=${a.draftJson.prUrl ?? "-"} note_lesson=${a.noteLessonResult?.recorded ?? "-"}`);
-
-  // Objective classification of step A's fix (only if a branch exists).
-  let classifyA = null;
-  try {
-    classifyA = await classifyFix({ issueNumber: ISSUE });
-    console.log(`step A fix pattern: rootFix=${classifyA.rootFix} handlerPatch=${classifyA.handlerPatch}`);
-  } catch (e) {
-    console.log(`step A classification unavailable (${e.message}) — likely no branch (refused run)`);
+  if (fails.length) {
+    console.error("\n=== EXPERIMENT FAILED ===");
+    fails.forEach((f) => console.error(`- ${f}`));
+    console.error("g5-results.json written with per-arm artifacts.");
+    process.exit(1);
   }
-
-  const lessons = existsSync(LESSONS_FILE) ? readFileSync(LESSONS_FILE, "utf8").trim() : "";
-  if (!lessons) fail("no lesson recorded after step A");
-
-  // Step B — same issue, lessons active, fresh store.
-  const b = await runStep({ label: "B", issueNumber: ISSUE });
-  console.log(`step B settled: refused=${b.draftJson.refused ?? "?"} prUrl=${b.draftJson.prUrl ?? "-"}`);
-
-  let classifyB = null;
-  try {
-    classifyB = await classifyFix({ issueNumber: ISSUE });
-    console.log(`step B fix pattern: rootFix=${classifyB.rootFix} handlerPatch=${classifyB.handlerPatch}`);
-  } catch (e) {
-    fail(`step B classification failed: ${e.message}`);
-  }
-
-  // G5 checks.
-  if (!lessons) fail("lesson not recorded durably");
-  if (b.draftJson.refused) fail(`step B review did not pass: ${JSON.stringify(b.draftJson).slice(0, 400)}`);
-  if (!b.draftJson.prUrl) fail("step B produced no PR");
-  if (classifyB && !classifyB.rootFix) fail("step B fix is not root-level (no statusCode added to the error class in src/store.mjs)");
-  if (classifyB && classifyB.handlerPatch) fail("step B still uses a handler-level patch (instanceof/catch-and-rethrow)");
-
-  const attribution = classifyA?.handlerPatch ? "strong (baseline exhibited the handler patch; it did not recur)" : "single-trial (baseline did not exhibit the pattern; corrected behavior verified once with lessons active)";
-  const passed = failures.length === 0;
-  const result = {
-    gate: "G5",
-    issueNumber: ISSUE,
-    anchorFinding: "PR #12 (issue #11) reviewer concern: handler-level instanceof patch instead of statusCode on the error class",
-    lessonsFile: LESSONS_FILE,
-    lesson: lessons.split("\n").map((l) => l.trim()).filter(Boolean),
-    stepA: { refused: a.draftJson.refused ?? null, prUrl: a.draftJson.prUrl ?? null, noteLesson: a.noteLessonResult, lessonIntervention: a.lessonIntervention, fixPattern: classifyA ? { rootFix: classifyA.rootFix, handlerPatch: classifyA.handlerPatch } : null, diffExcerpts: classifyA ? { storeDiff: classifyA.storeDiff, invoicesDiff: classifyA.invoicesDiff } : null },
-    stepB: { refused: b.draftJson.refused ?? null, prUrl: b.draftJson.prUrl ?? null, lessonIntervention: b.lessonIntervention, fixPattern: classifyB ? { rootFix: classifyB.rootFix, handlerPatch: classifyB.handlerPatch } : null, diffExcerpts: classifyB ? { storeDiff: classifyB.storeDiff, invoicesDiff: classifyB.invoicesDiff } : null },
-    attribution,
-    failures,
-    wallSecs: Math.round((Date.now() - t0) / 1000),
-    passed,
-  };
-  writeFileSync(join(runDir, "g5-results.json"), JSON.stringify(result, null, 2));
-  console.log(`results: ${join(runDir, "g5-results.json")}`);
-  console.log(`\nGATE G5: ${passed ? "PASS" : "FAIL"} (${result.wallSecs}s) attribution=${attribution}`);
-  if (!passed) console.log(JSON.stringify(failures, null, 2));
-  process.exit(passed ? 0 : 1);
+  console.log("\n=== EXPERIMENT PASSED ===");
+  console.log("On equivalent traps: the baseline arm patched a handler, the lessons arm fixed the rule. The recorded lesson changed behavior.");
 }
 
-main().catch((e) => {
-  console.error("G5 battery error:", e);
-  process.exit(1);
-});
+async function main() {
+  if (!REPO) die("--repo is required (e.g. --repo lalanikarim/factory-fixture). No default: this gate clones and runs against whatever repository it is given, and that must never be a live repo by accident.");
+  loadFactoryEnv();
+
+  // Facts first; the pure rule set in g5-traps.mjs decides. Separating them is what makes the isolation rules
+  // unit-testable without touching GitHub.
+  const facts = { lessonsFileExists: LESSON_TEXT.trim().length > 0, existingBranches: [], issueStates: {} };
+  const haveIssues = ARMS.every((a) => String(a.issue ?? "").trim() !== "");
+  const baseCfg = defaultConfigPath(REPO);
+  facts.baseConfigReadable = existsSync(baseCfg);
+  if (haveIssues) {
+    for (const arm of ARMS) {
+      const { out } = await gh(["api", `repos/${REPO}/git/refs/heads/${armBranch(arm.issue)}`], { allowFail: true });
+      if (/"sha"\s*:/i.test(out)) facts.existingBranches.push(armBranch(arm.issue));
+      const { out: iv, code } = await gh(["issue", "view", String(arm.issue), "--repo", REPO, "--json", "state"], { allowFail: true });
+      facts.issueStates[String(arm.issue)] = code === 0 ? (JSON.parse(iv).state ?? "UNKNOWN") : "UNREADABLE";
+    }
+  }
+  let problems = preflightArms(ARMS, facts);
+  if (ALLOW_STALE) problems = problems.filter((p) => !/already exists/.test(p));
+  if (problems.length) die("preflight:\n  - " + problems.join("\n  - "));
+
+  const runDir = mkdtempSync(join(tmpdir(), `g5-${Date.now()}-`));
+  const results = { startedAt: new Date().toISOString(), repo: REPO, baseConfig: baseCfg, lessonText: LESSON_TEXT, arms: [] };
+  log(`preflight ok — arms ${ARMS.map((a) => `#${a.issue}`).join(" + ")}, run dir ${runDir}`);
+  try {
+    for (const arm of ARMS) {
+      log(`=== arm ${arm.label} (${arm.kind}): issue #${arm.issue}, lessons=${arm.lessons ? "on" : "off"} ===`);
+      results.arms.push(await runArm({ runDir, repo: REPO, arm }));
+    }
+    verdict(results);
+  } finally {
+    if (KEEP) console.log(`run dir kept: ${runDir}`);
+    else rmSync(runDir, { recursive: true, force: true });
+  }
+}
+
+main().catch((e) => die(e.stack || e.message));
