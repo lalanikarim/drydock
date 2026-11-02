@@ -51,7 +51,7 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 | **last full nine-gate battery** | ✅ **7 of 9 green on 2026-11-02** (`main` `398385f` → `626de7a`): G0, G1, G2, G3, M1, M2, M4 PASS. G4 partial (T1 merged with exactly one merge commit; T2's retry after mid-approval SIGKILL never landed inside 900 s). G5 red — its two arms ran on one branch, so its "attribution" number was measured off a no-op diff (#145) | runbook §12; #144 (fix), #145 |
 | **fixture supply** | ⚠️ The battery consumes its own targets: every fixture issue in both repos was closed/implemented, and M-gates refuse to run without `M_REPO_B`/`M_ISSUE_B`. Eight issues were seeded for this run from live `curl` transcripts (`battery-seed`, never `agent`) | runbook §12 |
 
-Open issues (2026-11-02): **#143** supervisor died on a config read in its own recovery path · **#141** wall-budget aborts retried without a counter, and no `abort` verb exists · **#145** G5 arms share one branch · **#133** inference reachability (first half shipped) · **#120** stuck-run runbook · **#110** shutdown handle root cause · **#64** Telegram end-to-end
+Open issues (2026-11-02): **#143** supervisor died on a config read in its own recovery path · **#141** wall-budget aborts retried without a counter, and no `abort` verb exists · **#145** G5 arms share one branch · **#147** G4-T2 retry stall (flaked once) · **#133** inference reachability (first half shipped) · **#120** stuck-run runbook · **#110** shutdown handle root cause · **#64** Telegram end-to-end
 proof · #120 (real doc work, specified by a refinement brief) · #78 deferred · #42 parked · #41 hold.
 
 ---
@@ -131,7 +131,7 @@ fixture PRs #52/#57-era drafts.
 | M1 | **PASS** | two repos completed the full chain **simultaneously**, evidence complete, one merge commit each |
 | M2 | **PASS** | A SIGKILLed mid-run at 6 s; B completed end-to-end unaffected |
 | M4 | **PASS** | A aborted cleanly by a 120 s budget (`abortedByBudget=true`, no PR); B completed |
-| G4 | **partial** | T1: evidence on PR → approve → merge, `mergeCommits=1` verified. T2: approval survived the SIGKILL and re-verified the head sha, but the retry never merged within 900 s — under investigation |
+| G4 | **PASS** (re-run) | T1: evidence on PR → approve → merge, `mergeCommits=1` verified. T2: approval survived the SIGKILL and re-verified the head sha; first attempt's retry stalled 900 s without explanation, re-run merged in 48 s with exactly one merge commit (#147) |
 | G5 | **FAIL (harness)** | baseline arm exhibited the handler patch and the lesson arm did not — but both arms ran on `agent/issue-55`/PR #57, which had one commit total, so "did not recur" was measured off a no-op diff (#145) |
 
 **What the run bought, beyond a green checkbox:** the first thing it caught was that three gates were failing on a
@@ -140,8 +140,10 @@ merge, isolation and budget abort all passing underneath — fixed by putting th
 with producer and consumer sharing it (#144, +5 tests, mutation-checked). The second was G5's arm coupling (#145).
 Both are harness defects: the properties under test held in every case.
 
-**Open tails:** G4-T2's retry-after-crash stall (if a durable approval is recorded but nothing re-drives the merge,
-the Telegram-button flow silently stalls — worth treating as P1 until understood), and #145.
+**Bottom line: 8 of 9 green.** Only G5 stayed red, and on a harness defect (#145).
+
+**Open tails:** #147 (G4-T2's one-off 900 s retry stall: if a durable approval is recorded but nothing re-drives the
+merge, the Telegram-button flow silently stalls and looks like "nobody approved"), and #145.
 
 ### P0-3 · Deploy path: `SIGTERM` ignored — **DONE (2026-11-02, #130)**
 
