@@ -4,7 +4,7 @@
 > child-side orphan watchdog — #130), **runtime config moved outside the source tree** to `$DRYDOCK_CONFIG_DIR`
 > (#129, see §5.28 of the plan: `testCommand` was inside drydock's own path allowlist), **engram onboarded** as a
 > managed repo (#128), and the Tailscale funnel recovered (a delivery sweep found nothing needing redelivery). A
-> deploy has since been performed with no `kill -9`. **P0-1 (#122) shipped in review**: webhook intake no
+> deploy has since been performed with no `kill -9`. **P0-1 (#122) shipped, deployed and proven live**: webhook intake no
 > longer shares one transcript — the adapter posts `{kind, subject, requestId, content}` to a factory-owned
 > `/factory/intake`, which opens a conversation per `(kind, subject)` with only that kind's tools (§5.29 of
 > the plan). The live end-to-end proof is still owed: it needs inference, and **`aurora.infinidigm:8888` was
@@ -57,7 +57,7 @@ proof · #120 (real doc work, specified by a refinement brief) · #78 deferred �
 
 ## 3. P0 — blockers before any "production" claim
 
-### P0-1 · #122 silent task loss (transcript poisoning) — DONE in review, live proof owed
+### P0-1 · #122 silent task loss (transcript poisoning) — DONE, deployed, proven live
 The root agent refused `refine_issue` three times while a wire capture proved the tool was in the request:
 
 ```
@@ -72,10 +72,34 @@ conversation recorded a contrary claim.
 *Repro recipe:* in issue #122 (and §5.26.1). Discriminating test: `POST /conversations` (fresh) + submit
 "Call refine_issue …" → works; same instruction to conversation 1 → refused.
 
-*Candidate fixes (undecided — decide, don't drift):* route each task kind to a fresh, capability-minimal
-conversation (matches this repo's capability-removal posture); or expose `Conversation.reset()`/compaction over
-HTTP (kernel API exists, app server has no route). **Do not** fix with more prompt text — the transcript
-produces the counter-example.
+*What shipped (#132, deployed 2026-11-02):* structural, not a prompt. `factory/intake-router.ts` puts each
+intake kind in **its own conversation per (kind, subject)** — e.g. `intake refine:#133` — created with exactly
+that kind's tool registrations. `AgentChange.tools` is a hard kernel filter, so a refinement conversation
+cannot call `delegate`; it is not being asked politely. Subject-scoping rather than per-event keeps stable
+identity, and the core's per-conversation `requestId` settlement still provides exactly-once across GitHub
+redeliveries.
+
+*Live proof (production fleet, real label event, real model):*
+
+```
+[factory] lalanikarim/drydock: intake — opened refine conversation 1023 for #133 (1 tool(s))
+[factory.refine] posted refinement for #133 -> https://github.com/lalanikarim/drydock/issues/133#issuecomment-6566383239
+```
+
+And at the data layer, where a log line does not have to be believed — conversation 1023's agent doc:
+
+```json
+{"model":{"provider":"aurora",…},"thinkingLevel":"medium","tools":["refine_issue"], …}
+```
+
+One tool. Root (conversation 1) still reports `["delegate","open_draft_pr","pr_status","note_lesson","refine_issue"]`,
+which is the point: the poisoned context and the work no longer share a transcript. Ledger row verified in
+`document_revisions` (`{"entries":{"refine:#133":1023}}` plus a delta recording request `issue-133-refine`).
+
+*What this does not fix:* root is still what gates and operators drive, and it can still accumulate refusals
+that color later root turns. Production webhook intake no longer lands there, so the silent-loss path is gone;
+a root conversation that has refused things remains a thing to notice (runbook §6b has the queries). The posted brief was read before closing: it names the right goal, four testable criteria, and correctly
+excluded vendor/engram from scope — i.e. it is usable input, not filler.
 
 **What shipped.** The first option, taken: `factory/intake-router.ts` adds `POST /factory/intake`, registered via
 `createCoreInstance({ routes })` so it sits behind the kernel's bearer gate, and the adapter posts

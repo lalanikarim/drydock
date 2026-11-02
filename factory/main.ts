@@ -291,8 +291,15 @@ async function main() {
   };
   // Intake posture stated at boot like every other posture here. What it says is what a human needs to
   // predict behavior: which conversation a webhook lands in, and what that conversation can touch.
+  //
+  // A refine-disabled repo used to print "refine … (0 tool(s))", which reads like a misconfigured envelope
+  // rather than a feature that is off — observed on engram's boot line on 2026-11-02 and immediately
+  // mistaken for the #122 bug. Say "disabled" when it is disabled; reserve a tool count for a real envelope.
+  const refinePosture = policy.refine
+    ? `refine opens a refinement conversation per issue (${intakeAgents.refine.tools.length} tool(s))`
+    : "refinement is disabled, so no refine conversation is ever opened";
   console.log(
-    `[factory] ${repo}: intake routing — issue/pr-feedback open an orchestration conversation per issue (${orchestratorChange.tools.length} tools), refine opens a refinement conversation per issue (${intakeAgents.refine.tools.length} tool(s)); the root conversation is no longer on the webhook path`,
+    `[factory] ${repo}: intake routing — issue/pr-feedback open an orchestration conversation per issue (${orchestratorChange.tools.length} tools), ${refinePosture}; the root conversation is no longer on the webhook path`,
   );
 
   createCoreInstance({
