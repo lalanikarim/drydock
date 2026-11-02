@@ -9,7 +9,39 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 > cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
 > newer document references by number (queue 7, 8b, 11, 13).
 
-# Fourth refresh — 2026-11-02 (late) (current)
+# Fifth refresh — 2026-11-03 (current)
+
+Against `main` = `e4d89e1`, fleet restarted onto it (down in 3 s, lock released, `/health` → `{status: ok, build.sha: e4d89e1, inference: reachable}`, funnel 200, 2 children, zero orphans, zero sandboxes). Suite **448 pass / 0 fail**.
+
+Since the fourth refresh:
+
+- **#133 closed (items 1–2) via #160.** Inference edges now reach the notifier — and were proven to: `gates/alert-drill.mjs` runs the real prober wired to the real notifier against a local Bot API stand-in and requires **both** an outage and its recovery. Two shipped defects fell out of building it: every `inference_state` event shared one dedupe key (`run_stopped:undefined:undefined:undefined`, so any alert muted the rest for the whole window), and after that fix the window itself deleted the all-clear, because "back to healthy" repeats the key used at boot. Infrastructure state now dedupes by **edge** with a flap guard.
+- **#64 closed.** Deliveries log Telegram's message id, and twelve minutes after that shipped the adapter produced the first auditable production send in the repo's history: `telegram delivered inference_state message_id=121 attempts=1`, zero delivery failures. An id from `api.telegram.org` is what "it's wired" was always standing in for.
+- **#162 merged — an operator identifier was in git.** `test/notify-telegram.test.mjs` shipped the real `TELEGRAM_CHAT_ID` since it landed, in a **public** repo, with GitGuardian green on every one of those runs (its patterns are credentials, not identifiers). Redacted, tests switched to invented values, and `AGENTS.md` gained a "Secrets and operator identifiers in git" section. Two things this leaves true: the value remains in git history (a rewrite is an operator decision, not mine to take), and **this PR's sibling briefly carried the value in its own body before I caught it by grepping my own output** — GitHub retains body revisions, so treat that chat id as readable by anyone who looks. The bot token was never in any tracked file.
+- **#161 filed** — #133's third item, which #160 did not touch: nothing counts settlements that produced no work. Verified against production stores: 655 terminal tasks on the drydock instance break down `completed 606 / failed 38 / aborted 7 / faulted 4`, and no surface in the fleet says so. The query works today (`$.state.outcome.status`); `$.state.status` reads `terminal` for every row including failures, which is the trap.
+
+**Rank 1 (fixture protection posture) stays accepted as R14** — a decision, not work. Active work starts below.
+
+| # | Item | Owner | Why this rank | Done when |
+|---|---|---|---|---|
+| 1 🆕 | **#161 — nothing counts submissions that settled without producing work** | 🤖 | Silent work loss is this repo's recurring failure family (#122 transcript poisoning, #133 dead endpoint). The data already exists and the counter is a query plus a watermark; `aborted` must be reported separately from `failed`/`faulted`, because operator aborts from #141 are deliberate and alarming on them trains everyone to ignore the signal. | A count an operator can query, a gate that fails on a non-zero **window** (not lifetime total), and `no_model`-shaped settlements lighting up the #160 inference edge path. |
+| 2 | **#145 — G5's two arms share one branch/PR** | 🤖 | The gate reports success it did not measure: attribution came off a no-op diff. Blocks any trustworthy feedback-loop claim, and the battery cannot be re-run for real until it is fixed. Needs **two** equivalent trap issues so the arms get separate branches. | Distinct branches per arm, non-empty diffs asserted, lesson-arm pass impossible when step B produced zero commits. |
+| 3 | **#147 — G4 T2 stalled once (900 s), passed in 48 s on re-run** | 🤖 | A crash-recovery gate silent for 15 minutes reads as "nobody approved yet". Now that aborts report `settled` (#141/#153), the same snapshot idea applies to retries. Small, and it turns a flake into a diagnosable event. | Timeout path prints a task snapshot; test asserts the diagnostic exists. |
+| 4 | **#157 — after SIGKILL the store still says a dead task is `running`** | 🤖 | Found verifying #120: 90+ s across a successful respawn, no log line. Integrity held; what rots is the honesty of state. Compensated by the abort verb (`28\|running` → `terminal/aborted`). Same "read the wrong column and lie" family as #161's `$.state.status` trap. | Boot reconciles non-terminal reservations whose owner is gone and logs what it settled; or the kernel exposes stale-reservation reclaim. |
+| 5 | **§3.9 T1 partial-run recovery (C4)** | 🤖 | Pairs with #141 now that a stop is durable: preserve the branch, mark resumable, requeue once with the diff as context. Today a stopped issue stays stopped and a mid-run death starts over. | A resumed run consumes its prior diff and does not re-implement landed work. |
+| 6 | **#110 — shutdown can leave a child handle open (root cause unknown)** | 🤖 | Mitigated three times over (#127 groups, #130 coordinator, second-signal-exits); no symptom since. | Reproduce with the coordinator in place, or close as superseded with reasoning. |
+| 7 | **E4 per-task token annotation (§5.17)** | 🤖 | Offline accounting ships; per-task attribution partial. Battery numbers were assembled by hand (G2 run: 281,520 tokens). | Every task row carries its own count without reconstruction. |
+| 8 | **C5 release checklist** | 🤖 | §12 prerequisites + staleness curl landed; remaining is one page encoding "full battery before a pin bump" plus the restart step. The alert drill (§8) and checklist row 11 now belong on it. | One page, commands run as written. |
+| 9 | **#78 — App reach residual** | 🧑 | `gates/github-app-check.mjs` reports 2 reachable-but-unmanaged repos (`modelarena`, `collective`). | Installation narrowed, or residual recorded as accepted. |
+| 10 | **#42 Target 2 design doc · #41 upstream kernel PR** | 🧑 | Design/upstream work, no production risk. #41 on hold per its own note. | Unchanged. |
+
+**Closed since the fourth refresh:** #133 (inference reachability: probe + `/health` disclosure in #136/#138, edge alerts proven in #160; item 3 split to #161) · #64 (Telegram end-to-end — first real production delivery captured, `message_id=121`). **Shipped:** #160 (alert edges, delivery ids, wall-budget stop announcement, `gates/alert-drill.mjs`), #162 (identifier hygiene). **Filed:** #161.
+
+**Battery status unchanged at 8 of 9 green**; re-running G5 still requires #145 first, and the fixture-issue consumption rule in runbook §12 still applies — fixtures are consumables, seed before a battery run.
+
+---
+
+# Fourth refresh — 2026-11-02 (late) (superseded by the fifth)
 
 Against `main` = `b51982d`. Since the third refresh: **#141 shipped (#153)** — durable per-issue wall-budget attempt cap plus `POST /factory/runs/abort`, deployed and proven live against a real running task (`1543 → terminal/aborted`, `abort_requested=1`); **#120 shipped (#158)** — runbook §7c containment, every command executed against production including two containment kills; **R14 accepted (#155)** — unprotected fixture `main`, recorded rather than dropped; and a merge-verification rule in AGENTS.md (#156) written after I closed a PR unmerged. One new issue: **#157**, stale task reservations after SIGKILL. Suite **432 pass / 0 fail**. Fleet on trunk: `/health` → `{status: ok, build.sha: …, inference: reachable}`, funnel 200, zero orphans, zero sandboxes.
 

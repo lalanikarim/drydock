@@ -1,5 +1,7 @@
 # Production readiness assessment + session handoff — 2026-11-01
 
+> **Updated 2026-11-03.** Since the 2026-11-02 update: **#141 shipped and live** (durable per-issue wall-budget cap + `POST /factory/runs/abort`, #153, proven against a real running task), **#120 shipped** (runbook §7c containment, commands executed against production, #158), **#143 closed** (supervisor survives a bad config read in its own recovery path, #150), **#133 closed for items 1–2** with two alert-swallowing defects found and fixed on the way (#160: a catch-all dedupe key plus a time window that deleted the all-clear), and **#64 closed** — production made its first auditable Telegram send (`message_id=121`). Battery final tally recorded as **8 of 9**. New issue **#161**: settlements that produced no work are counted nowhere. Suite **448 pass / 0 fail**; fleet on `e4d89e1`.
+>
 > **Updated 2026-11-02.** Shipped since compilation: **P0-3 closed** (process-group ownership, bounded shutdown,
 > child-side orphan watchdog — #130), **runtime config moved outside the source tree** to `$DRYDOCK_CONFIG_DIR`
 > (#129, see §5.28 of the plan: `testCommand` was inside drydock's own path allowlist), **engram onboarded** as a
@@ -48,11 +50,14 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 | kernel pin | `vendor/engram` @ `v0.2.0` (`a764e36`) | `git submodule status` |
 | credential | App `drydock-factory` (5557270), installation 177271737, hourly installation tokens, PEM outside the tree | `node gates/github-app-check.mjs` |
 | drydock registry entry | `enabled:true`, `autoMerge:false`, eligibility `build`, `refine:true`, `prFeedback:true`, allowlist `factory/ fleet/ test/ research/ README.md AGENTS.md`, protected `gates/probes/`, verification required | `factory/repo-registry.json` |
-| **last full nine-gate battery** | ✅ **7 of 9 green on 2026-11-02** (`main` `398385f` → `626de7a`): G0, G1, G2, G3, M1, M2, M4 PASS. G4 partial (T1 merged with exactly one merge commit; T2's retry after mid-approval SIGKILL never landed inside 900 s). G5 red — its two arms ran on one branch, so its "attribution" number was measured off a no-op diff (#145) | runbook §12; #144 (fix), #145 |
+| **last full nine-gate battery** | ✅ **8 of 9 green on 2026-11-02**: G0, G1, G2, G3, M1, M2, M4 PASS and **G4 PASS on re-run** (T1 merged with exactly one merge commit; T2 passed in 48 s after a first attempt that stalled for the full 900 s — instrumentation owed by #147, pass recorded in #148). G5 red — its two arms ran on one branch, so its "attribution" number was measured off a no-op diff (#145) | runbook §12; #144 (fix), #145, #147, #148 |
 | **fixture supply** | ⚠️ The battery consumes its own targets: every fixture issue in both repos was closed/implemented, and M-gates refuse to run without `M_REPO_B`/`M_ISSUE_B`. Eight issues were seeded for this run from live `curl` transcripts (`battery-seed`, never `agent`) | runbook §12 |
 
-Open issues (2026-11-02): **#143** supervisor died on a config read in its own recovery path · **#141** wall-budget aborts retried without a counter, and no `abort` verb exists · **#145** G5 arms share one branch · **#147** G4-T2 retry stall (flaked once) · **#133** inference reachability (first half shipped) · **#120** stuck-run runbook · **#110** shutdown handle root cause · **#64** Telegram end-to-end
-proof · #120 (real doc work, specified by a refinement brief) · #78 deferred · #42 parked · #41 hold.
+Open issues (2026-11-03): **#161** nothing counts settlements that produced no work (655 terminal tasks on the drydock instance: 606 completed / 38 failed / 7 aborted / 4 faulted, unaggregated) · **#145** G5 arms share one branch · **#147** G4-T2 retry stall (flaked once) · **#157** a SIGKILLed task stays `running` in the store · **#110** shutdown handle root cause · #78 deferred · #42 parked · #41 hold.
+
+Closed since this document was written: **#143** (supervisor config resilience, #150) · **#141** (durable wall-budget cap + `POST /factory/runs/abort`, #153) · **#120** (containment runbook §7c, #158) · **#133** (inference probe and `/health` disclosure #136/#138; edges proven to deliver in #160 — item 3 split to #161) · **#64** (Telegram end-to-end: `telegram delivered inference_state message_id=121 attempts=1` from production, 2026-11-03).
+
+Hygiene note, because it is the kind of finding this document exists to record: a **public** repo was publishing the operator's real Telegram chat id in `test/notify-telegram.test.mjs` with GitGuardian green on every run — its patterns match credentials, not identifiers. Redacted in #162, rule added to `AGENTS.md`; the value remains in git history, and the bot token was never in a tracked file.
 
 ---
 
