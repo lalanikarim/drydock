@@ -724,12 +724,14 @@ TELEGRAM_BOT_TOKEN=...      # from @BotFather
 TELEGRAM_CHAT_ID=...        # your chat id, see .env.example for the getUpdates one-liner
 ```
 
-Exactly three things are announced, because a channel that carries everything is read by nobody:
+Five things are announced, because a channel that carries everything is read by nobody:
 
 | you get told when | the line contains |
 |---|---|
 | a draft PR opens (`pr_opened`) | issue, PR number, URL, verification result, head sha |
 | a run is stopped by the refusal budget (`run_stopped`) | issue and the reason it will not produce anything further |
+| an issue burns its wall budget twice and is stopped for good (`run_stopped`, #141) | attempt count, the clock that expired, and the two operator levers (`wallSecsPerIssue`, split the issue) |
+| inference changes state (`inference_state`, #133) | `reachable` / `degraded` / `unreachable` and how many endpoints answered (e.g. `1/2`) |
 | a refinement brief is posted (`refine_posted`) | issue and the comment URL (#65) |
 
 Everything else stays where it already lives: PR comments, `fleet/data/intake-adapter.jsonl`, durable task
@@ -744,8 +746,19 @@ state. Notifications are deployment configuration (who to tell), never repositor
   URL path, so naive fetch errors echo it. Redaction is asserted by tests.
 - **Connection resets are normal here and are retried** (this host answers Node's `fetch` with `ECONNRESET`
   where `curl` succeeds). A `400` is not retried: a bad token or blocked bot fails identically forever.
-- **One message per event per 10 minutes.** A retried code path cannot spam you; a different issue is a
-  different event.
+- **Per-issue events: one message each per 10 minutes.** A retried code path cannot spam you; a different issue,
+  or the same issue stopped for a different reason, is a different event.
+- **Infrastructure state dedupes by edge, not by clock — and that distinction is a missed recovery.** The generic
+  window suppresses a key for ten minutes after it fires, so an outage that began and ended inside one window was
+  announced as "unreachable" and never as "reachable": the all-clear repeats the key the process used at boot.
+  `inference_state` now announces when the state differs from the last announced state, bounded by a flap guard
+  (six edges per ten minutes, then one `flapping … suppressing` line and silence). Two defects were found this way:
+  first every inference alert shared one dedupe key built from fields the event does not have (`run_stopped:
+  undefined:undefined:undefined`, so the second alert of any kind muted the rest), and then the window itself ate
+  recoveries. Both are asserted in `test/alert-plumbing.test.mjs`.
+- **Deliveries are logged, with Telegram's message id** — `telegram delivered inference_state message_id=9004
+  attempts=1`. Before this, only failures were logged, so a healthy fleet and a misconfigured bot produced the
+  same silence. Grep `supervisor.log` (or the adapter log) for `telegram delivered` to confirm an alert existed.
 
 ### Verify the credentials any time, without running anything
 
@@ -759,6 +772,42 @@ console.log(JSON.stringify(await sendTelegramMessage("drydock notification chann
 
 Expected: `{"ok":true,"status":200,"attempts":1}`. Deliberately sends a message — a notification feature whose
 delivery path is unverified is a notification feature you find out about by not hearing from it.
+
+### Prove an edge alert arrives, without waiting for an outage (#133)
+
+The credential check above covers one HTTP call. It says nothing about the four boundaries an infrastructure alert
+actually crosses — probe result → aggregate state → transition edge → dedupe → transport — and a shipped defect
+lived in exactly that seam while every half of it passed its own tests.
+
+```bash
+node gates/alert-drill.mjs            # add --json for machine-readable output
+```
+
+It runs the real `InferenceProber` wired to the real `createNotifier`, against a local stand-in for the Telegram
+Bot API and two local inference endpoints whose reachability it controls, then forces
+`reachable → degraded → unreachable → reachable` and requires that **both** the outage and the all-clear were
+received. Exit 0 only when they both arrive; exit 2 when the path is broken or unconfigured — a drill that cannot
+report "not checked" is a drill that reports success by default.
+
+Observed on 2026-11-03 with the fleet's real `TELEGRAM_*` values:
+
+```
+edges observed: reachable → degraded → unreachable → reachable
+  delivered → text="factory: inference unreachable (0/2 endpoint(s))"
+  delivered → text="factory: inference reachable (2/2 endpoint(s))"
+alert path verified: 4 messages, outage and recovery both delivered
+```
+
+The drill reaches the network only through `TELEGRAM_API_BASE`, which redirects the transport to that local
+stand-in. The redirect is printed as a warning every time it is used — an alert channel pointed somewhere else
+must not look healthy:
+
+```
+⚠ telegram transport overridden → http://127.0.0.1:55318 (TELEGRAM_API_BASE): alerts are NOT reaching the operator's chat
+```
+
+So the drill proves the pipeline and explicitly does **not** prove that `api.telegram.org` accepts your token or
+that the chat is reachable; use the credential check above for that half.
 
 ## 9. Pre-flight checklist (a fresh machine, or before a demo)
 
@@ -774,6 +823,7 @@ delivery path is unverified is a notification feature you find out about by not 
 | 8 | No sandbox sidecar outlived a previous run | `podman ps --filter name=engram-sbx --format "{{.Names}} {{.Status}}"` | empty — a container bound to a worktree is an orphan too (§10) |
 | 9 | The running supervisor is on the commit you think it is | `curl -s localhost:9700/health \| jq '{build,startedAt}'` vs `git log -1 --format=%h` | `build.sha` equals trunk; if not, restart. Also grep `fleet/data/supervisor.log` for `SERVING STALE POLICY` (#150) — that means policy edits are not live |
 | 10 | You can name the supervisor pid without guessing | `cat fleet/data/routes.json.lock` | a live pid owned by this deployment — `pgrep -f … \| head -1` has twice returned a shell wrapper instead (§7c traps) |
+| 11 | An alert would actually reach you | `node gates/alert-drill.mjs` (needs the `TELEGRAM_*` pair) | exit 0 with both an outage and a recovery delivered to the local stand-in; exit 2 means the channel is broken, not that nothing happened (§8) |
 
 Steps 1 and 5 are the two that fail loudest when skipped: the supervisor refuses to start without runtime config, and a missing App permission turns every worker clone into an auth failure mid-run.
 

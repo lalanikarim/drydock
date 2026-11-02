@@ -39,6 +39,7 @@ import {
 } from "./budget-ledger.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
+import type { Notifier } from "./notify-telegram.ts";
 import type { PathScope } from "./path-scope.ts";
 import {
   authorizePrFeedback,
@@ -238,9 +239,37 @@ export interface WorkerTaskOptions {
   sandboxPolicy?: SetupPolicy | null;
   /** The same scope the push gate enforces, so the worker can respect it instead of discovering it. */
   pathScope?: PathScope;
+  /**
+   * Same notifier the push gate uses (#64 plumbing). Used for exactly one thing here: telling an operator that
+   * an issue has now burned two wall budgets and will refuse further work. That stop is the most expensive
+   * event in this file and it used to be a log line only, while the cheaper refusal-budget stop did notify.
+   */
+  notify?: Notifier;
 }
 
-export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth, pathScope }: WorkerTaskOptions) {
+/**
+ * The alert emitted when an issue crosses the wall-budget cap (#141). Extracted so its text is testable without
+ * running two full budgets: the reason must name the clock and the operator's levers, because "aborted" alone
+ * sends someone to read a prompt log instead of changing `wallSecsPerIssue` or splitting the issue.
+ */
+export function budgetStopNotification(o: {
+  repo: string;
+  issueNumber: number;
+  attempts: number;
+  reason: string;
+}): { kind: "run_stopped"; repo: string; issueNumber: number; reason: string; detail: string } {
+  return {
+    kind: "run_stopped",
+    repo: o.repo,
+    issueNumber: o.issueNumber,
+    reason: `wall budget exhausted after ${o.attempts} aborts (${o.reason})`,
+    detail:
+      "Further delegate calls for this issue are refused without creating a task. The levers are operator-side: " +
+      "raise wallSecsPerIssue in this repo's runtime config, or split the issue into pieces that each fit one budget.",
+  };
+}
+
+export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth, pathScope, notify }: WorkerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
   const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
     try {
@@ -375,6 +404,22 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
                 ? `[factory.worker] BUDGET: issue #${task.input.issueNumber} attempt ${note.attempts} — STOPPED. Further delegate calls for this issue are refused without doing work; the levers (raise wallSecsPerIssue, split the issue) belong to a human.`
                 : `[factory.worker] BUDGET: issue #${task.input.issueNumber} attempt ${note.attempts} recorded; one more identical abort stops the issue`,
             );
+            if (note.terminal) {
+              // Announce the stop once, at the moment it becomes true. Strictly downstream of the durable commit,
+              // and unable to affect the task: a dead bot token cannot un-stop — or un-run — anything.
+              void (async () => {
+                try {
+                  await notify?.(budgetStopNotification({
+                    repo: fixturesRepo,
+                    issueNumber: task.input.issueNumber,
+                    attempts: note.attempts,
+                    reason,
+                  }));
+                } catch (e) {
+                  console.error(`[factory.worker] budget-stop notification failed: ${String(e)}`);
+                }
+              })();
+            }
             return;
           }
 
