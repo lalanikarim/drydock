@@ -337,6 +337,9 @@ if (isMain) {
     routesDriftCheck: makeRoutesDriftCheck({ routesFile, startupHash, liveRoutes: routes }),
     inferenceStatus: prober ? () => prober.current() : undefined,
     inferenceDetails: prober ? () => prober.details() : undefined,
+    // The detail view names internal hosts, so it is token-gated rather than address-gated: a funnel or any
+    // other fronting proxy presents as loopback and would otherwise disclose it to strangers (#136 review).
+    adminToken: process.env.ADAPTER_ADMIN_TOKEN,
   }).then(({ server, port: actualPort, host }) => {
     // Both hashes are printed because they answer different questions: routes-hash is "which bytes am
     // I serving?" and policy-hash is "which authority am I serving under?" — a target-only refresh
