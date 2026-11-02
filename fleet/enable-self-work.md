@@ -780,10 +780,12 @@ first`. Point it at whatever drafts the chain produced today via `G4_T1_ISSUE` /
 were consumed in October.
 
 **Order that worked (2026-11-02, `main` = `398385f` → `626de7a`):** G0 → G3 → G1 → G2 → M1 → M2 → M4 → G4, with G5
-last because it is the slowest and the most fixture-hungry. Results went 6 green (G0 20/20, G3 both arms, G1 draft PR
+last because it is the slowest and the most fixture-hungry. Results went 7 green on first pass (G0 20/20, G3 both arms, G1 draft PR
 in 190 s, G2 1/1 with zero human edits, M1 both repos simultaneously, M2 isolation, M4 budget abort), G5 and G4-T2
-red — and those two reds are harness defects with their own issues (#145 for G5's arms sharing one branch; the T2
-retry-after-SIGKILL stall still under investigation), not silent passes.
+red on first pass. G4 then **passed cleanly on re-run** (T1 22 s, T2 48 s, exactly one merge commit each) after its
+first attempt stalled the full 900 s on the retry-after-SIGKILL step — a non-determinism with no explanation in the
+log, tracked as #147. G5 stayed red for a harness defect (#145: both arms ran on one branch). Neither red is a
+merge-safety failure, and neither was written up as a pass.
 
 **Evidence convention:** gates must not keep private copies of what a factory PR should contain. `factory/pr-evidence.ts`
 owns the required sections and pass regexes, production builds bodies from it and gates check through
