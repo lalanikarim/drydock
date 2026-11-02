@@ -527,7 +527,7 @@ survivor now means the watchdog did not work (or someone started an instance by 
 was from before we fixed that":
 
 ```bash
-pgrep -fl "factory/main.ts"                       # survivors of the previous generation
+pgrep -fl "factory/main[.]ts"                     # survivors of the previous generation (see note below)
 ps -eo pid,ppid,lstart,command | grep factory/main.ts | grep -v grep
 # PPID must equal the CURRENT supervisor's pid (fleet/data/routes.json.lock); an old START time is a survivor
 lsof -- factory-instances/lalanikarim_drydock/engram-data/agent.sqlite   # who shares the durable store
@@ -635,7 +635,7 @@ cat factory-instances/lalanikarim_drydock/orphan-events.log
 # 2026-11-01T17:47:18.470Z [factory lalanikarim/drydock] orphaned (reparented-to-init): supervisor pid 4452 is gone, my ppid is 1 — exiting rather than serving unmanaged (#127). Runbook §7: check for other instances on this store.
 ```
 
-A non-empty `orphan-events.log` means the safety net fired at least once: something was serving work with no supervisor, then stopped. Check whether another instance is on that store (`pgrep -fl factory/main.ts`) before restarting, and treat a growing file as a sign the supervisor keeps dying.
+A non-empty `orphan-events.log` means the safety net fired at least once: something was serving work with no supervisor, then stopped. Check whether another instance is on that store (`pgrep -fl 'factory/main[.]ts'`) before restarting, and treat a growing file as a sign the supervisor keeps dying.
 
 **Restart budget: N restarts per repo, then the supervisor gives up — and what that costs.** On 2026-11-02 this fired for real during a deploy: both instances failed to boot because the inference host was unreachable, the budget exhausted in ~50 s, `giveUp()` asked everything to shut down, the adapter died with it, and every public webhook delivery hit a closed port — which GitHub records as a failed delivery and does **not** retry. The comment above `giveUp()` says "the operator must restart manually", and that is accurate; what it does not say is that deliveries are lost between the give-up and the human noticing. Check `inference` on `/health` before concluding an outage was caused by the code you just deployed.
 
@@ -652,10 +652,21 @@ A non-empty `orphan-events.log` means the safety net fired at least once: someth
 ```bash
 cat fleet/data/routes.json.lock   # gone, or a pid `ps -p` cannot find
 lsof -nP -i :9700                 # listener released
-pgrep -fl "factory/main.ts|adapter.ts"   # nothing left holding an Engram store
+pgrep -fl "factory/main[.]ts|adapter[.]ts"   # nothing left holding an Engram store
 ```
 
-**Restart:** `nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> log 2>&1 & disown`. If the funnel URL changed while it was down, re-point the webhooks (§4) — GitHub does not retry deliveries that failed against the old URL, and §7 is how you find out which ones.
+**Why the bracket in `factory/main[.]ts`:** `pgrep -f` matches full command lines, and the command line of the
+shell running the check *contains* the pattern — so `pgrep -fl "factory/main.ts"` counts the check itself. Seen
+on 2026-11-02 reporting "3" instances where two existed, which is exactly the kind of number that makes an
+orphan check look like it found something when it found nothing. The bracket matches a literal dot without
+matching the pattern text. Same trap applies to `supervisor.ts run`: a `bash -c` wrapper left over from
+launching the fleet matches it too, so compare pids against `routes.json.lock` rather than counting lines.
+
+**Restart:** `nohup node --experimental-strip-types fleet/supervisor.ts run fleet/fleet.local.json >> log 2>&1 & disown`.
+It reads `.env` at the repo root (gitignored), and since #138 that file should define `ADAPTER_ADMIN_TOKEN` —
+without it `/health/inference` simply does not exist (that is the safe default, not a failure; public `/health`
+is unaffected). If you restart from a shell that never sourced `.env`, expect a 404 there and set the variable
+before assuming the probe broke. If the funnel URL changed while it was down, re-point the webhooks (§4) — GitHub does not retry deliveries that failed against the old URL, and §7 is how you find out which ones.
 
 **Recovery if orphans do exist** (a pre-watchdog build, or a `SIGKILL` plus a hung child): see [`orphan-recovery-2026-11-01.md`](orphan-recovery-2026-11-01.md) — kill the old tree, confirm nothing shares the Engram store, then start one supervisor. Two harnesses over one durable store is the failure this whole section exists to prevent; the lock catches a second supervisor, and it does not catch anything else.
 
