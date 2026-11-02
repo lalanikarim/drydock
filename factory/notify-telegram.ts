@@ -107,7 +107,44 @@ function isRetryableError(e: unknown): boolean {
   return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "TypeError"].includes(code) || name === "TypeError";
 }
 
-export type SendResult = { ok: boolean; status?: number; detail?: string; attempts: number };
+/**
+ * `messageId` is Telegram's own id for the delivered message. It exists so "the alert was sent" is an auditable
+ * claim in a log line rather than an inference from silence — before it, only failures were logged, so a healthy
+ * fleet and a mis-configured bot looked identical from the operator's side.
+ */
+const TELEGRAM_API_DEFAULT = "https://api.telegram.org";
+
+/**
+ * Resolve the Telegram Bot API base.
+ *
+ * The override exists so an operator can prove the alert path delivers — against a local stand-in, on demand —
+ * instead of waiting for an outage or trusting a green suite about someone else's HTTP API. It is loud by
+ * construction: a redirected alert channel that reports success into a void is worse than no channel, because
+ * the entire value of this code is that somebody finds out.
+ */
+export function resolveTelegramApiBase(
+  env: Record<string, string | undefined> = process.env,
+  log: (line: string) => void = () => {},
+): string {
+  const raw = env.TELEGRAM_API_BASE?.trim();
+  if (!raw) return TELEGRAM_API_DEFAULT;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    log(`telegram transport override ignored — TELEGRAM_API_BASE is not a valid URL (${raw.slice(0, 80)})`);
+    return TELEGRAM_API_DEFAULT;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    log(`telegram transport override ignored — only http/https allowed (got ${parsed.protocol})`);
+    return TELEGRAM_API_DEFAULT;
+  }
+  const base = parsed.toString().replace(/\/+$/, "");
+  log(`⚠ telegram transport overridden → ${base} (TELEGRAM_API_BASE): alerts are NOT reaching the operator's chat`);
+  return base;
+}
+
+export type SendResult = { ok: boolean; status?: number; detail?: string; attempts: number; messageId?: number };
 
 /**
  * POST one message to the Telegram Bot API. Retries connection errors, 429 (honouring `retry_after`) and 5xx;
@@ -125,6 +162,8 @@ export async function sendTelegramMessage(
     sleep?: (ms: number) => Promise<void>;
     maxAttempts?: number;
     log?: (line: string) => void;
+    /** Bot API base. Defaults to api.telegram.org; see `resolveTelegramApiBase`. */
+    apiBase?: string;
   },
 ): Promise<SendResult> {
   const log = opts.log ?? (() => {});
@@ -142,12 +181,25 @@ export async function sendTelegramMessage(
   let lastDetail = "unknown";
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const res = await doFetch(`https://api.telegram.org/bot${opts.token}/sendMessage`, {
+      const base = (opts.apiBase ?? TELEGRAM_API_DEFAULT).replace(/\/+$/, "");
+      const res = await doFetch(`${base}/bot${opts.token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ chat_id: opts.chatId, text: message, disable_web_page_preview: true }),
       });
-      if (res.ok) return { ok: true, status: res.status, attempts: attempt };
+      if (res.ok) {
+        // Parse but never depend on the body: a 200 with an unexpected shape is still a delivered message, and
+        // losing the id must not turn a success into a failure.
+        let messageId: number | undefined;
+        try {
+          const body = (await res.json()) as { result?: { message_id?: unknown } };
+          const id = body?.result?.message_id;
+          if (typeof id === "number" && Number.isFinite(id)) messageId = id;
+        } catch {
+          /* no parseable body — fine, we just cannot quote an id */
+        }
+        return { ok: true, status: res.status, attempts: attempt, ...(messageId !== undefined ? { messageId } : {}) };
+      }
 
       const body = await res.text().catch(() => "");
       lastDetail = redact(`${res.status} ${body.slice(0, 180)}`.trim());
@@ -183,11 +235,36 @@ export async function sendTelegramMessage(
   return { ok: false, detail: lastDetail, attempts: maxAttempts };
 }
 
-/** A key per event so a retried path cannot spam the same line. */
+/**
+ * A key per event so a retried path cannot spam the same line.
+ *
+ * Every kind must be named here. The previous shape ended in an unconditional `run_stopped:…` fallback, which
+ * meant `inference_state` inherited a key built from fields it does not have — `run_stopped:undefined:undefined:
+ * undefined` for every inference alert, whatever its state. Effect: the first alert of any kind muted every
+ * other inference alert for the whole dedupe window, so an operator who was told "inference unreachable" was
+ * never told it recovered (#133). A catch-all key is not a default; it is a collision waiting for the next kind.
+ */
 export function notifyEventKey(e: NotifyEvent): string {
-  if (e.kind === "pr_opened") return `pr_opened:${e.repo}:${e.issueNumber}:${e.prUrl}`;
-  if (e.kind === "refine_posted") return `refine_posted:${e.repo}:${e.issueNumber}`;
-  return `run_stopped:${e.repo}:${e.issueNumber}:${e.reason}`;
+  switch (e.kind) {
+    case "pr_opened":
+      return `pr_opened:${e.repo}:${e.issueNumber}:${e.prUrl}`;
+    case "refine_posted":
+      return `refine_posted:${e.repo}:${e.issueNumber}`;
+    case "run_stopped":
+      // Reason is part of the identity: an issue stopped twice for two different reasons is two news items.
+      return `run_stopped:${e.repo}:${e.issueNumber}:${e.reason}`;
+    case "inference_state":
+      // The state IS the event — an outage and its recovery are different messages, and a fleet that went from
+      // 1/2 to 0/2 is news again.
+      return `inference_state:${e.state}:${e.reachable}/${e.total}`;
+    default: {
+      // Unreachable while NotifyEvent is exhaustive. Structurally keyed so a future kind cannot silently share
+      // another's dedupe window; it also keeps this function total, because a notification defect must never
+      // throw into the code path that just merged something.
+      const exotic = e as unknown as { kind?: string };
+      return `unkeyed:${exotic?.kind ?? "event"}:${JSON.stringify(exotic)}`;
+    }
+  }
 }
 
 export type Notifier = (e: NotifyEvent) => Promise<void>;
@@ -203,28 +280,72 @@ export function createNotifier(opts: {
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   windowMs?: number;
+  /** Cap on inference state edges announced per `windowMs` before going quiet (flap guard). */
+  maxInferenceEdges?: number;
   log?: (line: string) => void;
+  env?: Record<string, string | undefined>;
 }): Notifier | undefined {
   const log = opts.log ?? (() => {});
   if (!opts.token || !opts.chatId) return undefined;
+  // Resolved once, loudly if overridden: an operator who sets this for a drill must not be able to forget it.
+  const apiBase = resolveTelegramApiBase(opts.env ?? process.env, log);
   const seen = new Map<string, number>();
   const windowMs = opts.windowMs ?? 10 * 60 * 1000;
+
+  /**
+   * Inference alerts dedupe by EDGE, not by time window — and the difference is a missed recovery.
+   *
+   * The generic path below suppresses a key for `windowMs` after announcing it. For per-issue events that is
+   * right (a retried tool call should not ping twice). For inference state it is wrong: a fleet that started
+   * healthy, went down, and came back announces `reachable:2/2` twice — once at boot and once as the recovery —
+   * so with a time window the operator gets "inference unreachable" and never gets the all-clear. The prober
+   * already fires only on transitions, so a second suppression by recency is what swallows the news.
+   *
+   * What the window was really protecting against is flapping, so that is what gets bounded here: edges are
+   * announced while they are rare, and once they are not, we say so once and go quiet until it settles.
+   */
+  let lastInferenceKey: string | undefined;
+  let inferenceEdges: number[] = [];
+  let flapAnnounced = false;
+  const MAX_INFERENCE_EDGES = opts.maxInferenceEdges ?? 6;
 
   return async (e: NotifyEvent) => {
     const key = notifyEventKey(e);
     const now = Date.now();
-    for (const [k, t] of seen) if (now - t > windowMs) seen.delete(k);
-    if (seen.has(key)) return;
-    seen.set(key, now);
+
+    if (e.kind === "inference_state") {
+      if (lastInferenceKey === key) return; // the same state again is not an edge
+      inferenceEdges = inferenceEdges.filter((t) => now - t < windowMs);
+      if (inferenceEdges.length >= MAX_INFERENCE_EDGES) {
+        if (!flapAnnounced) {
+          flapAnnounced = true;
+          log(`inference state flapping (${inferenceEdges.length} edges in ${Math.round(windowMs / 60000)} min) — suppressing further state alerts until it settles`);
+        }
+        return;
+      }
+      flapAnnounced = false;
+      inferenceEdges.push(now);
+      lastInferenceKey = key;
+    } else {
+      for (const [k, t] of seen) if (now - t > windowMs) seen.delete(k);
+      if (seen.has(key)) return;
+      seen.set(key, now);
+    }
     try {
       const res = await sendTelegramMessage(renderNotifyMessage(e), {
         token: opts.token!,
         chatId: opts.chatId!,
         fetchImpl: opts.fetchImpl,
         sleep: opts.sleep,
+        apiBase,
         log,
       });
-      if (!res.ok) log(`telegram notification not delivered (${res.detail ?? "unknown"}), attempts ${res.attempts}`);
+      if (res.ok) {
+        // Success is logged too, with the id: "alerts are wired" becomes a claim backed by a line in the log.
+        log(`telegram delivered ${String((e as { kind?: string }).kind ?? "event")} message_id=${res.messageId ?? "unreported"} attempts=${res.attempts}`);
+      } else {
+        log(`telegram notification not delivered (${res.detail ?? "unknown"}), attempts ${res.attempts}`);
+      }
     } catch (e2) {
       // sendTelegramMessage already swallows; this is belt-and-braces so a future edit cannot throw into a run.
       log(`telegram notification threw: ${opts.token ? String(e2).split(opts.token).join("[token]") : String(e2)}`);

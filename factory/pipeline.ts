@@ -179,6 +179,10 @@ export function factoryPipeline(opts: PipelineOptions) {
     sandboxPolicy: opts.sandboxPolicy,
     pathScope: opts.pathScope,
     gitAuth: auth,
+    // The wall-budget stop is announced from the worker itself (#141): it is the one place that knows an issue
+    // just crossed the cap, and the orchestrator may never see it — the delegate short-circuit returns a payload
+    // with no run behind it.
+    notify: opts.notify,
   });
   const refineTaskDef = opts.refine === true
     ? factoryRefineTask({ workDir: opts.workDir, fixturesRepo: opts.fixturesRepo, gitAuth: auth, pathScope: opts.pathScope, notify: opts.notify })
