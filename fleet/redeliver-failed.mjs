@@ -24,6 +24,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { loadRegistry, sweepTargets, missingWebhookIds } from "../factory/repo-registry.ts";
 
 const API = "https://api.github.com";
 
@@ -254,6 +255,97 @@ export function readSweepState(path) {
   }
 }
 
+/**
+ * Sweep every repo this deployment receives deliveries for, with targets DERIVED from the registry (#107).
+ *
+ * Why derived: the target list used to exist only inside an installed launchd plist. Engram was onboarded,
+ * started receiving webhooks, and its failures went unswept for two days because nothing connects "a repo was
+ * added" to "the control that recovers lost deliveries must know about it". A compensating control with its own
+ * copy of the world drifts from the world; this reads the same file the factory reads.
+ *
+ * The aggregate state file keeps the shape `supervisor status` already renders, plus a per-target breakdown,
+ * so "the sweep ran" stays one glance and "which repo is failing" stays answerable.
+ */
+async function runRegistrySweep({ argv, env, fetchImpl, log, listOnly = false }) {
+  const opt = (name) => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 ? argv[i + 1] : undefined;
+  };
+  const registryPath = opt("registry");
+  let targets, untracked;
+  try {
+    const registry = registryPath ? loadRegistry(registryPath) : loadRegistry();
+    targets = sweepTargets(registry);
+    untracked = missingWebhookIds(registry);
+  } catch (e) {
+    log(`cannot read the repo registry — refusing to sweep nothing: ${e && e.message ? e.message : e}`);
+    return { code: 2, failed: [], applied: [] };
+  }
+
+  log(`sweep targets (${registryPath ?? "factory/repo-registry.json"}): ${targets.map((t) => `${t.repo} hook ${t.webhookId}`).join(", ") || "none"}`);
+  // Loud, but not fatal: an untracked repo's deliveries are simply never examined, which is worse than a
+  // noisy line here and nobody would ever find out.
+  if (untracked.length) log(`WARNING enabled repos with no webhookId — their deliveries are NOT swept: ${untracked.join(", ")}`);
+  if (listOnly) return { code: 0, failed: [], applied: [], targets, untracked };
+  if (!targets.length) {
+    log("no enabled registry entry records a webhookId — nothing to sweep (exit 2: this is not a clean run)");
+    return { code: 2, failed: [], applied: [] };
+  }
+
+  const stateFile = opt("state-file") ?? null;
+  const perTarget = [];
+  let code = 0;
+  for (const t of targets) {
+    // Delivery ids are GitHub-global in practice (19-digit), so one shared acknowledgement file is fine; a
+    // per-repo file would split the audit trail across N files nobody keeps in sync.
+    const innerArgv = ["--repo", t.repo, "--hook", String(t.webhookId)];
+    for (const flag of ["--since", "--skip", "--skip-file"]) {
+      const v = opt(flag.slice(2));
+      if (v !== undefined) innerArgv.push(flag, v);
+    }
+    // Per-target breadcrumb next to the aggregate, so a finding names the repo it belongs to.
+    if (stateFile) innerArgv.push("--state-file", `${stateFile}.${t.repo.replace("/", "_")}.json`);
+    log(`\n=== ${t.repo} (hook ${t.webhookId}) ===`);
+    const r = await main({ argv: innerArgv, env, fetchImpl, log });
+    perTarget.push({
+      repo: t.repo,
+      hookId: t.webhookId,
+      code: r.code,
+      inspected: r.inspected ?? 0,
+      undelivered: r.failed?.length ?? 0,
+      acknowledged: r.acknowledged ?? 0,
+      queued: r.queued ?? 0,
+    });
+    code = Math.max(code, r.code);
+  }
+
+  if (stateFile) {
+    try {
+      const sum = (k) => perTarget.reduce((n, t) => n + (t[k] ?? 0), 0);
+      writeSweepState(
+        stateFile,
+        {
+          ...sweepStatePayload({
+            repo: `${perTarget.length} repos`,
+            hookId: perTarget.map((t) => t.hookId).join(","),
+            mode: argv.includes("--apply") ? "apply" : "dry-run",
+            inspected: sum("inspected"),
+            undelivered: sum("undelivered"),
+            queued: sum("queued"),
+            since: parseSince(opt("since")),
+            acknowledged: sum("acknowledged"),
+          }),
+          targets: perTarget,
+          untracked,
+        },
+      );
+    } catch (e) {
+      log(`warning: could not write aggregate --state-file ${stateFile}: ${e.message}`);
+    }
+  }
+  return { code, failed: [], applied: [], targets: perTarget, untracked };
+}
+
 export async function main({ argv = process.argv.slice(2), env = process.env, fetchImpl = ghFetch, log = console.log } = {}) {
   const args = new Set(argv);
   const opt = (name) => {
@@ -275,8 +367,14 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   const skipArg = (opt("skip") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   const skipFile = opt("skip-file") ?? null;
 
+  // Multi-repo modes short-circuit the single (repo, hook) path entirely.
+  if (args.has("--from-registry")) return runRegistrySweep({ argv, env, fetchImpl, log });
+  if (args.has("--list-targets")) return runRegistrySweep({ argv, env, fetchImpl, log, listOnly: true });
+
   if (!repo || !hookId) {
     log("usage: node fleet/redeliver-failed.mjs --repo owner/repo --hook <hook_id> [--since <ISO|24h>] [--skip <id,id> | --skip-file <path>] [--only <id,id>] [--state-file <path>] [--apply]");
+    log("       node fleet/redeliver-failed.mjs --from-registry [--state-file <path>] [--since 24h] [--skip-file <path>] [--apply]");
+    log("       node fleet/redeliver-failed.mjs --list-targets   (what would be swept, no network)");
     return { code: 2, failed: [], applied: [] };
   }
   const token = resolveToken(env);
@@ -318,7 +416,9 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
 
   if (!failed.length) {
     recordSweep(apply ? "apply" : "dry-run", 0);
-    return { code: 0, failed, applied: [] };
+    // Counts travel with the verdict: an aggregate that reported `inspected: 0` for a sweep that looked at
+    // 110 records would be worse than reporting nothing.
+    return { code: 0, failed, applied: [], inspected: all.length, acknowledged, queued: 0 };
   }
 
   if (!apply) {
@@ -326,7 +426,8 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
     log("DRY RUN — nothing re-driven. Re-run with --apply to POST delivery attempts.");
     log("  (A policy refusal is NOT listed here: those answer 2xx and GitHub records them as OK.)");
     recordSweep("dry-run", 0);
-    return { code: 1, failed, applied: [] }; // nonzero so a scheduled run surfaces in mail/logs
+    // nonzero so a scheduled run surfaces in mail/logs
+    return { code: 1, failed, applied: [], inspected: all.length, acknowledged, queued: 0 };
   }
 
   const applied = [];
@@ -338,7 +439,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, fe
   const queued = applied.filter((a) => a.ok).length;
   log(`${queued}/${applied.length} redelivery attempt(s) queued. GitHub accepted != delivered — check again next run.`);
   recordSweep("apply", queued);
-  return { code: applied.every((a) => a.ok) ? 0 : 1, failed, applied };
+  return { code: applied.every((a) => a.ok) ? 0 : 1, failed, applied, inspected: all.length, acknowledged, queued };
 }
 
 /**

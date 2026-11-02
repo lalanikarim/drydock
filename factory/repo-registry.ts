@@ -93,6 +93,16 @@ export interface RepoEntry {
   refine: boolean;
   /** Label that requests refinement. Must differ from eligibilityLabel (enforced at load). */
   refineLabel: string;
+  /**
+   * The repository webhook id whose deliveries this deployment receives (#107 sweep).
+   *
+   * Policy-adjacent rather than secret: it is a fact about which GitHub configuration feeds this fleet, and it
+   * belongs here precisely so that onboarding is incomplete without it. Before this field existed the sweep's
+   * target list lived only in an installed launchd plist, so adding engram to the registry silently left its
+   * deliveries unswept — a compensating control that does not follow the thing it protects is not a control.
+   * Absent means "nobody recorded it", which `missingWebhookIds` reports.
+   */
+  webhookId?: number;
   /** Human-facing note carried alongside the entry; never read for enforcement. */
   note?: string;
   oracleBoot: OracleBoot | null;
@@ -224,7 +234,7 @@ export function validateRegistry(raw: unknown): Registry {
             `$${CONFIG_DIR_ENV}/<owner>_<repo>.json (default ~/.drydock/configs) — move the file there and delete the key.`,
         );
       }
-      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "note"].includes(key)) {
+      if (!["repo", "enabled", "autoMerge", "eligibilityLabel", "oracleBoot", "pathAllowlist", "protectedPaths", "requireVerification", "prFeedback", "refine", "refineLabel", "webhookId", "note"].includes(key)) {
         throw new Error(`registry.repos[${i}]: unknown field: ${key}`);
       }
     }
@@ -272,6 +282,17 @@ export function validateRegistry(raw: unknown): Registry {
       prFeedback: r.prFeedback === undefined ? defaults.prFeedback : requireBoolean(r.prFeedback, `${repo}: prFeedback`),
       refine: refineEnabled,
       refineLabel: refineLabelValue,
+      // No default: "we do not know which hook feeds this repo" must stay representable, because inventing a
+      // plausible id is worse than admitting the gap — a typo'd id sweeps some other repo forever.
+      ...(r.webhookId === undefined || r.webhookId === null
+        ? {}
+        : Number.isSafeInteger(r.webhookId) && (r.webhookId as number) > 0
+          ? { webhookId: r.webhookId as number }
+          : (() => {
+              throw new Error(
+                `registry.repos[${i}].webhookId must be a positive integer GitHub hook id (not a string), got: ${JSON.stringify(r.webhookId)}`,
+              );
+            })()),
       ...(typeof r.note === "string" ? { note: r.note } : {}),
     };
   });
@@ -317,6 +338,26 @@ export function registryRepoNames(registry: Registry): string[] {
 
 export function enabledRepos(registry: Registry): RepoEntry[] {
   return registry.repos.filter((r) => r.enabled);
+}
+
+/**
+ * Repos the failed-delivery sweep must cover: every ENABLED entry with a recorded hook id.
+ *
+ * Derived from policy on purpose. The alternative — a target list inside a launchd plist — is how engram sat
+ * unswept from the day it was onboarded: nothing connected "you added a repo" to "a control now needs to know
+ * about it".
+ */
+export function sweepTargets(registry: Registry): Array<{ repo: string; webhookId: number }> {
+  return enabledRepos(registry)
+    .filter((e) => typeof e.webhookId === "number")
+    .map((e) => ({ repo: e.repo, webhookId: e.webhookId as number }));
+}
+
+/** Enabled repos with no hook id recorded — the sweep's blind spot, stated rather than discovered later. */
+export function missingWebhookIds(registry: Registry): string[] {
+  return enabledRepos(registry)
+    .filter((e) => typeof e.webhookId !== "number")
+    .map((e) => e.repo);
 }
 
 /** One entry by exact repo name, with a message that lists what IS in the registry. */

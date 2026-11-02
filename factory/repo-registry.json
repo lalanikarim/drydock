@@ -42,6 +42,7 @@
     {
       "repo": "lalanikarim/drydock",
       "enabled": true,
+      "webhookId": 703101252,
       "autoMerge": false,
       "pathAllowlist": [
         "factory/",
@@ -62,6 +63,7 @@
     {
       "repo": "lalanikarim/engram",
       "enabled": true,
+      "webhookId": 706043067,
       "autoMerge": false,
       "pathAllowlist": [
         "app/src/",

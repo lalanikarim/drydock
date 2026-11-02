@@ -413,7 +413,14 @@ conversation is no longer on the webhook path`.
 Run the sweep after any supervisor restart, and on a schedule otherwise:
 
 ```bash
-# report only (default) — nothing is re-driven
+# the one to run: sweep every deployed repo, targets derived from factory/repo-registry.json
+node --experimental-strip-types fleet/redeliver-failed.mjs --from-registry --since 24h \
+  --skip-file fleet/data/acknowledged-deliveries.txt --state-file fleet/data/last-sweep.json
+
+# what it would sweep, and what it cannot see (no network)
+node --experimental-strip-types fleet/redeliver-failed.mjs --list-targets
+
+# report only (default) — nothing is re-driven; single repo when you already know which one
 node fleet/redeliver-failed.mjs --repo lalanikarim/drydock --hook <hook_id> --since 2026-11-01T00:00:00Z
 
 # re-drive everything it found
@@ -431,6 +438,8 @@ What the output means:
 - **A policy refusal is never listed.** Those answer 2xx, GitHub records them as `OK`, and re-driving them would replay something we rejected on purpose. The sweep only ever sees infrastructure failures (`timeout`, `failed to connect to host`, `Invalid HTTP Response: 50x`).
 - **`HTTP 202 queued` is not delivered.** Check again next run; the second run's report is the confirmation.
 - **Re-driving an already-consumed issue is safe.** Intake deduplicates on `requestId` (`issue-<n>`), so a redelivered `labeled` event for work that already ran does not start a second worker. Re-driving a `ping` or any non-eligible event is inert — it lands as `not an eligible event`.
+- **`--from-registry` is the form that stays correct; `--repo/--hook` is the form that drifts.** Targets come from each enabled registry entry's `webhookId`, so onboarding a repo and forgetting to record its hook id produces `WARNING enabled repos with no webhookId — their deliveries are NOT swept: …` in the job's log instead of silence. That warning is the point: engram was onboarded on 2026-10-31 and its failures went unswept until 2026-11-02, because the target list existed only inside an installed launchd plist that nothing diffed against anything.
+- **`exit 2` also means "nothing was swept"** — a run with no targets is never reported as clean (the R6/R10 rule again: "not collected" and "passing" are the same color).
 - **Delivery ids are 19 digits, and jq cannot be trusted with them either.** They exceed `Number.MAX_SAFE_INTEGER`, so anything that parses the delivery log as JSON numbers rounds them and then addresses a record that does not exist. Not hypothetical — observed on this hook: `gh api … --jq '.[0].id'` prints `3851559675096989696` where the response's own digits are `3851559675096989700`, because jq parses numbers as float64 and `tostring` cannot undo it. The tool quotes oversized ids before parsing (`safeParse`) for exactly that reason; don't reimplement it with `jq -r .id`, `Number(id)`, or a column typed `int`.
 
 First run against this deployment, 2026-11-01: **72 delivery records inspected, 34 not delivered since 2026-10-31** — 18 connection failures (funnel down), 5×`503`, 4×`502`, 4 connect failures, 3×`403` (the secret-mismatch window). Every one of those was an event the factory never saw, and nothing in any log said so. Treat that number as a baseline to drive toward zero, not as reassuring history.
@@ -439,16 +448,18 @@ First run against this deployment, 2026-11-01: **72 delivery records inspected, 
 
 The decision #110 was waiting on, made: **launchd, not cron**. A laptop sleeps, and `cron` skips the jobs it would have run during sleep without ever catching up — which is precisely the window in which webhook deliveries fail. `StartInterval` resumes on wake, and `KeepAlive=false` keeps each run a short-lived process instead of another daemon to supervise.
 
-**Installed on this machine (2026-11-01):** label `com.drydock.redeliver`, every 900s + at load, `--since 24h --skip-file fleet/data/acknowledged-deliveries.txt --state-file fleet/data/last-sweep.json`, report-only, log at `~/Library/Logs/drydock-redeliver.log`.
+**Installed on this machine (2026-11-01; switched to derived targets 2026-11-02):** label `com.drydock.redeliver`, every 900s + at load, `--from-registry --since 24h --skip-file … --state-file fleet/data/last-sweep.json`, report-only, log at `~/Library/Logs/drydock-redeliver.log`.
+
+The unit file is now committed as `fleet/launchd/com.drydock.redeliver.plist.example`. It was *referenced* by this runbook since #110 and never committed — which is exactly why the drift was invisible: the installed job was the only copy of "what gets swept", so nothing could diff it against intent. Two things if you re-install: it needs `--experimental-strip-types` (the sweep imports `factory/repo-registry.ts`; without the flag the job dies on a syntax error and launchd reports an ordinary non-zero exit), and it has no placeholders, so `cp` is the whole edit.
 
 ```bash
 cp fleet/launchd/com.drydock.redeliver.plist.example ~/Library/LaunchAgents/com.drydock.redeliver.plist
-# edit the __PLACEHOLDER__s: node path, repo paths, hook id, interval (default 900s = 15 min)
 plutil -lint ~/Library/LaunchAgents/com.drydock.redeliver.plist   # a typo'd plist fails silently otherwise
+launchctl bootout gui/$(id -u)/com.drydock.redeliver 2>/dev/null  # retire the running definition first
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drydock.redeliver.plist
 launchctl kickstart -k gui/$(id -u)/com.drydock.redeliver        # run once, now
-launchctl print gui/$(id -u)/com.drydock.redeliver | grep -E "state|last exit code"
-tail -20 ~/Library/Logs/drydock-redeliver.log
+launchctl print gui/$(id -u)/com.drydock.redeliver | grep -E "state =|last exit code|runs ="
+tail -30 ~/Library/Logs/drydock-redeliver.log   # must name EVERY deployed repo — that is the check
 launchctl bootout gui/$(id -u)/com.drydock.redeliver             # stop
 ```
 
@@ -602,7 +613,7 @@ delivery path is unverified is a notification feature you find out about by not 
 | 1 | Runtime config exists for every repo in the fleet | `ls ~/.drydock/configs` (or `$DRYDOCK_CONFIG_DIR`) | one `<owner>_<repo>.json` each; see §1a |
 | 2 | Core is installed at the pinned version | `engram-core --version` | matches the pin in `docs/` / the runbook header |
 | 3 | `.env` complete | compare against `.env.example` | model base URL + key, App id/key/installation, per-repo webhook secrets, Telegram pair (optional) |
-| 4 | Registry says the repo is enabled | `node --experimental-strip-types factory/audit-registry.ts` | enabled, `eligibilityLabel: "agent"`, `autoMerge: false` |
+| 4 | Registry posture per enabled repo — labels, auto-merge, path scope, **hook id** | `node --experimental-strip-types factory/audit-registry.mjs fleet/fleet.local.json` | every repo this fleet deploys prints a real `hook=<id>` and exit is 0. (This row used to name `factory/audit-registry.ts`, which was never written, and quoted `eligibilityLabel: "agent"` when both deployed repos use `build` — a checklist line that fails with MODULE_NOT_FOUND trains you to skim past it.) WARN lines for `autoMerge` or a missing path allowlist are policy statements, not failures |
 | 5 | App permission posture | `node gates/github-app-check.mjs` | every managed repo answers `200` on both read and write probes; `Can merge? YES` |
 | 6 | Nothing already holds the lock or the port | `cat fleet/data/routes.json.lock` (a bare pid; `ps -p <pid>` must fail), `lsof -nP -i :9700` | lock file absent or stale, listener port free |
 | 7 | Webhook points at the current funnel URL | `gh api repos/<repo>/hooks --jq '.[].config.url'` | URL matches `tailscale funnel status` |

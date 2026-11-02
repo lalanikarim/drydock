@@ -170,3 +170,138 @@ test("redeliver() reports the delivery id it acted on", async () => {
   const r = await redeliver({ repo: "o/r", hookId: 9, deliveryId: 42, token: "t", fetchImpl: impl });
   assert.deepEqual(r, { deliveryId: 42, ok: true, status: 202 });
 });
+
+// ---- multi-repo sweep: targets derived from the registry, not from the scheduler ------------------
+//
+// Why these exist: engram was onboarded, started receiving webhooks, and its failed deliveries went
+// unswept because the sweep's target list lived in an installed launchd plist. Nothing connected "a repo was
+// added" to "the recovery control must know". These assert the control now reads the same file the factory
+// does — and that "there was nothing to sweep" can never be reported as success.
+
+import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const scratch = () => mkdtempSync(join(tmpdir(), "sweep-targets-"));
+
+const registryWith = (repos) => {
+  const path = join(scratch(), "repo-registry.json");
+  writeFileSync(path, JSON.stringify({ defaults: { eligibilityLabel: "agent", autoMerge: true, enabled: true }, repos }));
+  return path;
+};
+
+/** Fake GitHub whose delivery list depends on the hook in the URL, so per-repo behavior is observable. */
+const fakeHooks = (byHook) => {
+  const seen = [];
+  const fetchImpl = async (path) => {
+    const m = /\/hooks\/(\d+)\/deliveries/.exec(path);
+    seen.push(m ? m[1] : path);
+    if (path.includes("/redeliveries")) return { ok: true, status: 202, body: {} };
+    return { ok: true, status: 200, body: m ? byHook[m[1]] ?? [] : [], headers: {} };
+  };
+  return { fetchImpl, seen };
+};
+
+test("--from-registry sweeps EVERY enabled repo that records a webhookId", async () => {
+  const reg = registryWith([
+    { repo: "a/one", enabled: true, webhookId: 111 },
+    { repo: "a/two", enabled: true, webhookId: 222 },
+    // A disabled entry must also drop autoMerge (the registry enforces that); it is here only to prove
+    // the sweep leaves undeployed repos alone.
+    { repo: "a/three", enabled: false, autoMerge: false, webhookId: 333 },
+  ]);
+  // Timestamped now: --since 24h is part of the invocation, and a stale fixture date would silently
+  // exercise window filtering instead of target selection.
+  const now = new Date().toISOString();
+  const { fetchImpl, seen } = fakeHooks({
+    111: [fail(1, "Invalid HTTP Response: 502", { delivered_at: now })],
+    222: [ok(2), ok(3)],
+    333: [fail(9, "timeout", { delivered_at: now })],
+  });
+  const lines = [];
+  const r = await main({
+    argv: ["--from-registry", "--registry", reg, "--since", "24h"],
+    env: { GITHUB_TOKEN: "t" },
+    fetchImpl,
+    log: (l) => lines.push(l),
+  });
+  assert.deepEqual(seen.sort(), ["111", "222"], "both enabled repos queried; the disabled one never touched");
+  assert.equal(r.code, 1, "one repo had findings → the run is not clean");
+  assert.ok(lines.some((l) => l.includes("a/one (hook 111)")), "each target announced before it is swept");
+});
+
+test("aggregate state sums the targets and names them, so a finding says which repo", async () => {
+  const reg = registryWith([
+    { repo: "a/one", enabled: true, webhookId: 111 },
+    { repo: "a/two", enabled: true, webhookId: 222 },
+  ]);
+  const stateFile = join(scratch(), "last-sweep.json");
+  const { fetchImpl } = fakeHooks({
+    111: [fail(1, "timeout"), ok(2), ok(3)],
+    222: [ok(4)],
+  });
+  // a/one has one failure; make it acknowledged so both counts are exercised
+  const skipFile = join(scratch(), "ack.txt");
+  writeFileSync(skipFile, "1\n");
+  await main({
+    argv: ["--from-registry", "--registry", reg, "--state-file", stateFile, "--skip-file", skipFile],
+    env: { GITHUB_TOKEN: "t" },
+    fetchImpl,
+    log: () => {},
+  });
+  const agg = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.equal(agg.inspected, 4, "sum across targets — a sweep that saw 4 records must not report 0");
+  assert.equal(agg.undelivered, 0);
+  assert.equal(agg.acknowledged, 1, "acknowledgements travel with the aggregate, or 'clean' lies by omission");
+  assert.deepEqual(agg.targets.map((t) => t.repo), ["a/one", "a/two"]);
+  assert.deepEqual(agg.targets.map((t) => t.inspected), [3, 1]);
+});
+
+test("an enabled repo with no webhookId is reported as unswept, not silently skipped", async () => {
+  const reg = registryWith([
+    { repo: "a/one", enabled: true, webhookId: 111 },
+    { repo: "a/forgotten", enabled: true }, // onboarded, hook never recorded — the engram case
+  ]);
+  const stateFile = join(scratch(), "last-sweep.json");
+  const { fetchImpl, seen } = fakeHooks({ 111: [] });
+  const lines = [];
+  await main({ argv: ["--from-registry", "--registry", reg, "--state-file", stateFile], env: { GITHUB_TOKEN: "t" }, fetchImpl, log: (l) => lines.push(l) });
+  assert.ok(lines.some((l) => /NOT swept/i.test(l) && l.includes("a/forgotten")), "the blind spot is said out loud");
+  assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")).untracked, ["a/forgotten"]);
+  assert.deepEqual(seen, ["111"]);
+});
+
+test("no targets at all exits non-zero — 'nothing collected' is not 'passing'", async () => {
+  const reg = registryWith([{ repo: "a/one", enabled: true }]);
+  const lines = [];
+  const r = await main({ argv: ["--from-registry", "--registry", reg], env: { GITHUB_TOKEN: "t" }, fetchImpl: async () => ({ ok: true, status: 200, body: [], headers: {} }), log: (l) => lines.push(l) });
+  assert.equal(r.code, 2, "a sweep that examined zero repos must never look like a clean run (R6/R10)");
+  assert.ok(lines.some((l) => /nothing to sweep/i.test(l)));
+});
+
+test("--list-targets answers without touching the network", async () => {
+  const reg = registryWith([{ repo: "a/one", enabled: true, webhookId: 111 }]);
+  const lines = [];
+  const r = await main({
+    argv: ["--list-targets", "--registry", reg],
+    env: { GITHUB_TOKEN: "t" },
+    fetchImpl: async () => {
+      throw new Error("network was used");
+    },
+    log: (l) => lines.push(l),
+  });
+  assert.equal(r.code, 0);
+  assert.ok(lines.some((l) => l.includes("a/one hook 111")));
+});
+
+test("an unreadable registry is a hard failure, not an empty sweep", async () => {
+  const lines = [];
+  const r = await main({
+    argv: ["--from-registry", "--registry", join(scratch(), "nope.json")],
+    env: { GITHUB_TOKEN: "t" },
+    fetchImpl: async () => ({ ok: true, status: 200, body: [], headers: {} }),
+    log: (l) => lines.push(l),
+  });
+  assert.equal(r.code, 2);
+  assert.ok(lines.some((l) => /refusing to sweep nothing/i.test(l)));
+});
