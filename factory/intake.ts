@@ -49,6 +49,9 @@ export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
  * registry declared drydock's as "build" — a drydock factory would have booted, passed every health
  * check, and never received work, because no event could ever match.
  */
+/** When THIS process began serving, for the runbook \u00a77 staleness check (#143). */
+const PROCESS_STARTED_AT = new Date().toISOString();
+
 export function isAgentIssueEvent(event: any, eligibilityLabel: string = AGENT_LABEL): boolean {
   if (!event || typeof event !== "object") return false;
   if (event.action === "labeled") return event.label?.name === eligibilityLabel;
@@ -419,6 +422,12 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
         // healthy fleet on 2026-11-02 (#133). `status` stays "ok" while the listener itself is alive and
         // answering correctly; that is what liveness means here, and consumers of this field keep working.
         const body: Record<string, unknown> = { status: "ok" };
+        // "Is this daemon older than the tree it reads?" was answerable only by comparing `ps -o lstart=`
+        // against `git log -1` by hand (#143). Two harmless fields settle it from outside: when this process
+        // booted, and which commit the supervisor that spawned it was running. No repo names, no hosts.
+        body.startedAt = PROCESS_STARTED_AT;
+        const buildSha = (process.env.DRYDOCK_BUILD_SHA ?? "").trim();
+        if (buildSha) body.build = { sha: buildSha };
         const inf = inferenceStatus?.() ?? null;
         if (inf) body.inference = { state: inf.state, reachable: inf.reachable, total: inf.total, checkedAt: inf.checkedAt };
         res.writeHead(200, { "content-type": "application/json" });
