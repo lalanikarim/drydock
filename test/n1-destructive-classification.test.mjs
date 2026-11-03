@@ -90,10 +90,15 @@ test("B1: discarding output to /dev/null is not a destructive write", () => {
   assert.equal(tierOf("cd /sandbox && npm test 2>/dev/null"), null);
 });
 
-test("B2: a word appearing as search text or in a string is not the action it names", () => {
+test("B2: a word appearing as search text is not the action it names", () => {
   assert.equal(tierOf("grep -rn 'shutdown' src/"), null);
   assert.equal(tierOf("cat src/server.mjs | grep reboot"), null);
-  assert.equal(tierOf(`node -e "console.log('DROP TABLE x')"`), null);
+  // `node -e "console.log('DROP TABLE x')"` used to be asserted null here. It is not any more, and that is
+  // the deliberate half of engram#63: under a code-executing head (`sh -c`, `python3 -c`, `node -e`) quoted
+  // text IS the program, so masking it was the hole that let `node -e "require('fs').rmSync(...)"` through
+  // unclassified (see F1). Data positions in ordinary commands are still masked; interpreter bodies are not
+  // data. The cost is a false positive on a harmless `-e` string, which costs one approval prompt rather
+  // than a silent bypass — the asymmetry is why we reported it upstream rather than tuned around it.
 });
 
 test("B3: writing a script that contains a dangerous line is not running it", () => {
@@ -102,14 +107,20 @@ test("B3: writing a script that contains a dangerous line is not running it", ()
 
 test("B4: candidate reduction splits simple commands and masks data positions", () => {
   assert.deepEqual(destructiveCandidates("echo hi >/dev/null && grep -rn 'shutdown' src/").length >= 2, true);
-  for (const c of destructiveCandidates(`node -e "rm -rf /"`)) {
-    assert.doesNotMatch(c, /rm -rf/, "quoted data must not reach the patterns as an action");
-  }
+  // Candidate reduction still splits on operators and drops discard sinks: the device write disappears,
+  // the dangerous simple command survives as its own candidate (observed shape: "echo hi ", "rm -rf /tmp/x").
+  const split = destructiveCandidates("echo hi >/dev/null && rm -rf /tmp/x");
+  assert.ok(split.length >= 2, `expected a candidate per simple command, got ${JSON.stringify(split)}`);
+  assert.ok(!split.some((c) => c.includes("/dev/null")), `discard sinks are dropped, not matched: ${JSON.stringify(split)}`);
+  assert.ok(split.some((c) => /rm -rf \/tmp\/x/.test(c)), "the real deletion is still visible as a candidate");
+  // …but under a code-executing head the payload reaches the patterns on purpose (engram#63 / F1). Asserting
+  // the old masking here would be asserting the vulnerability we asked upstream to close.
+  assert.ok(destructiveCandidates(`node -e "rm -rf /"`).some((c) => /rm -rf/.test(c)), "interpreter payload stays visible");
 });
 
-// --------------------------------- C. pin characterization (engram v0.2.0, hook level)
+// ------------------- C. pin characterization (engram v0.2.1 through the real approval hook, hook level)
 
-test("C1: PIN CHARACTERIZATION v0.2.0 — benign commands run, real destruction blocks", async () => {
+test("C1: PIN CHARACTERIZATION v0.2.1 — benign commands run, real destruction blocks", async () => {
   for (const command of ["npm ci >/dev/null 2>&1", "grep -rn 'shutdown' src/", "node --test"]) {
     assert.equal(await blockFor(command, gates), undefined, `expected no block: ${command}`);
   }
@@ -118,7 +129,7 @@ test("C1: PIN CHARACTERIZATION v0.2.0 — benign commands run, real destruction 
   assert.match(blocked, /classified DESTRUCTIVE/);
 });
 
-test("C2: PIN CHARACTERIZATION v0.2.0 — the built-in floor is still not removable by config alone", () => {
+test("C2: PIN CHARACTERIZATION v0.2.1 — the built-in floor is still not removable by config alone", () => {
   const withExtra = compileGates({ ...MINIMAL_GATES, destructivePatterns: ["\\bpay_money\\b"] });
   assert.ok(withExtra.destructive.length > DEFAULT_DESTRUCTIVE_PATTERNS.length, "destructivePatterns is append-only");
   // RegExp.source re-escapes "/" as "\/", so compare against the same normalization.
@@ -168,20 +179,29 @@ test("E1: the worker prompt carries no destructive-guard workarounds (issue #40)
   assert.match(prompt, /do not push/i, "no-remote rule is still prompt-enforced");
 });
 
-// ------------------- F. known narrowings at v0.2.0 (asserted as-is; see the upstream review note)
+// --------- F. narrowings we reported upstream, now closed at v0.2.1 (were characterization at v0.2.0)
+//
+// These two tests used to document gaps: `null` was the expected answer and the comment said
+// "characterization, not endorsement". engram#63 fixed both halves (PR #70, tagged `v0.2.1`, vendored at
+// that tag since this bump), so the assertions are inverted — they now guard the floor rather than
+// memorialize its holes. That inversion is the point of keeping characterization tests in the first place:
+// a bump that changed behavior had to make noise here, and it did.
+//
+// History, because "why does this file mention two versions" is otherwise unanswerable: #41 reviewed the
+// v0.2.0 guard and found (F1) quoted payloads through non-shell interpreter heads classified as data and
+// (F2) a redirection drop broad enough to swallow writes to block devices. Filed upstream as engram#63,
+// fixed there, re-pinned knowingly on 2026-11-03 after the full suite ran green on this commit.
 
-test("F1: only shell-interpreter heads treat quoted text as live code — other interpreters do not", () => {
-  // Characterization, not endorsement: `sh -c` is caught but equivalent payloads through other
-  // runtime heads are masked as data. Harmless for factory workers (they run in the sealed
-  // sidecar), a real narrowing of the floor for uncontained hosts.
+test("F1: every code-executing interpreter head treats quoted text as live code (v0.2.1, was a gap at v0.2.0)", () => {
   assert.equal(tierOf(`sh -c "rm -rf /tmp/x"`), "destructive");
-  assert.equal(tierOf(`python3 -c "import os; os.system('rm -rf /tmp/x')"`), null);
-  assert.equal(tierOf(`node -e "require('fs').rmSync('/tmp/x',{recursive:true})"`), null);
+  assert.equal(tierOf(`python3 -c "import os; os.system('rm -rf /tmp/x')"`), "destructive");
+  assert.equal(tierOf(`node -e "require('fs').rmSync('/tmp/x',{recursive:true})"`), "destructive");
 });
 
-test("F2: the redirection drop is broader than output discarding", () => {
-  // The pre-v0.2.0 pattern `>\\s*/dev/` also guarded writes onto devices; dropping every
-  // /dev/* redirection now lets `> /dev/sda` through while `dd if=` is still caught.
+test("F2: only discard sinks are dropped from redirections; writes to devices still classify (v0.2.1)", () => {
   assert.equal(tierOf("dd if=/dev/zero of=/dev/sda"), "destructive");
-  assert.equal(tierOf("echo payload > /dev/sda"), null);
+  assert.equal(tierOf("echo payload > /dev/sda"), "destructive");
+  // The #53 false-positive fix must survive the narrowing: discarding output is not a write.
+  assert.equal(tierOf("npm ci >/dev/null 2>&1"), null);
+  assert.equal(tierOf("cat x > /dev/null"), null);
 });
