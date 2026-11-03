@@ -51,7 +51,7 @@ import { tmpdir } from "node:os";
 import { startIntakeServer } from "../factory/intake.ts";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, waitForToolResult } from "./lib.ts";
 import { classifyFixPattern, formatClassification } from "./fix-pattern.mjs";
-import { contractFor, preflightArms, armBranch, lessonsContent, validateLessonText, LESSON_TEXT } from "./g5-traps.mjs";
+import { contractFor, preflightArms, armBranch, lessonsContent, validateLessonText, experimentVerdict, LESSON_TEXT } from "./g5-traps.mjs";
 
 const exec = promisify(execFile);
 const argv = process.argv.slice(2);
@@ -245,25 +245,9 @@ async function runArm({ runDir, repo, arm, lessonText }) {
 
 function verdict(results) {
   const [a, b] = results.arms;
-  const fails = [];
-
-  // "Nothing measured" must never read as success — that is the #145 defect in one line.
-  for (const arm of [a, b]) if (!arm.classification.measured) fails.push(`arm ${arm.arm} produced an empty diff — nothing was measured`);
-
-  const distinctArtifacts = a.prNumber !== b.prNumber && a.issue !== b.issue && a.branch !== b.branch;
-  if (!distinctArtifacts) fails.push("both arms resolved to the same artifact — arms are not isolated (#145)");
-
-  if (a.classification.rootFix)
-    fails.push(
-      `arm A (baseline, no lessons) already produced a root fix: ${a.classified}\n  The trap no longer exercises the anti-pattern, so this experiment cannot measure the lesson. Author a fresh equivalent pair against current main (gates/g5-traps.mjs) and re-run.`,
-    );
-  if (b.classification.handlerPatch)
-    fails.push(
-      `arm B (with lessons) still patched a handler: ${b.classified}\n  Before concluding anything about the loop, check arm B's intake log and lessons file — the likelier cause is that the lesson never reached the prompt.`,
-    );
-
-  const attribution = distinctArtifacts && a.classification.measured && b.classification.measured ? "strong" : "weak";
-  results.verdict = fails.length ? "fail" : "pass";
+  // The decision rule lives in g5-traps.mjs (pure, unit-tested) so it can be argued with instead of re-derived here.
+  const { status, attribution, fails } = experimentVerdict(results.arms);
+  results.verdict = status;
   results.attribution = attribution;
   writeFileSync(join(process.cwd(), "g5-results.json"), JSON.stringify(results, null, 2));
 

@@ -277,3 +277,114 @@ test("lessonsContent keeps arm A empty and normalizes a variant into lesson shap
   const bare = lessonsContent(true, "A rule with no marker.");
   assert.match(bare, /^- \[\d{4}-\d{2}-\d{2}\] A rule with no marker\.\n$/, "a variant file without the marker is wrapped, not passed through raw");
 });
+
+// ── the mismatched-surface variant (#176) ────────────────────────────────────────────────────────────────
+//
+// #168 proved a lesson containing an imitable shape changes behavior — but arm B copied the lesson's own identifiers,
+// so "did it transfer the rule or pattern-match the vocabulary?" is still open. This variant is the control: same
+// STRUCTURE as the working lesson (a typed error carrying its own status + one guard to define once), deliberately
+// mismatched SURFACE (limits on a value, never request payloads). If an input-shape trap still gets a root fix, the
+// rule transferred. If it reverts to handler-local, the loop keys on surface tokens — which changes how lessons should
+// be authored and retrieved.
+
+test("the domain-limits variant keeps the structure and drops the surface", () => {
+  const text = readFileSync(join(FX, "lesson-domain-limits.md"), "utf8");
+  assert.deepEqual(validateLessonText(text), [], `must satisfy the same rules as the default: ${validateLessonText(text).join("; ")}`);
+
+  // Structure held constant with the lesson that worked in #168.
+  const working = readFileSync(join(FX, "lesson-imitable.md"), "utf8");
+  for (const [name, body] of [["working", working], ["variant", text]]) {
+    assert.match(body, /class\s+\w*Error\s+extends\s+Error/, `${name} declares an error type`);
+    assert.match(body, /this\.statusCode\s*=\s*/, `${name} carries its own status`);
+    assert.match(body, /function\s+assert\w*\s*\(|function\s+require\w*\s*\(/, `${name} names one guard to define once`);
+  }
+
+  // Surface deliberately absent: no word of the input-shape vocabulary the trap is made of. This assertion is the
+  // experiment — a future edit that reintroduces "body"/"object" silently turns it back into a surface match.
+  for (const word of ["body", "object", "array", "null", "parse", "destructure", "shape", "request"]) {
+    assert.doesNotMatch(text, new RegExp(`\\b${word}\\b`, "i"), `the variant must not mention "${word}"`);
+  }
+});
+
+// ── the fourth captured diff, and a verdict that can say "I don't know" (#176) ────────────────────────────
+//
+// PR #83 (fixture repo) is arm B of the mismatched-surface run: it put `if (not an object) throw new TypeError(...)`
+// into store.validate(), the function every call path already calls. Verified against a running server — one change
+// closed both traps (#71 and #72), suite 125/125. The classifier read it as neither signal and the old verdict printed
+// EXPERIMENT PASSED. Both halves of that are defects: a root fix the detector cannot see, and a pass for a run nobody
+// read.
+
+test("a guard added where the rule lives is a root fix (captured: fixture PR #83)", () => {
+  const c = classifyFixPattern(diff("domain-guard-pr83.diff"), contractFor(72));
+  assert.ok(c.measured);
+  assert.equal(c.rootFix, true, `expected the domain guard to count; reasons: ${JSON.stringify(c.reasons)}`);
+  assert.equal(c.handlerPatch, false, "no translation was added in a handler-layer file");
+  assert.ok(c.reasons.rootFix.some((r) => /where the rule lives/.test(r)), JSON.stringify(c.reasons));
+  assert.ok(c.signals.domainChanged);
+});
+
+test("a bare throw with no condition is not a guard", () => {
+  const c = classifyFixPattern(
+    ["--- a/src/store.mjs", "+++ b/src/store.mjs", "+throw new Error('nope')"].join("\n"),
+    contractFor(72),
+  );
+  assert.equal(c.rootFix, false, "an unconditional throw in a domain file is a refactor, not a guard");
+});
+
+const { experimentVerdict } = await import("../gates/g5-traps.mjs");
+
+const armOf = (label, over = {}) => ({
+  arm: label,
+  issue: label === "A" ? 71 : 72,
+  branch: `agent/issue-${label === "A" ? 71 : 72}`,
+  prNumber: label === "A" ? 82 : 83,
+  classification: { measured: true, rootFix: false, handlerPatch: false },
+  ...over,
+});
+
+test("verdict: baseline patches a handler and the lessons arm fixes the rule — the only pass", () => {
+  const v = experimentVerdict([
+    armOf("A", { classification: { measured: true, rootFix: false, handlerPatch: true } }),
+    armOf("B", { classification: { measured: true, rootFix: true, handlerPatch: false } }),
+  ]);
+  assert.equal(v.status, "pass");
+  assert.equal(v.attribution, "strong");
+  assert.deepEqual(v.fails, []);
+});
+
+test("verdict: an arm reading as neither signal is inconclusive, never a pass", () => {
+  const bNeither = experimentVerdict([
+    armOf("A", { classification: { measured: true, rootFix: false, handlerPatch: true } }),
+    armOf("B"),
+  ]);
+  assert.equal(bNeither.status, "fail");
+  assert.ok(bNeither.fails.some((f) => /INCONCLUSIVE/.test(f) && /arm B/.test(f)), JSON.stringify(bNeither.fails));
+
+  const aNeither = experimentVerdict([
+    armOf("A"),
+    armOf("B", { classification: { measured: true, rootFix: true, handlerPatch: false } }),
+  ]);
+  assert.equal(aNeither.status, "fail");
+  assert.ok(aNeither.fails.some((f) => /INCONCLUSIVE/.test(f) && /arm A/.test(f)), JSON.stringify(aNeither.fails));
+});
+
+test("verdict: the pre-existing failures still fail", () => {
+  const aRoot = experimentVerdict([
+    armOf("A", { classification: { measured: true, rootFix: true, handlerPatch: false } }),
+    armOf("B", { classification: { measured: true, rootFix: true, handlerPatch: false } }),
+  ]);
+  assert.ok(aRoot.fails.some((f) => /baseline.*already produced a root fix/.test(f)), "trap consumed");
+
+  const bPatched = experimentVerdict([
+    armOf("A", { classification: { measured: true, rootFix: false, handlerPatch: true } }),
+    armOf("B", { classification: { measured: true, rootFix: false, handlerPatch: true } }),
+  ]);
+  assert.ok(bPatched.fails.some((f) => /still patched a handler/.test(f)));
+
+  const empty = experimentVerdict([armOf("A", { classification: { measured: false } }), armOf("B")]);
+  assert.equal(empty.status, "fail");
+  assert.equal(empty.attribution, "weak", "an unmeasured arm cannot carry strong attribution");
+
+  const sameArtifact = experimentVerdict([armOf("A"), { ...armOf("B"), prNumber: 82, issue: 71, branch: "agent/issue-71" }]);
+  assert.ok(sameArtifact.fails.some((f) => /not isolated/.test(f)));
+});
