@@ -157,6 +157,8 @@ Exercises G2/G4 with everything merged since N2 applied. Costs ~10 min of aurora
 
 Two narrowings in the v0.2.0 destructive guard (interpreter-head matching, `/dev` redirection drop; tracked upstream as engram#63). We own the fix conversation instead of waiting on a release. No pin change until it lands and passes the battery.
 
+**Update 2026-11-03 — landed and pinned.** engram tagged `v0.2.1` at `e8791af` (PR #70 closed both halves) and drydock re-pinned to it on the same day: full suite 555/554/0, typecheck clean, `npm run test:boot` green against real inference, and suite F of `test/n1-destructive-classification.test.mjs` inverted from gap-characterization to floor assertions. The bump also surfaced a dependency-class risk that no manifest diff would show: the vendored kernel now needs `croner`, resolved from *our* root `node_modules`, so drydock declares it too.
+
 ---
 
 ## 2026-10-31 — safety posture revisions
