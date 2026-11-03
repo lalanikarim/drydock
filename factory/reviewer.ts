@@ -34,7 +34,7 @@ import { runSetupInContainer } from "./setup-sandbox.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { cloneUrlWithAuth, createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { wrapUntrusted } from "./untrusted.ts";
-import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
+import { abortedOutcome, isRestartAbort, type AbortFacts } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -199,6 +199,12 @@ export type ReviewerInput = {
   [key: string]: unknown;
 };
 
+/**
+ * What a review leaves in the task record: the verdict, or the facts beside an abort (#173 — `abortedOutcome`
+ * carries `result`, and TaskOutcome puts durable extras there, so R has to admit both shapes).
+ */
+export type ReviewerResult = ReviewVerdict | AbortFacts;
+
 /** Durable checkpoint: no conversation until spawn commits one. */
 export type ReviewerState =
   | { phase: "spawn"; convId?: undefined }
@@ -207,8 +213,8 @@ export type ReviewerState =
 export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null, gitAuth }: ReviewerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
   // Generic over the per-phase narrowing (see the same note in worker.ts): the kernel narrows the checkpoint per phase.
-  const guarded = <P extends ReviewerState>(label: string, fn: PhaseHandler<ReviewerInput, P, ReviewerState, ReviewVerdict, object>) =>
-    async (task: RunningTask<ReviewerInput, P, ReviewVerdict>, runtime: TaskRuntime<ReviewerInput, ReviewerState, ReviewVerdict, object>, ctx: Context) => {
+  const guarded = <P extends ReviewerState>(label: string, fn: PhaseHandler<ReviewerInput, P, ReviewerState, ReviewerResult, object>) =>
+    async (task: RunningTask<ReviewerInput, P, ReviewerResult>, runtime: TaskRuntime<ReviewerInput, ReviewerState, ReviewerResult, object>, ctx: Context) => {
     try {
       return await fn(task, runtime, ctx);
     } catch (e) {
@@ -217,7 +223,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
     }
   };
 
-  return defineTask<ReviewerInput, ReviewerState, ReviewVerdict>({
+  return defineTask<ReviewerInput, ReviewerState, ReviewerResult>({
     name: "factory.reviewer",
     version: 1,
     initial: () => ({ phase: "spawn" }),

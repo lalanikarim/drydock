@@ -89,7 +89,7 @@ async function workerReportFromTranscript(api: ToolExecutionApi, ctx: Context): 
 // The reviewer produces this; open-draft-pr consumes it across a task boundary. It used to be re-declared here with
 // optional evidence/concerns while reviewer.ts declared them required — two names for one wire shape, neither side
 // noticing the other change (#173).
-import type { ReviewerInput, ReviewerState, ReviewVerdict } from "./reviewer.ts";
+import type { ReviewerInput, ReviewerResult, ReviewerState, ReviewVerdict } from "./reviewer.ts";
 export type { ReviewVerdict };
 
 /** G4 evidence packager: every non-obvious section of the PR body, assembled from
@@ -171,7 +171,7 @@ export interface OpenDraftPrOptions {
    * `api.createTask(reviewerTaskDef, input, …)` type-check `input` against ReviewerInput — the arguments a tool
    * builds by hand are exactly where a renamed field used to survive until production (#173).
    */
-  reviewerTaskDef: Task<ReviewerInput, ReviewerState, ReviewVerdict, object>;
+  reviewerTaskDef: Task<ReviewerInput, ReviewerState, ReviewerResult, object>;
   testCommand?: string;
   /**
    * Registry policy (decision C1): must a passing verification run exist before this repo's branch

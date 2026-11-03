@@ -26,7 +26,7 @@ import { gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { sanitizeUntrusted } from "./untrusted.ts";
 import type { PathScope } from "./path-scope.ts";
 import { parseRefineBrief, refinePrompt, renderRefineComment, type RefineTrigger } from "./issue-refine.ts";
-import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
+import { abortedOutcome, isRestartAbort, type AbortFacts } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -154,7 +154,7 @@ export type RefineState =
   | { phase: "wait"; convId: ConversationId };
 
 /** What a successful refinement leaves in the task record. */
-export type RefineResult = { posted: boolean; commentUrl: string; brief: string };
+export type RefineResult = { posted: boolean; commentUrl: string; brief: string } | AbortFacts;
 
 export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerRefine = 600, pathScope, notify }: RefineTaskOptions) {
   return defineTask<RefineInput, RefineState, RefineResult>({
