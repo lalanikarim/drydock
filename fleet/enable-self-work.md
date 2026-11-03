@@ -910,6 +910,61 @@ That line is worth grepping after any deploy; a fleet that cannot alert has alre
 
 ---
 
+## 7g. A run is waiting on you (#188)
+
+**Symptom:** a run makes no progress, `/health` is green, and the store blames the model — typically
+`reviewer never called submit_verdict`. What actually happened is that a gate demanded an approval and the tool
+never ran, so nothing in the pipeline could report it.
+
+As of #188 the adapter asks every instance for pending approvals on an interval (`APPROVAL_WATCH_INTERVAL_MS`,
+default 60s) and announces each new key once:
+
+```
+[adapter] lalanikarim/engram: approval pending 74944fe45911 (submit_verdict, destructive)
+[adapter] telegram delivered approval_blocked message_id=… attempts=1
+```
+
+### See it and clear it
+
+```bash
+# routes.json is a top-level list; port + token are per route
+TOK=$(python3 -c "import json;print(json.load(open('fleet/data/routes.json'))[1]['token'])")
+curl -s -H "authorization: Bearer $TOK" http://127.0.0.1:<instance-port>/approvals
+
+# approve the one named in the alert (the key IS the fix — it is sha1(tool + exact args))
+curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"decision":"approved"}' http://127.0.0.1:<instance-port>/approvals/74944fe45911
+```
+
+**Approving costs what the call costs.** `submit_verdict` finishes a review that already happened; `edit` applies
+one edit; `open_draft_pr` pushes and opens a PR. Nothing runs extra inference.
+
+### Why retrying instead of approving is always a loss
+
+The key is a content hash: `sha1(tool + exact args)`. Re-running the same call hits the same block; rewording it
+produces a *different* key that nobody has approved. A retry is therefore guaranteed waste — one full worker or
+reviewer cycle (order of 10 minutes of inference) to arrive back at the same wall. This is what burned an hour on
+the first cross-repo run, and why the alert names the key in the message body.
+
+### Destructive-tier blocks cannot be allow-listed
+
+`tier: "destructive"` requests must be decided individually — `alwaysAllow` is refused upstream, and batch approval
+excludes them by design. If a repo's own policy keeps producing destructive-tier prompts for routine factory calls
+(the case upstream is [`engram#69`](https://github.com/lalanikarim/engram/issues/69): the floor matches *prose* in
+tool arguments, so a PR titled "Fix rm -rf regression" is classified destructive), that is an upstream semantics
+bug, not something to work around by approving faster.
+
+### What is NOT claimed yet
+
+Detection is deliberately adapter-side and read-only: the pipeline itself still cannot see its own block (a gated
+tool never executes; the reviewer's conversation handle exposes no transcript read; `GET /approvals` is the only
+public surface for it). So the run outcome still reads `reviewer never called submit_verdict`, the refusal budget
+still counts it, and #165's settlement window still classifies it as failing. Those need a producer that writes a
+structured `blocked_on_approval` outcome — tracked on #188. The alert is what stops the hour-long silent stall;
+the store-side vocabulary is still open.
+
+---
+
 ## 8. Operator notifications (Telegram, #64)
 
 Optional outbound pings so the factory does not have to be polled. Enabled by two variables in `.env`; with
