@@ -32,9 +32,40 @@
 export const LESSON_TEXT =
   "- [2026-11-03] When an API returns the wrong status or an internal error string for client input, fix the rule where the error originates — give the domain error a type that carries its own status, or enforce the check once in a place every path calls. Do not translate errors with instanceof/catch in one request handler: the other paths keep the bug.";
 
+/**
+ * Identifiers belonging to the current traps. A lesson that contains one has stopped being a lesson and become the
+ * answer to a specific bug, which measures instruction-following instead of the feedback loop.
+ */
+export const LESSON_FORBIDDEN_TOKENS = ["invoices", "customerId", "amountCents"];
+
+/**
+ * Same rules `test/g5-harness.test.mjs` asserts of `LESSON_TEXT`, exported so a `--lesson-file` variant is held to the
+ * standard instead of smuggling the answer past the test that exists to prevent exactly that.
+ *
+ * @returns {string[]} problems; empty means the text is usable as a lesson
+ */
+export function validateLessonText(text, { forbiddenTokens = LESSON_FORBIDDEN_TOKENS } = {}) {
+  const problems = [];
+  const body = String(text ?? "");
+  if (body.trim().length === 0) return ["lesson text is empty — the with-lessons arm would silently run without lessons"];
+  if (/\.(mjs|ts|js)\b/.test(body)) problems.push("lesson names a source file (a filename makes it the answer to one bug, not a rule)");
+  if (/issue\s*#\d+/i.test(body)) problems.push("lesson names an issue number (same reason)");
+  for (const token of forbiddenTokens) {
+    if (new RegExp(`\\b${token}\\b`, "i").test(body))
+      problems.push(`lesson names a trap identifier (${token}) — it would be solving this trap by name rather than transferring a rule`);
+  }
+  return problems;
+}
+
 /** What each arm's lessons file contains (arm A: empty, which is what "no lessons yet" looks like to readLessons). */
-export function lessonsContent(enabled) {
-  return enabled ? `${LESSON_TEXT}\n` : "";
+export function lessonsContent(enabled, lessonText = LESSON_TEXT) {
+  if (!enabled) return "";
+  const text = String(lessonText ?? "").trim();
+  // Blank in, blank out — never a bare `- [date]` marker, which would read as a lesson and satisfy preflight while
+  // telling the worker nothing.
+  if (text.length === 0) return "";
+  // A variant supplied on the command line may already carry its own `- [date]` marker; the default always does.
+  return /^-\s+\[/.test(text) ? `${text}\n` : `- [${new Date().toISOString().slice(0, 10)}] ${text}\n`;
 }
 
 /** Branch a worker will use for an issue — one branch per issue, so distinct issues mean distinct arms. */

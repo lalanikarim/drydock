@@ -51,7 +51,7 @@ import { tmpdir } from "node:os";
 import { startIntakeServer } from "../factory/intake.ts";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, waitForToolResult } from "./lib.ts";
 import { classifyFixPattern, formatClassification } from "./fix-pattern.mjs";
-import { contractFor, preflightArms, armBranch, lessonsContent } from "./g5-traps.mjs";
+import { contractFor, preflightArms, armBranch, lessonsContent, validateLessonText, LESSON_TEXT } from "./g5-traps.mjs";
 
 const exec = promisify(execFile);
 const argv = process.argv.slice(2);
@@ -64,6 +64,11 @@ const REPO = flagValue("--repo") ?? process.env.G5_REPO;
 const ISSUE_A = flagValue("--issue-a") ?? process.env.G5_ISSUE_A;
 const ISSUE_B = flagValue("--issue-b") ?? process.env.G5_ISSUE_B;
 const KEEP = argv.includes("--keep");
+// Arm B's lesson text. Defaults to LESSON_TEXT in g5-traps.mjs; a file replaces it so the experiment can ask whether
+// the *form* of a recorded lesson matters (#168) without editing the constant between runs. Held to the same rules as
+// the default — no filename, no issue number, no trap identifier — because the escape hatch is the thing that needs
+// guarding.
+const LESSON_FILE = flagValue("--lesson-file") ?? process.env.G5_LESSON_FILE;
 const ALLOW_STALE = argv.includes("--allow-stale-branches");
 const TIMEOUT_MS = Number(process.env.G5_TIMEOUT_MS ?? 45 * 60_000);
 const POLL_MS = 20_000;
@@ -90,10 +95,24 @@ async function gh(args, opts = {}) {
   }
 }
 
+/** Resolve arm B's lesson text (default constant, or --lesson-file), validated the same way either way. */
+function resolveLesson() {
+  if (!LESSON_FILE) return { text: LESSON_TEXT, source: "g5-traps.mjs LESSON_TEXT" };
+  let raw;
+  try {
+    raw = readFileSync(LESSON_FILE, "utf8");
+  } catch (e) {
+    die(`--lesson-file ${LESSON_FILE} is not readable: ${e.message}`);
+  }
+  const problems = validateLessonText(raw);
+  if (problems.length) die(`--lesson-file ${LESSON_FILE} is not a valid lesson:\n  - ${problems.join("\n  - ")}`);
+  return { text: raw, source: LESSON_FILE };
+}
+
 /** Both arms get a lessons file — only arm B's has content. Same config shape either way. */
-function writeLessonsFile(runDir, label, enabled) {
+function writeLessonsFile(runDir, label, enabled, lessonText) {
   const p = join(runDir, `g5-lessons-${label}.md`);
-  writeFileSync(p, lessonsContent(enabled));
+  writeFileSync(p, lessonsContent(enabled, lessonText));
   return p;
 }
 
@@ -139,11 +158,11 @@ async function deliverIssue({ instance, runDir, repo, issueNumber, label }) {
  * `{ prUrl }`. No result within the window is reported as `unknown`, not `false`: a run that never got there is not
  * evidence that the worker chose to work.
  */
-async function runArm({ runDir, repo, arm }) {
+async function runArm({ runDir, repo, arm, lessonText }) {
   const cfg = JSON.parse(readFileSync(defaultConfigPath(repo), "utf8"));
   // The ONLY difference between the arms. Everything else is byte-identical on purpose — this is a controlled
   // experiment and any other divergence measures configuration instead of the lesson.
-  cfg.lessonsFile = writeLessonsFile(runDir, arm.label, arm.lessons);
+  cfg.lessonsFile = writeLessonsFile(runDir, arm.label, arm.lessons, lessonText);
   const cfgPath = join(runDir, `factory-config-arm-${arm.label}.json`);
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 
@@ -272,7 +291,9 @@ async function main() {
 
   // Facts first; the pure rule set in g5-traps.mjs decides. Separating them is what makes the isolation rules
   // unit-testable without touching GitHub.
-  const facts = { lessonsFileExists: lessonsContent(true).trim().length > 0, existingBranches: [], issueStates: {} };
+  const lesson = resolveLesson();
+  log(`lesson variant: ${lesson.source}`);
+  const facts = { lessonsFileExists: lessonsContent(true, lesson.text).trim().length > 0, existingBranches: [], issueStates: {} };
   const haveIssues = ARMS.every((a) => String(a.issue ?? "").trim() !== "");
   const baseCfg = defaultConfigPath(REPO);
   facts.baseConfigReadable = existsSync(baseCfg);
@@ -289,12 +310,19 @@ async function main() {
   if (problems.length) die("preflight:\n  - " + problems.join("\n  - "));
 
   const runDir = mkdtempSync(join(tmpdir(), `g5-${Date.now()}-`));
-  const results = { startedAt: new Date().toISOString(), repo: REPO, baseConfig: baseCfg, lessonText: lessonsContent(true).trim(), arms: [] };
+  const results = {
+    startedAt: new Date().toISOString(),
+    repo: REPO,
+    baseConfig: baseCfg,
+    lessonSource: lesson.source,
+    lessonText: lessonsContent(true, lesson.text).trim(),
+    arms: [],
+  };
   log(`preflight ok — arms ${ARMS.map((a) => `#${a.issue}`).join(" + ")}, run dir ${runDir}`);
   try {
     for (const arm of ARMS) {
       log(`=== arm ${arm.label} (${arm.kind}): issue #${arm.issue}, lessons=${arm.lessons ? "on" : "off"} ===`);
-      results.arms.push(await runArm({ runDir, repo: REPO, arm }));
+      results.arms.push(await runArm({ runDir, repo: REPO, arm, lessonText: lesson.text }));
     }
     verdict(results);
   } finally {

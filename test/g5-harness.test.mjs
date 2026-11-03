@@ -234,3 +234,46 @@ function writeTemp(content) {
   writeFileSync(p, content);
   return p;
 }
+
+// ── lesson variants (#168) ───────────────────────────────────────────────────────────────────────────────
+//
+// The first G5 measurement found that an abstract lesson reached the worker prompt and changed nothing. Testing whether
+// the *form* of a lesson matters means handing arm B a different text, and an escape hatch is exactly where the rules
+// get smuggled past — so the variant goes through the same validator the default is asserted against, in this file.
+
+const { validateLessonText } = await import("../gates/g5-traps.mjs");
+
+test("the shipped LESSON_TEXT passes its own validator", () => {
+  // If this goes red, the validator and the assertion above have diverged and one of them is decorative.
+  assert.deepEqual(validateLessonText(LESSON_TEXT), []);
+});
+
+test("the imitable variant is a valid lesson and actually contains an imitable shape", () => {
+  const text = readFileSync(join(FX, "lesson-imitable.md"), "utf8");
+  assert.deepEqual(validateLessonText(text), [], `variant must satisfy the same rules as the default: ${validateLessonText(text).join("; ")}`);
+  // "Imitable" has to mean something checkable: a typed error that carries a status, and one guard meant for reuse.
+  assert.match(text, /class\s+\w*Error\s+extends\s+Error/, "declares an error type");
+  assert.match(text, /this\.statusCode\s*=\s*400/, "the error carries its own status");
+  assert.match(text, /function\s+require\w*\s*\(/, "names a guard to define once");
+  assert.match(text, /^- \[\d{4}-\d{2}-\d{2}\] /m, "note_lesson's line shape");
+});
+
+test("validateLessonText rejects the shapes that would measure instruction-following", () => {
+  const problems = (t) => validateLessonText(t);
+  assert.deepEqual(problems("   "), ["lesson text is empty — the with-lessons arm would silently run without lessons"]);
+  assert.ok(problems("in src/store.mjs, throw a typed error").some((p) => /source file/.test(p)));
+  assert.ok(problems("see issue #19 for the pattern").some((p) => /issue number/.test(p)));
+  for (const token of ["invoices", "customerId", "amountCents"]) {
+    const found = problems(`validate the ${token} field once`);
+    assert.ok(found.some((p) => /trap identifier/.test(p)), `${token} must be rejected`);
+  }
+});
+
+test("lessonsContent keeps arm A empty and normalizes a variant into lesson shape", () => {
+  assert.equal(lessonsContent(false), "");
+  assert.equal(lessonsContent(true, "  "), "", "a blank variant for the with-lessons arm is still blank — preflight catches it");
+  const marked = lessonsContent(true, "- [2026-01-01] Rule.");
+  assert.equal(marked, "- [2026-01-01] Rule.\n");
+  const bare = lessonsContent(true, "A rule with no marker.");
+  assert.match(bare, /^- \[\d{4}-\d{2}-\d{2}\] A rule with no marker\.\n$/, "a variant file without the marker is wrapped, not passed through raw");
+});
