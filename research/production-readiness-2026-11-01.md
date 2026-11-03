@@ -295,6 +295,10 @@ feature is unreachable.** Drive the real path; when a model's account contradict
   *accepted* proves nothing, because a ref naming an unregistered provider is accepted and never runs. Provider names
   come from `<agentDir>/models.json` (a declared provider beats env auto-registration); `providerForBaseUrl()` in
   `factory/model-catalog.ts` is the resolver.
+  The script now runs all three boot tests — `core-spike`, `pipeline-boot`, `intake-boot`. It previously omitted
+  `intake-boot.test.ts`, which is to say the one file that was red (#171) was excluded from the command named after
+  it: a check nobody runs cannot fail, and a script that skips its most recently broken case will not catch a
+  regression in intake wiring.
 - **3 undelivered deliveries pending review** at handoff: re-drive with `node fleet/redeliver-failed.mjs --only
   <id>` after looking at each, or add the id to `fleet/data/acknowledged-deliveries.txt` with a reason. GitHub
   redacts delivery payloads, so correlate by timestamp against issue activity.
