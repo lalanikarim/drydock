@@ -94,6 +94,53 @@ export function contractFor(issueNumber) {
 }
 
 /**
+ * Decide an experiment from both arms' classifications. Pure, so the decision rule itself is testable.
+ *
+ * The rule that matters: **an arm showing neither signal is inconclusive, never a pass.** On 2026-11-03 arm B
+ * produced a domain-layer guard the classifier could not see, printed `rootFix=false handlerPatch=false`, and the old
+ * verdict — which only asked "did A root-fix? did B patch a handler?" — reported EXPERIMENT PASSED for a run that had
+ * measured nothing of the kind. A gate whose failure modes are "pass" and "fail" will eventually pass something it has
+ * not read.
+ *
+ * @param {Array<{arm:string, issue?:any, branch?:string, prNumber?:any, classification?:{measured?:boolean, rootFix?:boolean, handlerPatch?:boolean}}>} arms
+ */
+export function experimentVerdict(arms = []) {
+  const [a, b] = arms ?? [];
+  if (!a || !b) return { status: "fail", attribution: "weak", fails: ["G5 expects exactly two arms"] };
+
+  const fails = [];
+  for (const arm of [a, b]) if (!arm.classification?.measured) fails.push(`arm ${arm.arm} produced an empty diff — nothing was measured`);
+
+  const distinctArtifacts = a.prNumber !== b.prNumber && String(a.issue) !== String(b.issue) && a.branch !== b.branch;
+  if (!distinctArtifacts) fails.push("both arms resolved to the same artifact — arms are not isolated (#145)");
+
+  // Only read signals from arms that actually produced something; an unmeasured arm has no signals to interpret.
+  if (a.classification?.measured) {
+    if (a.classification.rootFix)
+      fails.push(
+        `arm A (baseline, no lessons) already produced a root fix.\n  The trap no longer exercises the anti-pattern, so this experiment cannot measure the lesson. Author a fresh equivalent pair against current main (gates/g5-traps.mjs) and re-run.`,
+      );
+    else if (!a.classification.handlerPatch)
+      fails.push(
+        `INCONCLUSIVE: arm A (baseline) produced a diff that reads as neither root fix nor handler patch.\n  Either the classifier cannot see what happened or the trap does not exercise either pattern. Read the diff; if the fix is real and structural, add its shape to gates/fix-pattern.mjs with the diff as a captured fixture — then re-run. A pass here would be a claim about a diff nobody read.`,
+      );
+  }
+  if (b.classification?.measured) {
+    if (b.classification.handlerPatch)
+      fails.push(
+        `arm B (with lessons) still patched a handler.\n  Before concluding anything about the loop, check arm B's intake log and lessons file — the likelier cause is that the lesson never reached the prompt.`,
+      );
+    else if (!b.classification.rootFix)
+      fails.push(
+        `INCONCLUSIVE: arm B (with lessons) produced a diff that reads as neither root fix nor handler patch.\n  Read it before believing anything: this is the classifier saying "I don't know", not the lesson working or failing. If the change is structural, capture it as a fixture and teach gates/fix-pattern.mjs its shape.`,
+      );
+  }
+
+  const attribution = distinctArtifacts && a.classification?.measured && b.classification?.measured ? "strong" : "weak";
+  return { status: fails.length ? "fail" : "pass", attribution, fails };
+}
+
+/**
  * Preflight the two arms. Pure — takes what it needs so it is unit-testable without GitHub.
  *
  * @param {Array<{label:string,issue?:string|number}>} arms

@@ -95,6 +95,26 @@ export function detectsSharedRule(lines) {
   return null;
 }
 
+/**
+ * A guard added where the rule lives: a conditional throw inside a domain-path file. This is the third shape a root
+ * fix takes, and the classifier missed it on 2026-11-03 — arm B put `if (not an object) throw new TypeError(...)`
+ * into `store.validate()`, the one function every call path already goes through, and read as neither root fix nor
+ * handler patch. It was verified to close both traps with a single change (`POST /invoices` and `POST /
+ * invoices/batch`, suite 125/125), so "the detector cannot see it" is a measurement defect, not a property of the fix.
+ *
+ * Requires a condition plus a throw in the same added block: an unconditional throw in a domain file is usually a
+ * removal or a refactor, and counting that as a guard would rubber-stamp anything.
+ */
+export function detectsDomainGuard(domainLines) {
+  const lines = Array.isArray(domainLines) ? domainLines : String(domainLines ?? "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\+\s*(?:if|for|while)\s*\(/.test(lines[i])) continue;
+    // A guard's throw is one to three added lines below its condition in any normal formatting.
+    if (lines.slice(i, i + 4).some((l) => /^\+\s*throw\s+new\s+[A-Za-z_$][\w$]*\s*\(/.test(l))) return true;
+  }
+  return false;
+}
+
 /** The anti-pattern: status attached where the error was caught, rather than carried by the error. */
 export function detectsHandlerPatch(lines) {
   const reasons = [];
@@ -134,11 +154,12 @@ export function classifyFixPattern(diff, contract = {}) {
 
   const typedError = detectsTypedError(allLines);
   const sharedRule = detectsSharedRule(allLines);
+  const domainGuard = domainChanged && detectsDomainGuard(domainLines);
   const handlerPatchReasons = detectsHandlerPatch(handlerLines);
 
   return {
     measured,
-    rootFix: typedError || Boolean(sharedRule),
+    rootFix: typedError || Boolean(sharedRule) || domainGuard,
     handlerPatch: handlerPatchReasons.length > 0,
     // Why a verdict was reached — printed by the gate so a reviewer can disagree with the classification instead of
     // having to re-derive it from a diff.
@@ -146,6 +167,7 @@ export function classifyFixPattern(diff, contract = {}) {
       rootFix: [
         ...(typedError ? ["a typed error carrying its own status code was added"] : []),
         ...(sharedRule ? [`validation defined once (${sharedRule.name}) and called from ${sharedRule.callSites} places`] : []),
+        ...(domainGuard ? ["a conditional guard was added where the rule lives (domain path)"] : []),
       ],
       handlerPatch: handlerPatchReasons,
     },
@@ -153,6 +175,7 @@ export function classifyFixPattern(diff, contract = {}) {
       domainChanged,
       handlerChanged,
       typedError,
+      domainGuard,
       sharedRule: sharedRule ? sharedRule.name : null,
       filesTouched: [...files.keys()],
     },
