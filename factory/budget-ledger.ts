@@ -21,7 +21,11 @@
 
 import { defineDoc } from "@earendil-works/pi-durable";
 
-export interface BudgetEntry {
+// Type aliases, not interfaces: pi-durable's document state is constrained to `JsonObject`
+// (`{ [key: string]: JsonValue }`), and TypeScript gives interfaces no implicit index signature — so an
+// identical `type` is assignable where an `interface` is not. Reported the moment tsc was run on this tree
+// (#173); at runtime the two are the same file.
+export type BudgetEntry = {
   /** Wall-clock aborts caused by the budget itself (not by an operator). */
   budgetAborts: number;
   /** Operator-initiated aborts, recorded for context and never charged to the cap. */
@@ -33,7 +37,7 @@ export interface BudgetEntry {
   stopReason?: string;
 }
 
-export interface BudgetLedgerState {
+export type BudgetLedgerState = {
   issues: Record<string, BudgetEntry>;
 }
 

@@ -17,7 +17,8 @@ import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, defineTask, defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
+import { configure, defineTask, defineTool, type Task, type ConversationId, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 import type { Notifier } from "./notify-telegram.ts";
 import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
@@ -167,7 +168,10 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
           .filter((t: any) => t.name === "read");
         if (!tools.length) throw new Error("refinement cannot run: the `read` tool is not installed in this instance");
 
-        let convId: number;
+        // Assigned inside the commit callback below. TypeScript cannot see through the closure, so the value is
+        // checked after the commit rather than trusted (#173) — refining against no conversation would be worse
+        // than a loud internal error.
+        let convId: number | undefined;
         await runtime.commit(async (tx: any) => {
           const rec = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
           const meta = await tx.doc(ConversationMeta, rec.id);
@@ -183,7 +187,8 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
           return undefined;
         }, ctx);
 
-        const handle = await runtime.conversation(convId, ctx);
+        if (convId === undefined) throw new Error("refinement committed no conversation id (internal: configure recorded nothing)");
+        const handle = await runtime.conversation(convId as ConversationId, ctx);
         if (handle === undefined) throw new Error("refinement conversation missing");
         const issueText = `# ${issue.title}\n\n${issue.body}\n\nLabels: ${issue.labels.join(", ") || "(none)"}`;
         await handle.submit(
@@ -290,7 +295,9 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
 }
 
 /** Orchestrator-facing tool: run one refinement pass for an issue and post the brief as a comment. */
-export function refineIssueTool({ taskDef, modelRef }: { taskDef: ToolTask; modelRef: { provider: string; modelId: string } }) {
+// TaskDefinition, not ToolTask: ToolTask is the kernel's class for a model-issued tool call, which is a different
+// thing from a defineTask() result. Nothing checked this annotation before #173.
+export function refineIssueTool({ taskDef, modelRef }: { taskDef: Task<any, { phase: string }, any, any>; modelRef: { provider: string; modelId: string } }) {
   return defineTool({
     name: "refine_issue",
     description:

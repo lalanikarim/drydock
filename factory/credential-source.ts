@@ -101,7 +101,8 @@ export function resolveCredentialSource(
 
 /** Human-readable description for boot logs. The host-helper case is the one that must be unmissable. */
 export function describeCredentialSource(source: CredentialSource): string {
-  const shadow = source.appShadowed ? " — NOTE: a GitHub App is configured but this takes precedence" : "";
+  // appShadowed exists only on the non-App variants — that is the whole point of it — so it is read with `in`.
+  const shadow = "appShadowed" in source && source.appShadowed ? " — NOTE: a GitHub App is configured but this takes precedence" : "";
   switch (source.kind) {
     case "env":
       return `git credential: ${source.variable} from environment${shadow}`;

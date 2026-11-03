@@ -23,7 +23,12 @@
 /** One provider an enabled repo actually pins, resolved to something probeable. */
 export type ProviderEndpoint = {
   id: string;
-  baseUrl: string;
+  /**
+   * Absent means "declared in config, no base url we could resolve". Recorded rather than dropped — dropping it
+   * would make the aggregate look healthier than the deployment is — and `probeProvider` guards for it. The type
+   * used to claim baseUrl always exists, which was a lie the compiler found (#173).
+   */
+  baseUrl?: string;
   apiKey?: string;
 };
 

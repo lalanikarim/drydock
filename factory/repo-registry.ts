@@ -121,7 +121,8 @@ export interface RepoEntry {
    * the PR body must then state that nothing was verified.
    */
   requireVerification: boolean;
-  note?: string;
+  // `note` was declared twice in this interface (TS2300, first caught by tsc under #173). The documented
+  // declaration above is the one that stays; nothing about behavior changed.
 }
 
 export interface Registry {

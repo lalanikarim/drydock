@@ -12,7 +12,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
+import { defineTool, type Task, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
 import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
@@ -76,8 +77,8 @@ async function workerReportFromTranscript(api: ToolExecutionApi, ctx: Context): 
       const msg = Array.isArray(item.model) ? item.model[0] : undefined;
       if (!msg || msg.toolName !== "delegate") continue;
       const text = (msg.content ?? [])
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
+        .filter((c: { type?: string }) => c.type === "text")
+        .map((c: { text?: string }) => c.text)
         .join("\n");
       if (text.trim()) return text.trim();
     }
@@ -165,7 +166,8 @@ export interface OpenDraftPrOptions {
    */
   gitAuth?: GitAuth;
   modelRef: { provider: string; modelId: string };
-  reviewerTaskDef: ToolTask;
+  /** A defineTask() result — not `ToolTask`, which is the kernel's model-tool-call class (#173). */
+  reviewerTaskDef: Task<any, { phase: string }, any, any>;
   testCommand?: string;
   /**
    * Registry policy (decision C1): must a passing verification run exist before this repo's branch
@@ -312,7 +314,10 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
         // retry may genuinely fix it. Charged to the ledger but never to the budget — a transient
         // fault must not consume the attempts of the real task behind it.
         return {
-          output: [{ type: "text" as const, text: charged({ class: "infrastructure", reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]})` }, { refused: true, reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]}); refusing to push unchecked`, counted: false }) }],
+          // JSON.stringify like every other tool-result site: `text` must be a string, and this path was handing
+          // the model an object (`[object Object]`) for a whole refusal class. Found by the first typecheck this
+          // repository ever ran (#173).
+          output: [{ type: "text" as const, text: JSON.stringify(charged({ class: "infrastructure", reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]})` }, { refused: true, reason: `cannot compute changed files against origin/main (${(e as Error).message.split("\n")[0]}); refusing to push unchecked`, counted: false })) }],
         };
       }
       const scope = checkPathScope(changedFiles, pathScope);

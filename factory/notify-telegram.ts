@@ -226,7 +226,7 @@ export async function sendTelegramMessage(
       // 4xx other than 429: bad token, bad chat id, blocked bot. Retrying cannot help.
       return { ok: false, status: res.status, detail: lastDetail, attempts: attempt };
     } catch (e) {
-      lastDetail = redact(e instanceof Error ? `${e.name} ${e.code ?? ""} ${e.message}` : String(e));
+      lastDetail = redact(e instanceof Error ? `${e.name} ${(e as NodeJS.ErrnoException).code ?? ""} ${e.message}` : String(e));
       if (!isRetryableError(e)) return { ok: false, detail: lastDetail, attempts: attempt };
       log(`telegram connection error (${lastDetail}), retrying (attempt ${attempt}/${maxAttempts})`);
       await sleep(500 * attempt);

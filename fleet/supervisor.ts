@@ -183,8 +183,12 @@ function spawnProc(name: string, args: string[], env: NodeJS.ProcessEnv): ChildP
   });
   const pump = (stream: NodeJS.ReadableStream, prefix: string) =>
     stream.on("data", (d: Buffer) => process.stdout.write(`[${name}] ${prefix}${String(d).replace(/\n$/, "")}\n`));
-  pump(child.stdout, "");
-  pump(child.stderr, "err: ");
+  // spawn() with pipe stdio always hands back both streams, but the type says `Readable | null`, and a missing
+  // stream here would mean a child's logs silently never reach the supervisor (#173).
+  if (child.stdout) pump(child.stdout, "");
+  else console.error(`[${name}] child has no stdout pipe — its logs are lost`);
+  if (child.stderr) pump(child.stderr, "err: ");
+  else console.error(`[${name}] child has no stderr pipe — its errors are lost`);
   return child;
 }
 
@@ -504,7 +508,7 @@ async function statusFleet(fleetPath: string): Promise<void> {
     process.exit(1);
   }
   const rows = await Promise.all(routes.map(async (r) => {
-    const row: Record<string, string> = { repo: r.repo, base: r.target, state: "DOWN", pending: "" };
+    const row: Record<string, string> = { repo: r.repo, base: r.target ?? "(no target recorded)", state: "DOWN", pending: "" };
     try {
       const health = await fetch(`${r.target}/health`, { headers: { Authorization: `Bearer ${r.token ?? ""}` }, signal: AbortSignal.timeout(3_000) });
       if (!health.ok) throw new Error(`health ${health.status}`);
@@ -533,7 +537,10 @@ async function statusFleet(fleetPath: string): Promise<void> {
   const sweepPath = process.env.FACTORY_SWEEP_STATE ?? join(dirname(routesPath), "last-sweep.json");
   const sweep = readSweepState(sweepPath);
   if (!sweep.ok) {
-    console.log(`\nfailed-delivery sweep: ${sweep.reason === "never" ? "NEVER RECORDED" : sweep.reason.toUpperCase()} — run fleet/redeliver-failed.mjs with --state-file ${sweepPath}`);
+    // The reader returns a `reason` on every not-ok path, but it is JavaScript and the inferred type allows
+    // undefined — so default rather than assert (#173). "undefined" printed here would be worse than useless.
+    const why = sweep.reason ?? "unreadable";
+    console.log(`\nfailed-delivery sweep: ${why === "never" ? "NEVER RECORDED" : why.toUpperCase()} — run fleet/redeliver-failed.mjs with --state-file ${sweepPath}`);
     return;
   }
   const st = sweep.state as {
