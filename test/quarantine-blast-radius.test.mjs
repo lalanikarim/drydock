@@ -213,10 +213,17 @@ test("supervisor with two repos: the sick one quarantines, the healthy one keeps
     mkdirSync(agentDir);
     writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { testprov: { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: "stub-key", models: [{ id: "test/model", name: "Test Model" }] } } }));
 
-    const goodConfig = join(dir, "good.json");
+    // Runtime config is resolved from $DRYDOCK_CONFIG_DIR/<owner>_<repo>.json, and the supervisor pre-flights
+    // exactly that path for every repo in the fleet before it writes a single route ("nothing was started").
+    // Pointing the variable at a temp directory with the conventional names keeps this hermetic: on my machine
+    // the real ~/.drydock/configs exists and the test passed for the wrong reason; on CI it failed loudly, which
+    // is the value of running the suite somewhere that has none of your setup.
+    const cfgDir = join(dir, "configs");
+    mkdirSync(cfgDir, { recursive: true });
+    const goodConfig = join(cfgDir, "lalanikarim_factory-fixture.json");
     writeFileSync(goodConfig, JSON.stringify({ repo: "lalanikarim/factory-fixture", models: { provider: "testprov", modelId: "test/model" } }));
     // The exact incident: one unknown key. Strict-at-boot is correct, so this child dies immediately, every time.
-    const badConfig = join(dir, "bad.json");
+    const badConfig = join(cfgDir, "lalanikarim_factory-fixture-2.json");
     writeFileSync(badConfig, JSON.stringify({ repo: "lalanikarim/factory-fixture-2", models: { provider: "test-provider", modelId: "test/model" }, _comment_setup: "typo: only _comment and _notes are inert" }));
 
     const port = await freePort();
@@ -255,6 +262,7 @@ test("supervisor with two repos: the sick one quarantines, the healthy one keeps
         FACTORY_SUPERVISOR_LOCK: join(dir, "supervisor.lock"),
         FACTORY_MAX_RESTARTS: "1", // quarantine after one retry instead of ten
         FACTORY_RESTART_BACKOFF_MS: "250",
+        DRYDOCK_CONFIG_DIR: cfgDir,
         PI_AGENT_DIR: agentDir,
         DEFAULT_MODEL: "testprov:test/model",
         // The env-driven provider is registered from OPENAI_BASE_URL + OPENAI_API_KEY as PI_PROVIDER_ID ??
