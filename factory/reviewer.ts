@@ -33,6 +33,7 @@ import { runSetupInContainer } from "./setup-sandbox.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { cloneUrlWithAuth, createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { wrapUntrusted } from "./untrusted.ts";
+import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -280,7 +281,12 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
     abort: guarded("ABORT", async (task, runtime, ctx) => {
       const convId = task.state.checkpoint?.convId;
       if (convId) verdictRegistry.delete(convId);
-      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "reviewer aborted" } }), ctx);
+      // #157: distinguish a boot-time reclaim of a dead instance's reservation from an operator stopping a run.
+      if (isRestartAbort(task)) {
+        const issue = (task as { input?: { issueNumber?: number } })?.input?.issueNumber ?? "?";
+        console.error(`[factory.reviewer] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
+      }
+      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "reviewer") }), ctx);
     }),
   });
 }

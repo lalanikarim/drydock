@@ -17,6 +17,36 @@ export interface AbortableTask {
 }
 
 /**
+ * Did this abort come from the kernel reclaiming a reservation whose owner died? (#157)
+ *
+ * A task created under a tool that does not resume is flagged `abandonOnRestart`, and the next instance boot marks its
+ * live tasks with `abortReason: "restart"` before anything of them runs a phase again. That mechanism exists and
+ * works — what was missing was that nothing said so: a settled-at-boot task looked identical to an operator stop in
+ * the durable record, and no log line mentioned the recovery at all (verified 2026-11-03: stale `factory.worker`
+ * reservation terminal within 5 s of the replacement boot, zero log lines naming it).
+ */
+export function isRestartAbort(task: { abortReason?: unknown } | undefined): boolean {
+  return String(task?.abortReason ?? "").toLowerCase() === "restart";
+}
+
+/**
+ * The outcome an abort handler commits, keeping a crash-reclaim distinguishable from a human stopping a run.
+ *
+ * `label` produces the historical strings unchanged (`worker aborted`, `reviewer aborted`, `refinement aborted`) so
+ * anything matching them keeps matching; a restart gets its own reason instead of inheriting one. The settlement
+ * ledger classifies on the kernel's `abort_reason` column (#161), which this does not touch — it is about what a
+ * reader of the record, or of a log line, can tell apart afterwards.
+ */
+export function abortedOutcome(
+  task: { abortReason?: unknown } | undefined,
+  label: string,
+): { status: "aborted"; reason: string; reclaimedAtBoot?: boolean } {
+  return isRestartAbort(task)
+    ? { status: "aborted", reason: `${label} reclaimed at boot`, reclaimedAtBoot: true }
+    : { status: "aborted", reason: `${label} aborted` };
+}
+
+/**
  * Throws unless the task exposes a callable `abort` where the kernel reads it.
  *
  * @param task   the value returned by `defineTask(...)` — `{ definition }`

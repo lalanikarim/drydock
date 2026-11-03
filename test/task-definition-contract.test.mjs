@@ -125,3 +125,66 @@ test("assertAbortable rejects a value that is not a defineTask result", () => {
   assert.throws(() => assertAbortable({ definition: undefined }, "factory.broken"), /must return \{ definition \}/);
   assert.throws(() => assertAbortable({}, "factory.broken2"), /must return \{ definition \}/);
 });
+
+// ── crash-reclaim vs operator stop (#157) ────────────────────────────────────────────────────────────────
+//
+// The kernel already reclaims a reservation whose instance died: tasks created under a tool that does not resume are
+// flagged `abandonOnRestart`, and the next boot marks them `abortReason: "restart"` before any phase runs again. That
+// was verified against real processes on 2026-11-03 — a running `factory.worker` task, its instance SIGKILLed, a
+// replacement booted on the same store, the record terminal within 5 s. What the record could not tell you afterwards
+// is that it happened: a reclaim and a human pressing abort committed the same reason, and no log line mentioned it.
+
+const { abortedOutcome, isRestartAbort } = await import("../factory/task-contract.ts");
+
+const LABELS = { "factory.worker": "worker", "factory.reviewer": "reviewer", "factory.refine": "refinement" };
+
+test("isRestartAbort reads the kernel's marker and nothing else", () => {
+  assert.equal(isRestartAbort({ abortReason: "restart" }), true);
+  assert.equal(isRestartAbort({ abortReason: "RESTART" }), true, "the kernel's spelling should not be load-bearing");
+  for (const t of [undefined, {}, { abortReason: undefined }, { abortReason: "operator" }, { abortRequested: 1 }]) {
+    assert.equal(isRestartAbort(t), false, `${JSON.stringify(t ?? null)} is not a restart`);
+  }
+});
+
+test("a reclaim never inherits an operator stop's reason, and an operator stop keeps its historical string", () => {
+  for (const label of Object.values(LABELS)) {
+    const operator = abortedOutcome({ abortReason: undefined }, label);
+    const reclaimed = abortedOutcome({ abortReason: "restart" }, label);
+    assert.equal(operator.reason, `${label} aborted`, "historical strings are unchanged (#164's evidence matches on these)");
+    assert.equal(reclaimed.reason, `${label} reclaimed at boot`);
+    assert.notEqual(reclaimed.reason, operator.reason);
+    assert.equal(reclaimed.reclaimedAtBoot, true);
+    assert.equal(operator.reclaimedAtBoot, undefined, "only the reclaim sets the flag");
+  }
+});
+
+for (const [kind, label] of Object.entries(LABELS)) {
+  test(`${kind}'s abort handler distinguishes a boot-time reclaim from an operator abort`, async () => {
+    const run = async (taskRecord) => {
+      const committed = [];
+      const runtime = { commit: async (decide, ctx) => committed.push({ decided: decide(), ctx }) };
+      const logs = [];
+      const realError = console.error;
+      console.error = (...a) => logs.push(a.join(" "));
+      try {
+        await definitionOf(kind).abort(taskRecord, runtime, { ctxToken: "ctx" });
+      } finally {
+        console.error = realError;
+      }
+      return { committed, logs };
+    };
+
+    const operator = await run({ state: { checkpoint: {} }, input: { issueNumber: 71 } });
+    assert.equal(operator.committed.length, 1);
+    assert.equal(operator.committed[0].decided.outcome.reason, `${label} aborted`);
+    assert.ok(!operator.logs.some((l) => /RESTART-RECLAIM/.test(l)), "an operator abort must not be reported as a reclaim");
+
+    const reclaimed = await run({ state: { checkpoint: {} }, input: { issueNumber: 71 }, abortReason: "restart" });
+    assert.equal(reclaimed.committed.length, 1);
+    assert.equal(reclaimed.committed[0].decided.outcome.reason, `${label} reclaimed at boot`);
+    assert.ok(
+      reclaimed.logs.some((l) => /RESTART-RECLAIM \(#157\)/.test(l) && /#71/.test(l)),
+      `the reclaim must be visible in the log; got ${JSON.stringify(reclaimed.logs)}`,
+    );
+  });
+}

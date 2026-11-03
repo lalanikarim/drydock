@@ -25,6 +25,7 @@ import { gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { sanitizeUntrusted } from "./untrusted.ts";
 import type { PathScope } from "./path-scope.ts";
 import { parseRefineBrief, refinePrompt, renderRefineComment, type RefineTrigger } from "./issue-refine.ts";
+import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -278,7 +279,12 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
     },
     // Top-level TaskDefinition member, not a phase (#164).
     abort: async (task: any, runtime: any, ctx: Context) => {
-      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "refinement aborted" } }), ctx);
+      // #157: distinguish a boot-time reclaim of a dead instance's reservation from an operator stopping a run.
+      if (isRestartAbort(task)) {
+        const issue = task?.input?.issueNumber ?? "?";
+        console.error(`[factory.refine] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
+      }
+      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "refinement") }), ctx);
     },
   });
 }
