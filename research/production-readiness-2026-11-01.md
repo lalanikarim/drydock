@@ -286,6 +286,15 @@ feature is unreachable.** Drive the real path; when a model's account contradict
 - **Tests:** `npm test` uses glob discovery (`test/*.mjs`) — adding a file is enough; never reintroduce an
   enumerated list, and never edit `package.json`'s `scripts.test` from agent work (it *is* the verification gate,
   so it stays outside the path allowlist on purpose).
+- **Run `npm run verify` (typecheck + suite), not just `npm test`.** CI runs `npm run typecheck` as a hard gate; the
+  suite does not compile anything. Pushing on a green suite once shipped a red CI (#183's first run).
+- **`npm run test:boot` runs LOCALLY ONLY — CI has no model.** The boot tests (`factory/*.test.ts`) need a reachable
+  inference endpoint and skip cleanly when there isn't one; GitHub-hosted CI never has, so no job can run them. That
+  is why `intake-boot.test.ts` stayed red at trunk for days (#171). Run it before shipping anything that touches core
+  wiring, intake routes, or model resolution — and remember its assertions are non-vacuity checks: a submission being
+  *accepted* proves nothing, because a ref naming an unregistered provider is accepted and never runs. Provider names
+  come from `<agentDir>/models.json` (a declared provider beats env auto-registration); `providerForBaseUrl()` in
+  `factory/model-catalog.ts` is the resolver.
 - **3 undelivered deliveries pending review** at handoff: re-drive with `node fleet/redeliver-failed.mjs --only
   <id>` after looking at each, or add the id to `fleet/data/acknowledged-deliveries.txt` with a reason. GitHub
   redacts delivery payloads, so correlate by timestamp against issue activity.

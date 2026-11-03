@@ -23,6 +23,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { AgentDoc, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
 import { instanceGatesConfig } from "./gate-policy.ts";
+import { parseProviderCatalog, providerForBaseUrl } from "./model-catalog.ts";
 import { createIntakeRoute } from "./intake-router.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -89,13 +90,23 @@ const modelsRes = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
 const modelsBody = (await modelsRes.json()) as { data?: Array<{ id: string }> };
 const modelId = modelsBody.data?.[0]?.id;
 if (!modelId) throw new Error("no models reported by the inference endpoint");
-// Provider resolution matters more than it looks. A ref that names a provider whose host is down does not
-// fail loudly: the submission takes, sits unsettled, and produces no assistant turn — the same silence the
-// fleet shows when aurora is offline (#133). DEFAULT_MODEL=<provider>:<modelId> therefore wins over the
-// env-derived "openai-completions" default, and the non-vacuity assertion below proves a run really happened.
+// Provider resolution matters more than it looks. A ref naming a provider the kernel never registered does NOT fail
+// loudly: the submission is accepted, no task is created, and no assistant turn ever appears. That silence is what
+// made this test red for reasons that looked like a model outage (#171) — it defaulted to "openai-completions"
+// while production runs on a provider *declared* in <agentDir>/models.json (`aurora`), and a declared provider wins
+// over the env-driven registration. So: DEFAULT_MODEL wins, otherwise ask the same catalog the kernel was handed
+// which provider serves OPENAI_BASE_URL, and skip loudly rather than guess if nothing declares it.
+const agentDir = process.env.PI_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
+const catalogPath = join(agentDir, "models.json");
+const catalogRaw = existsSync(catalogPath) ? readFileSync(catalogPath, "utf8") : null;
+const declaredProvider = providerForBaseUrl(parseProviderCatalog(catalogRaw), baseUrl);
+if (!process.env.DEFAULT_MODEL?.includes(":") && !declaredProvider) {
+  console.log(`intake boot (#122): SKIP — no provider in ${catalogPath} serves ${baseUrl}; a ref naming an unregistered provider is accepted and never runs (#171)`);
+  process.exit(0);
+}
 const modelRef = process.env.DEFAULT_MODEL?.includes(":")
   ? { provider: process.env.DEFAULT_MODEL.split(":")[0]!, modelId: process.env.DEFAULT_MODEL.split(":").slice(1).join(":") }
-  : { provider: "openai-completions", modelId };
+  : { provider: declaredProvider!, modelId };
 console.log(`probe conversation model: ${modelRef.provider}:${modelRef.modelId}`);
 
 const logLines: string[] = [];

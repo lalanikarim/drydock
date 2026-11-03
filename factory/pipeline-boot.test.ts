@@ -11,7 +11,11 @@ import { fileURLToPath } from "node:url";
 // Kernel's declared public surface (app/src/core.ts), not internal modules.
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
 import { instanceGatesConfig } from "./gate-policy.ts";
+import { parseProviderCatalog, providerForBaseUrl } from "./model-catalog.ts";
 
+// Provider resolution is not a detail (#171): a ref naming a provider the kernel never registered is accepted and
+// never runs, so this asked for `openai-completions` while production names a provider declared in
+// <agentDir>/models.json. Same catalog, same precedence as the kernel.
 async function firstModelRef(base: string): Promise<{ provider: string; modelId: string }> {
   const r = await fetch(`${base.replace(/\/$/, "")}/models`, {
     headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY ?? ""}` },
@@ -20,7 +24,10 @@ async function firstModelRef(base: string): Promise<{ provider: string; modelId:
   const j = (await r.json()) as { data?: Array<{ id: string }> };
   const id = j.data?.[0]?.id;
   if (!id) throw new Error("no models reported by /models");
-  return { provider: "openai-completions", modelId: id };
+  const agentDir = process.env.PI_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
+  const catalogPath = join(agentDir, "models.json");
+  const declared = providerForBaseUrl(parseProviderCatalog(existsSync(catalogPath) ? readFileSync(catalogPath, "utf8") : null), base);
+  return { provider: declared ?? "openai-completions", modelId: id };
 }
 import { factoryPipeline, ORCHESTRATOR_INSTRUCTIONS } from "./pipeline.ts";
 
@@ -97,7 +104,10 @@ const instance = await createCoreInstance({
   config,
   extraExtensions: [ext],
   port: 0,
-  rootAgent: { instructions: ORCHESTRATOR_INSTRUCTIONS, tools: rootTools },
+  // The model is pinned explicitly here too. Without it the root agent inherits the core default, which is a second
+  // source of truth for something this repository has already been burned on (#47), and it made the check below
+  // unable to say which model it ran (#171).
+  rootAgent: { model: modelRef as never, instructions: ORCHESTRATOR_INSTRUCTIONS, tools: rootTools },
 });
 
 try {
@@ -121,6 +131,25 @@ try {
   const sub = await tasksRes.json();
   assert.ok(sub.submissionId, "submissionId");
   console.log("check: /api/tasks accepted a submission (root agent live with factory tools)");
+
+  // Non-vacuity (#171): "accepted" is not "ran". A ref naming an unregistered provider is accepted and produces
+  // nothing at all, which is exactly how intake-boot.test.ts sat red for days while this file stayed green — it
+  // asserted only the acceptance. Wait for an assistant turn, then say which model produced it.
+  const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
+  const root = await instance.harness.conversation(instance.rootConversationId as never, BACKGROUND_CONTEXT);
+  assert.ok(root, "root conversation handle");
+  await Promise.race([
+    root!.waitForIdle(BACKGROUND_CONTEXT),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`root conversation still busy after 180s (model ${modelRef.provider}:${modelRef.modelId})`)), 180_000)),
+  ]);
+  const entriesRes = await fetch(`${base}/conversations/${instance.rootConversationId}/entries`, { headers: auth });
+  const entriesBody = (await entriesRes.json()) as { entries?: Array<{ kind?: string }> } | Array<{ kind?: string }>;
+  const kinds = (Array.isArray(entriesBody) ? entriesBody : entriesBody.entries ?? []).map((e) => String(e.kind ?? "?"));
+  assert.ok(
+    kinds.some((k) => k.includes("assistant")),
+    `non-vacuity: expected an assistant turn in the root conversation (entry kinds: ${kinds.join(",") || "none"}) — acceptance alone proves nothing (#171)`,
+  );
+  console.log(`check: the model actually answered (entry kinds: ${kinds.join(",")}; model ${modelRef.provider}:${modelRef.modelId})`);
 
   // Idempotent close + port release.
   await instance.close();

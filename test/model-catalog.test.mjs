@@ -10,7 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { catalogModelIds, isModelAvailable, unavailableModelError, defaultMismatchWarning } from "../factory/model-catalog.ts";
+import { catalogModelIds, isModelAvailable, unavailableModelError, defaultMismatchWarning, parseProviderCatalog, providerForBaseUrl } from "../factory/model-catalog.ts";
 import { configDir } from "../factory/factory-config.ts";
 
 const PINNED = "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF";
@@ -123,4 +123,33 @@ test("main.ts pins the orchestrator model instead of inheriting the endpoint's l
   // used by config roles; passing a string produced "Model undefined/undefined is not available".
   assert.match(src, /model: \{ provider: modelRef\.provider, modelId: modelRef\.modelId \}/, "rootAgent must carry an explicit ModelRef");
   assert.match(src, /assertModelAvailable\(/, "readiness must be gated on the catalog");
+});
+
+// ── provider resolution for #171 (why intake-boot.test.ts went red: an unregistered provider is accepted and never runs) ──
+test("parseProviderCatalog reads the shape <agentDir>/models.json actually has", () => {
+  const raw = JSON.stringify({ providers: { aurora: { baseUrl: "http://aurora.infinidigm:8888/v1", api: "openai-completions" } } });
+  assert.deepEqual(Object.keys(parseProviderCatalog(raw).providers), ["aurora"]);
+});
+
+test("parseProviderCatalog degrades to null instead of throwing", () => {
+  for (const bad of [null, undefined, "", "{", "[]", '{"providers":[]}', "not json"]) {
+    assert.equal(parseProviderCatalog(bad), null, `${JSON.stringify(String(bad))} must yield null`);
+  }
+});
+
+test("providerForBaseUrl matches the declared provider, trailing slash notwithstanding", () => {
+  const catalog = parseProviderCatalog(JSON.stringify({ providers: { spark: { baseUrl: "http://spark.infinidigm:8888/v1" }, aurora: { baseUrl: "http://aurora.infinidigm:8888/v1/" } } }));
+  assert.equal(providerForBaseUrl(catalog, "http://aurora.infinidigm:8888/v1"), "aurora");
+  assert.equal(providerForBaseUrl(catalog, "http://aurora.infinidigm:8888/v1/"), "aurora");
+  assert.equal(providerForBaseUrl(catalog, "http://spark.infinidigm:8888/v1"), "spark");
+});
+
+test("providerForBaseUrl falls back to host+port when the path differs, but not to a guess", () => {
+  const catalog = parseProviderCatalog(JSON.stringify({ providers: { aurora: { baseUrl: "http://aurora.infinidigm:8888/v1" } } }));
+  assert.equal(providerForBaseUrl(catalog, "http://aurora.infinidigm:8888/other"), "aurora", "same server, different path");
+  // The important half: nothing declared → undefined. Returning "openai-completions" here is what made #171 look
+  // like a model outage; the caller must decide whether to skip or fail.
+  assert.equal(providerForBaseUrl(catalog, "http://elsewhere.example:9/v1"), undefined);
+  assert.equal(providerForBaseUrl(null, "http://aurora.infinidigm:8888/v1"), undefined);
+  assert.equal(providerForBaseUrl(catalog, ""), undefined);
 });
