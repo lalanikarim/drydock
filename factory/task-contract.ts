@@ -29,6 +29,9 @@ export function isRestartAbort(task: { abortReason?: unknown } | undefined): boo
   return String(task?.abortReason ?? "").toLowerCase() === "restart";
 }
 
+/** Durable facts an abort handler may record alongside its reason (#173: inside `result`, not on the outcome). */
+export type AbortFacts = { reclaimedAtBoot?: boolean };
+
 /**
  * The outcome an abort handler commits, keeping a crash-reclaim distinguishable from a human stopping a run.
  *
@@ -40,9 +43,12 @@ export function isRestartAbort(task: { abortReason?: unknown } | undefined): boo
 export function abortedOutcome(
   task: { abortReason?: unknown } | undefined,
   label: string,
-): { status: "aborted"; reason: string; reclaimedAtBoot?: boolean } {
+): { status: "aborted"; reason: string; result?: AbortFacts } {
+  // Durable extras go in `result`. The kernel's TaskOutcome union is closed (`status`, `reason`, `result`, `error`)
+  // and `reclaimedAtBoot` used to ride on the outcome itself — persisted, because nothing validates, but promised by
+  // nothing either (#173).
   return isRestartAbort(task)
-    ? { status: "aborted", reason: `${label} reclaimed at boot`, reclaimedAtBoot: true }
+    ? { status: "aborted", reason: `${label} reclaimed at boot`, result: { reclaimedAtBoot: true } }
     : { status: "aborted", reason: `${label} aborted` };
 }
 

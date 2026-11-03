@@ -25,7 +25,7 @@ import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, defineTask, defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import { configure, defineTask, defineTool, type ConversationId, type PhaseHandler, type RunningTask, type Task, type TaskRuntime, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 // ConversationMeta is part of the kernel's declared public surface (app/src/core.ts;
 // engram #44 closed in v0.2.0) — reach it through that seam, not the internal module.
@@ -34,7 +34,7 @@ import { runSetupInContainer } from "./setup-sandbox.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import { cloneUrlWithAuth, createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { wrapUntrusted } from "./untrusted.ts";
-import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
+import { abortedOutcome, isRestartAbort, type AbortFacts } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -190,9 +190,31 @@ export interface ReviewerTaskOptions {
   gitAuth?: GitAuth;
 }
 
+/** What the review stage is created with (#173). */
+export type ReviewerInput = {
+  branch: string;
+  issueNumber: number;
+  provider: string;
+  modelId: string;
+  [key: string]: unknown;
+};
+
+/**
+ * What a review leaves in the task record: the verdict, or the facts beside an abort (#173 — `abortedOutcome`
+ * carries `result`, and TaskOutcome puts durable extras there, so R has to admit both shapes).
+ */
+export type ReviewerResult = ReviewVerdict | AbortFacts;
+
+/** Durable checkpoint: no conversation until spawn commits one. */
+export type ReviewerState =
+  | { phase: "spawn"; convId?: undefined }
+  | { phase: "wait"; convId: ConversationId };
+
 export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null, gitAuth }: ReviewerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
-  const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
+  // Generic over the per-phase narrowing (see the same note in worker.ts): the kernel narrows the checkpoint per phase.
+  const guarded = <P extends ReviewerState>(label: string, fn: PhaseHandler<ReviewerInput, P, ReviewerState, ReviewerResult, object>) =>
+    async (task: RunningTask<ReviewerInput, P, ReviewerResult>, runtime: TaskRuntime<ReviewerInput, ReviewerState, ReviewerResult, object>, ctx: Context) => {
     try {
       return await fn(task, runtime, ctx);
     } catch (e) {
@@ -201,7 +223,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
     }
   };
 
-  return defineTask({
+  return defineTask<ReviewerInput, ReviewerState, ReviewerResult>({
     name: "factory.reviewer",
     version: 1,
     initial: () => ({ phase: "spawn" }),
@@ -224,7 +246,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
           .installed()
           .flatMap((e: any) => e.tools ?? [])
           .filter((t: any) => ["read", "git_diff", "run_tests", "submit_verdict"].includes(t.name));
-        let convId: number;
+        let convId: ConversationId | undefined;
         await runtime.commit(async (tx: any) => {
           const rec = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
           // Sandbox flag + workspace: the core's envFor routes this conversation's
@@ -243,16 +265,20 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
           return undefined;
         }, ctx);
 
-        const handle = await runtime.conversation(convId, ctx);
+        if (convId === undefined) throw new Error("reviewer phase committed no conversation id (internal: configure recorded nothing)");
+        // Narrowing does not survive the awaits below (convId is assigned inside the commit callback) (#173).
+        const spawnedConvId = convId;
+        const handle = await runtime.conversation(spawnedConvId, ctx);
         if (handle === undefined) throw new Error("reviewer conversation missing");
         await handle.submit(
           { type: "input", content: reviewerPrompt({ branch, issueNumber, issueText }), requestId: `reviewer-${task.id}` },
           ctx,
         );
-        await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId } }), ctx);
+        await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId: spawnedConvId } }), ctx);
       }),
       wait: guarded("WAIT", async (task, runtime, ctx) => {
         const convId = task.state.checkpoint.convId;
+        if (convId === undefined) throw new Error("reviewer wait phase has no conversation in its checkpoint — spawn never committed one");
         const handle = await runtime.conversation(convId, ctx);
         if (handle === undefined) throw new Error("reviewer conversation missing");
 
@@ -265,7 +291,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
             try { await handle.abort(ctx); } catch (e) { console.error(`[factory.reviewer] budget abort: ${(e as Error).message}`); }
             verdictRegistry.delete(convId);
             await runtime.commit(
-              () => ({ status: "completing", outcome: { status: "aborted", reason: `wall-clock budget exceeded (${wallSecsPerIssue}s)` } }),
+              () => ({ status: "terminal", outcome: { status: "aborted", reason: `wall-clock budget exceeded (${wallSecsPerIssue}s)` } }),
               ctx,
             );
             return;
@@ -275,12 +301,12 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
           verdictRegistry.delete(convId);
           if (!verdict) {
             await runtime.commit(
-              () => ({ status: "completing", outcome: { status: "failed", error: { message: "reviewer never called submit_verdict" } } }),
+              () => ({ status: "terminal", outcome: { status: "failed", error: { message: "reviewer never called submit_verdict" } } }),
               ctx,
             );
             return;
           }
-          await runtime.commit(() => ({ status: "completing", outcome: { status: "completed", result: verdict } }), ctx);
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: verdict } }), ctx);
         } finally {
           // Container teardown is owned by the core (run_end → dispose).
         }
@@ -296,7 +322,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
         const issue = (task as { input?: { issueNumber?: number } })?.input?.issueNumber ?? "?";
         console.error(`[factory.reviewer] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
       }
-      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "reviewer") }), ctx);
+      await runtime.commit(() => ({ status: "terminal", outcome: abortedOutcome(task, "reviewer") }), ctx);
     }),
   });
 }
