@@ -40,6 +40,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadFactoryEnv, spawnInstance, defaultConfigPath, api, postTask, waitForApproval, decideApproval } from "./lib.ts";
+import { taskSnapshot, formatTaskSnapshot, staleTasksBefore, instanceStoreDb, waitOrDiagnose } from "./timeout-diagnostics.mjs";
 import { checkEvidenceBody, REVIEW_PASS_RE, VERIFICATION_PASS_RE } from "../factory/pr-evidence.ts";
 
 
@@ -59,7 +60,6 @@ const MODE = process.env.G4_MODE === "work" ? "work" : "merge";
 const WAIT_APPROVAL_MS = 25 * 60 * 1000;
 const WAIT_MERGED_MS = 15 * 60 * 1000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date().toISOString();
 
 async function prInfo(n) {
@@ -76,14 +76,51 @@ async function prForHead(branch) {
   return list.find((p) => p.state === "MERGED") ?? list.find((p) => p.state === "OPEN") ?? null;
 }
 
-async function waitMergedForHead(branch, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const pr = await prForHead(branch);
-    if (pr && pr.state === "MERGED") return pr;
-    await sleep(10_000);
+/**
+ * Wait for the branch's PR to reach MERGED. On timeout the error carries a diagnosis (#147): T2 stalled once for the
+ * full budget and printed only "no merged PR … within 900s", which cannot distinguish "queued behind a task that will
+ * never finish" from "the approval was never recorded" from "still thinking".
+ */
+async function waitMergedForHead(branch, timeoutMs, diagnose) {
+  return waitOrDiagnose({
+    what: `merged PR for ${branch}`,
+    timeoutMs,
+    pollMs: 10_000,
+    probe: async () => {
+      const pr = await prForHead(branch);
+      return pr && pr.state === "MERGED" ? pr : null;
+    },
+    diagnose,
+  });
+}
+
+/**
+ * What the instance looked like at the moment we gave up, from the surfaces that exist.
+ *
+ * There is no `GET /tasks` (probed against the live instance 2026-11-03: `/tasks`, `/tasks/status`, `/harness/tasks`,
+ * `/task-graph`, `/submissions` all 404), so non-terminal work comes out of the instance's own sqlite store and the two
+ * real endpoints — `GET /approvals` and `GET /conversations` (the latter carries `openSubmissions` per conversation).
+ */
+async function describeInstanceState(instance, repo) {
+  const lines = [];
+  const snap = taskSnapshot(instanceStoreDb(instance.root, repo));
+  lines.push("    --- tasks (durable store) ---");
+  lines.push(formatTaskSnapshot(snap));
+  try {
+    const { status, json } = await api(instance.base, instance.token).get("/approvals");
+    const approvals = json?.approvals ?? [];
+    lines.push(`    --- GET /approvals -> HTTP ${status}: ${approvals.length ? approvals.map((a) => `${a.tool ?? a.name ?? "?"}(${a.key ?? "?"})`).join(", ") : "none pending"} ---`);
+  } catch (err) {
+    lines.push(`    GET /approvals failed: ${String(err?.message ?? err).slice(0, 160)}`);
   }
-  throw new Error(`no merged PR for ${branch} within ${timeoutMs / 1000}s`);
+  try {
+    const { status, json } = await api(instance.base, instance.token).get("/conversations");
+    const convs = (json?.conversations ?? []).filter((c) => Number(c.openSubmissions) > 0 || c.isRoot === false);
+    lines.push(`    --- GET /conversations -> HTTP ${status}: ${convs.length ? convs.map((c) => `#${c.id}${c.name ? ` ${c.name}` : ""} open=${c.openSubmissions ?? 0}`).join("; ") : "no conversations with open submissions"} ---`);
+  } catch (err) {
+    lines.push(`    GET /conversations failed: ${String(err?.message ?? err).slice(0, 160)}`);
+  }
+  return lines.join("\n");
 }
 
 /** Exactly-once merge verification on a fresh clone: between preMainSha and the
@@ -214,6 +251,7 @@ async function runMergeFlow({ label, issue, crashAfterPending, mode = "merge" })
     if (crashAfterPending) {
       // G4 crash test: SIGKILL while the merge approval is pending.
       const dead = instance;
+      const killedAt = Date.now();
       dead.child.kill("SIGKILL");
       await new Promise((resolve) => dead.child.once("exit", resolve));
       ev("sigkill-while-pending");
@@ -231,6 +269,23 @@ async function runMergeFlow({ label, issue, crashAfterPending, mode = "merge" })
       if (survived.key !== pending.key) throw new Error(`pending key changed across restart: ${pending.key} -> ${survived.key}`);
       result.crashSurvived = true;
       ev("approval-state-survived-restart", { key: survived.key });
+
+      // Assert the retry is not queueing behind a task that died with the old process (#147). `status` is a reservation,
+      // not a heartbeat, so a row can say `running` for a process that no longer exists — and one of those holding the
+      // conversation's slot is the leading suspect for T2's 900-second stall. Better to fail here naming the task than to
+      // time out 15 minutes later with a message about merges.
+      const afterRestart = taskSnapshot(instanceStoreDb(instance.root, REPO));
+      const stale = staleTasksBefore(afterRestart, killedAt);
+      if (stale.length) {
+        throw new Error(
+          `${stale.length} non-terminal task(s) survived the restart and predate it — the retry may be queued behind work ` +
+            `that cannot finish (#147):\n${formatTaskSnapshot({ ...afterRestart, tasks: stale })}` +
+            `\n    (all non-terminal at restart:)\n${formatTaskSnapshot(afterRestart)}` +
+            `\n    store: ${afterRestart.dbPath}` +
+            `\n    If this fires consistently, the fix is reclaim/abort on restart, not a longer WAIT_MERGED_MS.`,
+        );
+      }
+      ev("no-stale-tasks-after-restart", { nonTerminalAtRestart: afterRestart.tasks.length, counts: afterRestart.counts });
     }
 
     // Fail CLOSED before approving: the commit whose evidence we verified must still be the PR head.
@@ -260,7 +315,7 @@ async function runMergeFlow({ label, issue, crashAfterPending, mode = "merge" })
     );
     ev("submitted-retry");
 
-    const mergedPr = await waitMergedForHead(branch, WAIT_MERGED_MS);
+    const mergedPr = await waitMergedForHead(branch, WAIT_MERGED_MS, () => describeInstanceState(instance, REPO));
     result.mergeCommit = mergedPr.mergeCommit?.oid ?? null;
     ev("merged", { mergeCommit: result.mergeCommit });
 
