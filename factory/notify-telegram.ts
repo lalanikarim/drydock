@@ -70,6 +70,19 @@ export type NotifyEvent =
       repo: string;
       attempts: number;
       reason: string;
+    }
+  | {
+      /**
+       * A run is waiting on a human (#188). Before this, an approval block looked identical to an agent
+       * failure — `reviewer never called submit_verdict` — and got retried, which cannot help: the same call
+       * produces the same block, and because the key is `sha1(tool + exact args)` a reworded retry produces a
+       * DIFFERENT key nobody approved. The message therefore has to carry the key, because the key is the fix.
+       */
+      kind: "approval_blocked";
+      repo: string;
+      key: string;
+      tool: string;
+      tier?: string;
     };
 
 const SHORT = (s: string | null | undefined, n = 9): string => (s ? String(s).slice(0, n) : "");
@@ -98,6 +111,11 @@ export function renderNotifyMessage(e: NotifyEvent): string {
     }
     case "repo_quarantined": {
       return `factory: ${name} quarantined after ${e.attempts} failed boots — ${e.reason}. Its deliveries are refused with 503; siblings unaffected`.trim();
+    }
+    case "approval_blocked": {
+      // Imperative, and it names the exact command: an operator who wants to unblock this should not have to
+      // look up the endpoint while a run is idle and inference is being wasted.
+      return `${name}: waiting on approval ${e.key} (${e.tool}${e.tier ? `, ${e.tier}` : ""}) — POST /approvals/${e.key} {"decision":"approved"}`.trim();
     }
   }
 }
@@ -281,6 +299,11 @@ export function notifyEventKey(e: NotifyEvent): string {
       // items, which is why repo is in the key — and a supervisor that dies and re-quarantines the same repo
       // starts a fresh dedupe table, which is correct: that is a second outage.
       return `repo_quarantined:${e.repo}`;
+    case "approval_blocked":
+      // Keyed by the approval key itself: one block, one message. A different blocked call is a different key
+      // (keys are content hashes), so it is genuinely separate news; the same key again is the same standing
+      // condition and must not nag.
+      return `approval_blocked:${e.repo}:${e.key}`;
     default: {
       // Unreachable while NotifyEvent is exhaustive. Structurally keyed so a future kind cannot silently share
       // another's dedupe window; it also keeps this function total, because a notification defect must never

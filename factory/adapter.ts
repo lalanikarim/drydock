@@ -38,6 +38,7 @@ import { loadRegistry, enabledRepos } from "./repo-registry.ts";
 import { resolveFactoryConfigPath } from "./factory-config.ts";
 import { InferenceProber, resolvePinnedProviders } from "./inference-probe.ts";
 import { createNotifier } from "./notify-telegram.ts";
+import { buildApprovalWatcher } from "./approval-watch.ts";
 
 /**
  * sha256 of a routes file. The supervisor and the adapter both report this hash in their startup
@@ -342,6 +343,20 @@ if (isMain) {
   const logPath = process.argv[4] ?? "data/intake-adapter.jsonl";
   const prober = buildInferenceProber({ log: (line) => console.log(`[adapter] ${line}`) });
   prober?.start();
+  // #188: the other half of "the fleet was waiting on a human and nobody said so". The instance already
+  // publishes pending approvals; this reads them on an interval and announces each new key once, naming the
+  // key, because the key IS the fix (POST /approvals/<key>). Routes are read live, so a repo that restarts or
+  // is quarantined (#185) drops out of the poll by itself.
+  const watcherNotify = createNotifier({
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+    log: (line) => console.log(`[adapter] ${line}`),
+  });
+  const approvalWatcher = buildApprovalWatcher(routes, {
+    ...(watcherNotify ? { notify: watcherNotify } : {}),
+    log: (line) => console.log(`[adapter] ${line}`),
+  });
+  approvalWatcher.start();
   startIntakeServer({
     port,
     host: process.env.ADAPTER_HOST ?? "127.0.0.1", // reachable only behind a TLS proxy with ADAPTER_HOST set
@@ -371,6 +386,7 @@ if (isMain) {
       closing = true;
       console.log(`adapter: ${reason} — closing`);
       prober?.stop();
+      approvalWatcher.stop();
       server.close();
       process.exit(0);
     };
