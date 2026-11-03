@@ -141,6 +141,58 @@ export function experimentVerdict(arms = []) {
 }
 
 /**
+ * Read the three-state refusal signal from what `open_draft_pr` actually returns.
+ *
+ * The shapes below are copied verbatim from production tool results (captured 2026-11-03 into
+ * `test/fixtures/g5/production/`, one of each kind):
+ *
+ *   refusal: `{"refused":true,"reason":"path scope violation — nothing was pushed or reviewed",
+ *             "offenders":[{"file":"package.json","why":"outside this repo's allowlist (…)"}],
+ *             "detail":"…","hint":"…"}`
+ *   success: `{"prUrl":"https://github.com/…/pull/83","isDraft":true,"branch":"agent/issue-80",
+ *             "head":"c6aad17…","verification":{"ran":true,"command":"npm test","exitCode":0,"passed":true}}`
+ *
+ * (Other refusals exist with the same `refused:true` key and different companions — a verification failure carries
+ * `verification:{ran,command,exitCode,timedOut,tail}` instead of `offenders`.)
+ *
+ * There is **no `refused: false` in the vocabulary.** Success is announced by `prUrl`. The original G5 read asked
+ * `parsed.refused === false ? "false" : "unknown"`, so every successful arm — the common case, the case the gate exists
+ * to measure — reported `unknown`. That is not a plumbing failure; it is an assumed contract, and the assumption was
+ * wrong in the direction of "we never learn anything".
+ *
+ * @returns {{refused: "true"|"false"|"unknown", reason: string, parsed: object|null}}
+ */
+export function refusalState({ outcomeText, prNumber = null, toolErrored = false } = {}) {
+  const text = typeof outcomeText === "string" ? outcomeText.trim() : "";
+
+  if (text) {
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { /* handled below */ }
+    if (parsed && typeof parsed === "object") {
+      if (parsed.refused === true)
+        return { refused: "true", reason: `open_draft_pr refused: ${String(parsed.reason ?? "(no reason given)").slice(0, 240)}`, parsed };
+      if (typeof parsed.prUrl === "string" && parsed.prUrl.length > 0)
+        return { refused: "false", reason: `open_draft_pr opened ${parsed.prUrl}${parsed.isDraft ? " (draft)" : ""}`, parsed };
+      if (parsed.refused === false)
+        return { refused: "false", reason: "open_draft_pr reported refused=false (a shape production does not emit; treating as success)", parsed };
+      return { refused: "unknown", reason: `open_draft_pr result carried neither \`refused\` nor \`prUrl\`: ${JSON.stringify(parsed).slice(0, 200)}`, parsed };
+    }
+    // Not JSON. An errored tool call lands here too, and the distinction matters to whoever reads the run.
+    return {
+      refused: "unknown",
+      reason: `${toolErrored ? "open_draft_pr errored" : "open_draft_pr result was not JSON"}: ${text.slice(0, 200)}`,
+      parsed: null,
+    };
+  }
+
+  // No tool result visible anywhere. A PR on the arm's own branch is an observable effect and settles the question; a
+  // run with neither stays honestly unknown.
+  if (prNumber !== null && prNumber !== undefined)
+    return { refused: "false", reason: `no open_draft_pr result found, but PR #${prNumber} exists on the arm branch`, parsed: null };
+  return { refused: "unknown", reason: "no open_draft_pr result in any conversation and no PR on the arm branch", parsed: null };
+}
+
+/**
  * Preflight the two arms. Pure — takes what it needs so it is unit-testable without GitHub.
  *
  * @param {Array<{label:string,issue?:string|number}>} arms
