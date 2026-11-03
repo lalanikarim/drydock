@@ -366,3 +366,17 @@ incidents.
 gate whose claim starting to depend on protection existing (at which point the gate is lying and must be fixed
 or moved). Do not answer any of these by flipping `autoMerge:false` in place — that trades an integrity risk for
 a silent loss of coverage, which is the worse of the two.
+
+---
+
+## 2026-11-03 — engram#68 (Linux lockfile) fixed upstream; the factory drops its install workaround
+
+**Context.** `lalanikarim/engram`'s workspace-root `package-lock.json` recorded one TypeScript platform variant (`@typescript/typescript-darwin-arm64`). TypeScript 7 resolves its compiler through a platform-specific optional dependency, so on Linux `npm ci` installed no binary and died in `getExePath.js`. That is why the engram repo config ran `setupCommand: "npm ci --ignore-scripts"` and why its CI needed the same flag. Fail-closed setup was correct behavior — it just meant nothing in that repo could be built or tested off a Mac.
+
+**Decision.** Fix upstream instead of keeping the local workaround ([engram#73](https://github.com/lalanikarim/engram/pull/73), merged `ce18106`): regenerate the root lock (zero version changes; 20 platform variants and pruned optionals restored, packages re-hoisted to the workspace root), delete the stale nested `app/package-lock.json`, drop `--ignore-scripts` from CI while adding `npm run build` and turning the platform-coverage diagnostic into a hard failure. Then set drydock's runtime config for engram back to `setupCommand: "npm ci"` (fleet restarted: `/health ok bdf7e49 inference reachable`, three children parented to the supervisor, no quarantine lines).
+
+**Evidence.** Pre-fix `main` reproduced the failure on `node:24-slim`. Post-fix: `npm ci` exit 0 with `prepare → npm run build` actually executing, `npm run test:unit` exit 0 (RESULT 26/0, 58/0, 18/0; config 5/0), and `npm ci` exit 0 on the darwin-arm64 host that generated the lock. The x64 half — which an Apple Silicon container cannot exercise — came from CI on ubuntu-latest printing `platform entries: 20 | linux x64/arm64: …arm64, …x64`.
+
+**The lesson that cost the time.** engram has *two* lockfiles and the complete one was the wrong one: `app/package-lock.json` (pre-workspace, never read by a root-level `npm ci`) carried all 20 variants while the root lock — the file npm actually uses — carried one. Checking "the lockfile" showed a healthy graph while installs kept failing. Two locks over one dependency graph is not redundancy; it is a plausible-looking second source of truth, and stale ones cost more than absent ones.
+
+**Keep this one too.** A `--ignore-scripts` in a setup command is a load-bearing flag with no owner: nothing recorded why it was there, so removing the workaround never gets scheduled. Removing the workaround is part of fixing the defect. (engram's own `Dockerfile` also uses `--ignore-scripts`, deliberately, so the app image skips `prepare` without devDependencies — that one stays; this is not a general "flags bad" rule.)
