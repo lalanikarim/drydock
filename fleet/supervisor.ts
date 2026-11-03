@@ -39,14 +39,31 @@ import { loadRegistry, loadRegistryTolerant, missingRuntimeConfigs, requireEnabl
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 import { readSweepState } from "./redeliver-failed.mjs";
 import { defaultConfigPathFor } from "../factory/factory-config.ts";
+import { createNotifier } from "../factory/notify-telegram.ts";
 import { spawnInProcessGroup, terminateProcessGroup, killProcessGroupNow } from "./proc-group.ts";
 import { createShutdownCoordinator } from "./shutdown-coordinator.ts";
 import { SUPERVISOR_PID_ENV } from "../factory/parent-watchdog.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
-const MAX_RESTARTS = 10;
-const RESTART_BACKOFF_MS = 5_000;
+/**
+ * Restart budget, overridable for tests (#185). Defaults are the production values and unchanged; the seams
+ * exist because "quarantine after N boot failures" is otherwise a 50-second test, and a test that slow gets
+ * skipped, which is worse than no test.
+ */
+const MAX_RESTARTS = readPositiveIntEnv("FACTORY_MAX_RESTARTS", 10);
+const RESTART_BACKOFF_MS = readPositiveIntEnv("FACTORY_RESTART_BACKOFF_MS", 5_000);
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    console.error(`[supervisor] ignoring ${name}=${JSON.stringify(raw)} (not a non-negative number); using ${fallback}`);
+    return fallback;
+  }
+  return Math.floor(n);
+}
 const READY_RE = /ready on http:\/\/127\.0\.0\.1:(\d+)\/ /;
 
 export interface FactoryEntry {
@@ -97,6 +114,7 @@ export function buildRoutes(
   bases: Map<string, string>,
   registry: { repos: Array<{ repo: string; eligibilityLabel: string; prFeedback?: boolean; refine?: boolean; refineLabel?: string }> },
   env: NodeJS.ProcessEnv = process.env,
+  quarantined: Map<string, string> = new Map(),
 ): Array<{
   repo: string;
   secret: string;
@@ -107,6 +125,7 @@ export function buildRoutes(
   prFeedback?: boolean;
   refine?: boolean;
   refineLabel?: string;
+  quarantined?: string;
 }> {
   return factories.map((f) => {
     const entry = registry.repos.find((r) => r.repo === f.repo);
@@ -125,6 +144,10 @@ export function buildRoutes(
       ...(entry.prFeedback ? { prFeedback: true } : {}),
       // Same posture for refinement (#65): absent means off, and refineLabel travels only with it.
       ...(entry.refine ? { refine: true, refineLabel: entry.refineLabel ?? "refine" } : {}),
+      // #185: a repo the supervisor gave up on stays in the routes file WITH its reason, so the adapter can
+      // refuse its deliveries with 503 `repo_quarantined` instead of accepting work nobody will ever do.
+      // Runtime state like `target`, and excluded from the policy fingerprint for the same reason.
+      ...(quarantined.has(f.repo) ? { quarantined: quarantined.get(f.repo)! } : {}),
     };
   });
 }
@@ -250,6 +273,14 @@ async function runFleet(fleetPath: string): Promise<void> {
   const restarts = new Map<string, number>();
   /** key -> pid of a live child. Each pid is also its process group id (#127). */
   const managed = new Map<string, number>();
+  /**
+   * repo -> why it stopped booting (#185). Sticky for the life of this process: nothing here can fix a bad
+   * config file, so re-spawning is waste and re-alerting is noise. Cleared only by a supervisor restart, which
+   * is also the moment the operator has been told about again.
+   */
+  const quarantined = new Map<string, string>();
+  /** key -> last non-empty stderr line from a child, used as the quarantine reason in logs and alerts. */
+  const lastFault = new Map<string, string>();
   /** Pending restart timers, so teardown can guarantee nothing spawns into a shutdown in progress. */
   const restartTimers = new Set<ReturnType<typeof setTimeout>>();
   // repo -> base URL once the instance reports ready (for the routes file).
@@ -263,6 +294,18 @@ async function runFleet(fleetPath: string): Promise<void> {
       console.log(`[supervisor] ${key}: group ${result.pgid} fully stopped (${result.initial.length} process(es), escalated=${result.escalated})`);
     }
   };
+
+  // Operator alerts for supervisor-level infrastructure events (#185). Same notifier the instances use, so a
+  // quarantine and an inference outage arrive through one channel with one dedupe policy. Undefined when
+  // credentials are absent — "alerts disabled" stays an explicit state rather than a silent no-op.
+  const notify = createNotifier({
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+    log: (line) => console.log(`[supervisor] ${line}`),
+  });
+  if (!notify) {
+    console.warn("[supervisor] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — supervisor alerts (quarantine, #185) are disabled");
+  }
 
   // The shutdown state machine lives in ./shutdown-coordinator.ts; this is the wiring to real processes.
   const coordinator = createShutdownCoordinator({
@@ -333,7 +376,7 @@ async function runFleet(fleetPath: string): Promise<void> {
       }
       return;
     }
-    const routes = buildRoutes(fleet.factories, bases, registry);
+    const routes = buildRoutes(fleet.factories, bases, registry, process.env, quarantined);
     const hash = writeRoutesFile(routesFile, routes);
     if (routesDegraded) {
       console.log(`[supervisor] routes recovered after a failure — ${routes.length} route(s), hash ${hash.slice(0, 16)}`);
@@ -350,14 +393,65 @@ async function runFleet(fleetPath: string): Promise<void> {
   writeRoutes("boot", { strict: true });
 
   /**
-   * Stop supervising and leave (#127). Non-zero exit on purpose: the old code set a flag and stayed alive,
-   * so a scheduler saw a healthy pid and never restarted it while webhooks kept arriving at an adapter whose
-   * factory was dead — deliveries lost permanently, because GitHub does not retry them. "Gave up" has to
-   * look like a failure to the thing watching, not like a server that is fine.
+   * Keep a fault line from a child's stderr to use as its quarantine reason (#185).
+   *
+   * "Last non-empty line" is wrong in exactly the case that matters: an uncaught throw ends its output with a
+   * stack frame, so this incident's reason would have read `at async asyncRunEntryPointWithESMLoader
+   * (node:internal/modules/run_main:117:5)` — found by running the test, not by imagining it. So: skip stack
+   * frames, prefer a line that names an error, and let the latest such line win (the last failure is the
+   * representative one). Anything else is kept only as a fallback, so a child that dies silently still yields
+   * text rather than "exit code 1".
+   */
+  const FAULT_LINE_RE = /error|fatal|cannot|could not|refus|unknown|invalid|denied|EADDR|no such|not found/i;
+  const rememberFault = (key: string, chunk: string) => {
+    for (const raw of String(chunk).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || /^at\s/.test(line)) continue; // stack frames are noise in a one-line alert
+      if (FAULT_LINE_RE.test(line) || !lastFault.has(key)) lastFault.set(key, line.slice(0, 300));
+    }
+  };
+
+  /**
+   * A child exhausted its restart budget (#127, blast radius fixed in #185).
+   *
+   * Non-zero exit was right when the supervisor supervised ONE factory: "gave up" has to look like a failure to
+   * whatever watches pids, because the old behavior (set a flag, stay alive) let a scheduler see a healthy pid
+   * while webhooks arrived at an adapter whose factory was dead — deliveries lost permanently, since GitHub
+   * does not retry them. With N repos on one supervisor, applying that globally made repo A's bad config key a
+   * fleet-wide kill switch: 2026-11-03, `_comment_setup` in engram's config took drydock down too, along with
+   * the adapter — the one component that could have reported it.
+   *
+   * So the blast radius is now per-repo:
+   *   - a factory quarantines itself: no more restarts, marked in routes.json so the adapter refuses its
+   *     deliveries with 503 rather than accepting work nobody will do, one alert edge, siblings unaffected;
+   *   - the supervisor exits only when nothing can serve — every repo quarantined, or the shared adapter dying.
    */
   const giveUp = (key: string) => {
-    console.error(`[supervisor] ${key} exceeded ${MAX_RESTARTS} restarts — giving up and exiting non-zero`);
-    coordinator.begin(`${key}: restart budget exhausted`, { exitCode: 1 });
+    const attempts = restarts.get(key) ?? MAX_RESTARTS + 1;
+    const repo = key.startsWith("factory:") ? key.slice("factory:".length) : undefined;
+
+    if (!repo) {
+      // Shared machinery: no adapter means no repo is served, so a supervisor with no route has no purpose.
+      console.error(`[supervisor] ${key} exceeded ${MAX_RESTARTS} restarts — giving up and exiting non-zero`);
+      coordinator.begin(`${key}: restart budget exhausted`, { exitCode: 1 });
+      return;
+    }
+
+    if (quarantined.has(repo)) return; // already announced; quarantine is sticky, so a repeat is noise
+    const reason = lastFault.get(key) ?? "instance exited before reporting a fault";
+    quarantined.set(repo, reason);
+
+    console.error(`[supervisor] QUARANTINE ${key} after ${attempts} failed boots: ${reason}`);
+    console.error(`[supervisor] ${key} will not be restarted; ${fleet.factories.length - quarantined.size} of ${fleet.factories.length} repo(s) still served. Fix the cause and restart the supervisor (runbook §7).`);
+
+    // Publish before alerting: "refused with 503" has to be true by the time the operator reads the message.
+    writeRoutes(`quarantine:${repo}`);
+    void notify?.({ kind: "repo_quarantined", repo, attempts, reason });
+
+    if (fleet.factories.every((f) => quarantined.has(f.repo))) {
+      console.error(`[supervisor] every managed repo is quarantined (${fleet.factories.length}) — nothing can serve, exiting non-zero`);
+      coordinator.begin("all managed repos quarantined", { exitCode: 1 });
+    }
   };
 
   /** Schedule a restart, tracked so teardown can prove nothing spawns after it. */
@@ -392,6 +486,12 @@ async function runFleet(fleetPath: string): Promise<void> {
       giveUp(key);
       return;
     }
+    if (quarantined.has(f.repo)) {
+      // Defensive: quarantine means "stop", so no path may respawn it. Reaching this line would mean some
+      // future refactor scheduled a restart behind giveUp's back, and silence here would hide that.
+      console.error(`[supervisor] refusing to start ${key}: quarantined (${quarantined.get(f.repo)})`);
+      return;
+    }
     // Omitting "config" in the fleet file is now the normal case: the instance resolves the conventional
     // path itself ($DRYDOCK_CONFIG_DIR/<owner>_<repo>.json). Explicit paths remain for a deployment that
     // keeps config somewhere unusual — but never inside the source tree, which is what this change removed.
@@ -408,6 +508,9 @@ async function runFleet(fleetPath: string): Promise<void> {
     console.log(`[supervisor] starting ${key} — attempt ${restarts.get(key)}`);
     const child = spawnProc(key, args, env);
     managed.set(key, child.pid ?? -1);
+    // Second reader on the same stream (spawnProc's pump is the first and keeps logging): keep the fault text
+    // so a quarantine can name the cause instead of "exit code 1" (#185).
+    child.stderr?.on("data", (d: Buffer) => rememberFault(key, String(d)));
     let readySent = false;
     // Learn the ephemeral port from stdout and publish it to the routes file.
     child.stdout!.on("data", (d: Buffer) => {
