@@ -14,8 +14,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { ApprovalWatcher, buildApprovalWatcher, parseApprovalsBody } from "../factory/approval-watch.ts";
+import { ApprovalWatcher, buildApprovalWatcher, parseApprovalsBody, readRoutesForWatch } from "../factory/approval-watch.ts";
 import { renderNotifyMessage, notifyEventKey, createNotifier } from "../factory/notify-telegram.ts";
 
 function server(handler) {
@@ -135,25 +138,42 @@ test("hostile instances: refusal, junk body and timeout are failures, never 'not
 });
 
 // --- route plumbing ---------------------------------------------------------
-test("buildApprovalWatcher polls only routes that have an instance behind them (#185 interaction)", async () => {
-  const live = await server((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ approvals: [] })); });
-  const polled = [];
-  const w = buildApprovalWatcher(
-    [
-      { repo: "o/live", target: live.url, token: "t" },
-      { repo: "o/starting" }, // no target: still booting
-      { repo: "o/quarantined", quarantined: "unknown config field: x" }, // #185: nobody behind this route
-    ],
-    { log: () => {}, notify: async () => {} },
-  );
-  const origCheck = w.check.bind(w);
-  w.check = async () => { polled.push("x"); return origCheck(); };
+// The target list comes from the routes FILE on every pass. This is a defect found by deploying the first
+// version and watching it alert about nothing: the adapter adopts in-memory `target` values only inside the
+// per-request drift check (#81), so with no webhook traffic an instance's freshly published port never reaches
+// that array — and four genuinely pending approvals went unreported.
+test("targets are re-read from the routes file each pass, including late-arriving ports and #185 markers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "approval-watch-"));
+  const file = join(dir, "routes.json");
+  const live = await server((req, res) => {
+    if (req.headers.authorization !== "Bearer tok-live") { res.writeHead(401); res.end("{}"); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ approvals: [{ key: "74944fe45911", tool: "submit_verdict", tier: "destructive" }] }));
+  });
+  const { events, notify } = collect();
 
-  const r = await w.check();
-  assert.equal(r.checked, 1, "exactly the one live route was asked");
-  assert.equal(r.failures.length, 0, "a route with no target is not a failure — it is a repo with nothing to ask");
+  // Pass 1: the instance has not published a port yet (boot), and another repo is quarantined.
+  writeFileSync(file, JSON.stringify([{ repo: "o/live" }, { repo: "o/sick", quarantined: "unknown config field: x" }]));
+  const w = buildApprovalWatcher(file, { notify, log: () => {} });
+  const first = await w.check();
+  assert.equal(first.checked, 0, "no target to ask yet");
+  assert.deepEqual(first.alerted, []);
+
+  // Pass 2: the instance became ready — same watcher, no restart, no webhook needed to notice.
+  writeFileSync(file, JSON.stringify([{ repo: "o/live", target: live.url, token: "tok-live" }, { repo: "o/sick", quarantined: "unknown config field: x" }]));
+  const second = await w.check();
+  assert.deepEqual(second.alerted, ["74944fe45911"], `the late port must be polled; got ${JSON.stringify(second)}`);
+  assert.equal(events.length, 1);
+
+  // A missing or corrupt file is "nothing to ask", never a crash next to webhook serving.
+  writeFileSync(file, "{ half-written");
+  assert.deepEqual(readRoutesForWatch(file), []);
+  rmSync(file, { force: true });
+  assert.deepEqual(readRoutesForWatch(file), []);
+
   w.stop();
-  await new Promise((r2) => live.s.close(r2));
+  rmSync(dir, { recursive: true, force: true });
+  await new Promise((r) => live.s.close(r));
 });
 
 // --- delivery ---------------------------------------------------------------

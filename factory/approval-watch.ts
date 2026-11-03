@@ -25,6 +25,8 @@
 //   - **Never throw.** This runs beside webhook serving; a defective poll must degrade to a logged failure.
 //   - **No acting on approvals.** Reading is fine; deciding belongs to a human typing a POST.
 
+import { readFileSync, existsSync } from "node:fs";
+
 import type { Notifier } from "./notify-telegram.ts";
 
 export type ApprovalWatchTarget = { repo: string; target: string; token?: string };
@@ -135,14 +137,36 @@ export class ApprovalWatcher {
 }
 
 /**
- * Build the watcher for a running adapter from its route list. Routes without a `target` (instance starting or
- * quarantined) are skipped — there is nobody to ask.
+ * Build the watcher for a running adapter.
+ *
+ * Targets come from the routes FILE, re-read every pass — not from the adapter's in-memory route array. That
+ * distinction was found by deploying this and watching it alert about nothing: in-memory `target` values are only
+ * adopted by the per-request drift check (#81), so on an idle adapter (no webhooks arriving) a freshly started
+ * instance's port never appears there, and "nobody is waiting on you" would have been reported for a fleet where
+ * four approvals were pending. Reading the file also gets quarantine markers (#185) for free.
  */
-export function buildApprovalWatcher(routes: Array<{ repo: string; target?: string; token?: string }>, opts: { notify?: Notifier; log?: (line: string) => void; intervalMs?: number }): ApprovalWatcher {
+export function buildApprovalWatcher(
+  routesFile: string,
+  opts: { notify?: Notifier; log?: (line: string) => void; intervalMs?: number } = {},
+): ApprovalWatcher {
   return new ApprovalWatcher({
-    targets: () => routes.filter((r) => typeof r.target === "string").map((r) => ({ repo: r.repo, target: r.target!, ...(r.token ? { token: r.token } : {}) })),
+    targets: () => readRoutesForWatch(routesFile),
     notify: opts.notify,
     log: opts.log,
     intervalMs: opts.intervalMs ?? Number(process.env.APPROVAL_WATCH_INTERVAL_MS ?? 60_000),
   });
+}
+
+/** Defensive read: a missing or half-written file yields no targets, never an exception. */
+export function readRoutesForWatch(routesFile: string): ApprovalWatchTarget[] {
+  try {
+    if (!existsSync(routesFile)) return [];
+    const parsed = JSON.parse(readFileSync(routesFile, "utf8"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((r) => r && typeof r.repo === "string" && typeof r.target === "string")
+      .map((r) => ({ repo: r.repo as string, target: r.target as string, ...(typeof r.token === "string" ? { token: r.token as string } : {}) }));
+  } catch {
+    return [];
+  }
 }

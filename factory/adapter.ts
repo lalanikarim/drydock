@@ -352,7 +352,7 @@ if (isMain) {
     chatId: process.env.TELEGRAM_CHAT_ID,
     log: (line) => console.log(`[adapter] ${line}`),
   });
-  const approvalWatcher = buildApprovalWatcher(routes, {
+  const approvalWatcher = buildApprovalWatcher(routesFile, {
     ...(watcherNotify ? { notify: watcherNotify } : {}),
     log: (line) => console.log(`[adapter] ${line}`),
   });
