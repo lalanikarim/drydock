@@ -38,8 +38,13 @@
  *   failure, never a pass.
  * - Each arm's diff is `merge-base(main, its own branch)..its own branch`, captured per arm — never `main..branch`
  *   after the fact, because A merging moves main underneath B and silently changes what B's diff contains.
- * - A refusal is read from `open_draft_pr`'s tool result as three states (refused / not refused / unknown). Treating
- *   "no outcome" as "did not refuse" made an unfinished run look clean.
+ * - A refusal is read from `open_draft_pr`'s tool result as three states (refused / not refused / unknown), using the
+ *   shapes production emits: a refusal carries `{refused:true, reason}` and a success carries `{prUrl,…}` — there is no
+ *   `refused:false`. If nothing was seen in the root conversation the scan widens to every conversation, and if still
+ *   nothing, a PR on the arm's own branch settles it as "not refused"; otherwise it stays `unknown` with the reason
+ *   recorded in `g5-results.json` (`refusalReason`, `outcomeConversation`, `outcomeRaw`). Treating "no outcome" as "did
+ *   not refuse" made an unfinished run look clean; reading a field that is never sent made every successful run read
+ *   unknown, which is #169.
  * - Traps are described by symptom only, never by where the fix belongs — an issue that says "fix this in the domain
  *   layer" measures instruction-following, not the lesson.
  */
@@ -49,9 +54,9 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "no
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startIntakeServer } from "../factory/intake.ts";
-import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, waitForToolResult } from "./lib.ts";
+import { loadFactoryEnv, spawnInstance, defaultConfigPath, rootConversationId, findToolResultAcrossConversations } from "./lib.ts";
 import { classifyFixPattern, formatClassification } from "./fix-pattern.mjs";
-import { contractFor, preflightArms, armBranch, lessonsContent, validateLessonText, experimentVerdict, LESSON_TEXT } from "./g5-traps.mjs";
+import { contractFor, preflightArms, armBranch, lessonsContent, validateLessonText, experimentVerdict, refusalState, LESSON_TEXT } from "./g5-traps.mjs";
 
 const exec = promisify(execFile);
 const argv = process.argv.slice(2);
@@ -174,35 +179,53 @@ async function runArm({ runDir, repo, arm, lessonText }) {
     intake = await deliverIssue({ instance, runDir, repo, issueNumber: arm.issue, label: arm.label });
     log(`arm ${arm.label}: issue #${arm.issue} delivered`);
 
-    const convId = await rootConversationId(instance.base, instance.token);
-    const deadline = Date.now() + TIMEOUT_MS;
+    // Scan every conversation for the tool result rather than polling the root one (#169). A result is recorded in the
+    // conversation that ran the tool, and an intake-driven run gets a conversation of its own; a root-only poll waits
+    // out the whole 45-minute budget on an arm that finished in 90 seconds somewhere else. Newest conversation first,
+    // so the current run wins if an older one left a result behind.
+    const rootConv = await rootConversationId(instance.base, instance.token);
     let outcome = null;
-    while (Date.now() < deadline) {
-      try {
-        outcome = await waitForToolResult(instance.base, instance.token, convId, "open_draft_pr", () => true, 60_000);
+    let outcomeConv = null;
+    let outcomeErrored = false;
+    const deadline = Date.now() + TIMEOUT_MS;
+    let lastProgress = Date.now();
+    while (outcome === null && Date.now() < deadline) {
+      const found = await findToolResultAcrossConversations(
+        instance.base,
+        instance.token,
+        "open_draft_pr",
+        () => true,
+        (m) => log(`arm ${arm.label}: ${m}`),
+      );
+      if (found) {
+        outcome = found.text;
+        outcomeConv = found.conversationId;
+        outcomeErrored = found.isError === true;
         break;
-      } catch {
-        process.stdout.write(".");
       }
+      if (Date.now() - lastProgress > 60_000) {
+        lastProgress = Date.now();
+        log(`arm ${arm.label}: still waiting for open_draft_pr (${Math.round((Date.now() - t0) / 1000)}s, root conv ${rootConv})`);
+      } else process.stdout.write(".");
+      await new Promise((r) => setTimeout(r, 10_000));
     }
     const wallSecs = Math.round((Date.now() - t0) / 1000);
-    if (outcome === null) log(`arm ${arm.label}: no open_draft_pr outcome after ${wallSecs}s — refusal state unknown`);
-
-    let refused = "unknown";
-    let review = null;
-    try {
-      const parsed = JSON.parse(outcome ?? "");
-      refused = parsed.refused === true ? "true" : parsed.refused === false ? "false" : "unknown";
-      review = parsed.review ?? null;
-    } catch {
-      /* no parsable outcome — stays unknown */
-    }
 
     const branch = armBranch(arm.issue);
     const { out: prOut } = await gh(["pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--json", "number,url,state,isDraft,headRefOid"]);
     const prs = JSON.parse(prOut || "[]");
     const pr = prs[0] ?? null;
-    if (!pr) throw new Error(`arm ${arm.label}: no PR on ${branch} (refused=${refused}) — nothing to measure`);
+
+    // Read refusal from the payload shapes production actually emits, falling back to the observable effect (a PR exists
+    // on this arm's branch) when no tool result was visible at all. `unknown` now means "we could not tell", never
+    // "it succeeded in the usual way" — which is what it meant before #169 and why every run ever made read unknown.
+    const refusal = refusalState({ outcomeText: outcome, prNumber: pr?.number ?? null, toolErrored: outcomeErrored });
+    const refused = refusal.refused;
+    const review = refusal.parsed?.review ?? null;
+    if (refused === "unknown") log(`arm ${arm.label}: refusal unknown after ${wallSecs}s — ${refusal.reason}`);
+    else log(`arm ${arm.label}: refusal=${refused} (${refusal.reason})${outcomeConv ? ` [conv ${outcomeConv}]` : " [derived from PR listing]"}`);
+
+    if (!pr) throw new Error(`arm ${arm.label}: no PR on ${branch} after ${wallSecs}s (refused=${refused}: ${refusal.reason}) — nothing to measure`);
 
     // Diff from merge base to this arm's own head, captured now. `main..branch` after the fact silently changes when
     // the other arm merges (#145).
@@ -226,6 +249,10 @@ async function runArm({ runDir, repo, arm, lessonText }) {
       lessonsPresent: arm.lessons,
       wallSecs,
       refused,
+      refusalReason: refusal.reason,
+      rootConversation: rootConv,
+      outcomeConversation: outcomeConv,
+      outcomeRaw: (outcome ?? "").slice(0, 400),
       review,
       prNumber: pr.number,
       prUrl: pr.url,

@@ -186,6 +186,53 @@ export async function waitForToolResult(base: string, token: string, conversatio
 }
 
 /** The instance's root conversation id (first in the list on a fresh store). */
+/**
+ * One pass over every conversation looking for a tool result, newest conversation first. No polling — call it when the
+ * deadline has passed and you want to know whether the result exists somewhere the caller was not looking.
+ *
+ * Why this exists: a tool result is recorded in the conversation that ran the tool, and an intake-driven run gets its
+ * own conversation rather than the root one. Observed on the live instance 2026-11-03: `/conversations` listed 22
+ * conversations with exactly one `isRoot: true`, while the intake run for an issue lived in a non-root conversation
+ * named `intake issue:#120` alongside its `delegate` results. Polling only the root is correct when the work happens to
+ * run there — which /tasks-driven runs do, and intake-driven ones need not.
+ *
+ * A conversation that cannot be read is reported through `warn` and skipped; one broken sibling is not a reason to stop
+ * looking, and silently skipping is how a scan starts reporting "nothing anywhere" for the wrong reason.
+ */
+export async function findToolResultAcrossConversations(
+  base: string,
+  token: string,
+  toolName: string,
+  match: (text: string) => boolean,
+  warn?: (message: string) => void,
+): Promise<{ conversationId: number; text: string; isError?: boolean } | null> {
+  const a = api(base, token);
+  const { json } = await a.get("/conversations");
+  const list = json.conversations ?? json.items ?? [];
+  for (const c of list) {
+    let res: { status: number; json: any };
+    try {
+      res = await a.get(`/conversations/${c.id}/entries?n=200`);
+    } catch (err: any) {
+      warn?.(`conversation ${c.id}: request failed (${err?.message ?? err}) — skipped`);
+      continue;
+    }
+    if (res.status !== 200) {
+      warn?.(`conversation ${c.id}: entries returned HTTP ${res.status} — skipped`);
+      continue;
+    }
+    const items = res.json.entries ?? res.json.items ?? [];
+    for (const item of items) {
+      if ((item.kind ?? "") !== "pi.tool-result") continue;
+      const msg = Array.isArray(item.model) ? item.model[0] : undefined;
+      if (!msg || msg.toolName !== toolName) continue;
+      const text = (msg.content ?? []).filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n");
+      if (match(text)) return { conversationId: c.id, text, isError: msg.isError === true };
+    }
+  }
+  return null;
+}
+
 export async function rootConversationId(base: string, token: string): Promise<number> {
   const a = api(base, token);
   const { json } = await a.get("/conversations");
