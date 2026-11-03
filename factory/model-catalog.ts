@@ -104,3 +104,47 @@ export async function assertModelAvailable(ref: ModelRefLike, baseUrl: string, t
   if (!isModelAvailable(ref, payload)) throw new Error(unavailableModelError(ref, payload));
   return payload;
 }
+
+/**
+ * Provider resolution for anything that has to name a provider rather than inherit one (#171).
+ *
+ * The kernel builds its catalog from `<agentDir>/models.json`, and a provider declared there WINS over the
+ * env-driven single-model registration (the coupling documented at the top of this file). A ref naming a provider
+ * that is not registered does not fail loudly: the submission is accepted, no task is created, and no assistant turn
+ * ever appears — which is exactly how `factory/intake-boot.test.ts` went red while every assertion before the
+ * non-vacuity check stayed green. The test defaulted to `"openai-completions"`; production runs on a declared
+ * provider (`aurora`) and never noticed the difference.
+ */
+export type ProviderCatalogFile = { providers?: Record<string, { baseUrl?: string; api?: string }> };
+
+/** Parse `<agentDir>/models.json`. Anything unparseable yields `null` — callers fall back and must say so. */
+export function parseProviderCatalog(raw: string | null | undefined): ProviderCatalogFile | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const providers = (parsed as ProviderCatalogFile).providers;
+    if (!providers || typeof providers !== "object" || Array.isArray(providers)) return null;
+    return { providers };
+  } catch {
+    return null; // a corrupt catalog is a fallback, not a crash: this runs in tests and at boot diagnostics
+  }
+}
+
+/**
+ * Name the provider in `catalog` that serves `baseUrl`, preferring an exact match and falling back to matching on
+ * host+port (a catalog entry with a different path suffix is still the same server for our purposes).
+ *
+ * Returns `undefined` when nothing declares it — the caller decides whether that is a fallback or an error. It must
+ * not silently return `"openai-completions"`, because that guess is what made #171 look like a model outage.
+ */
+export function providerForBaseUrl(catalog: ProviderCatalogFile | null | undefined, baseUrl: string): string | undefined {
+  const target = baseUrl.trim().replace(/\/+$/, "");
+  if (!target) return undefined;
+  const entries = Object.entries(catalog?.providers ?? {});
+  const exact = entries.find(([, p]) => (p?.baseUrl ?? "").trim().replace(/\/+$/, "") === target);
+  if (exact) return exact[0];
+  const hostPort = (u: string) => u.replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
+  const loose = entries.find(([, p]) => hostPort(p?.baseUrl ?? "") === hostPort(target));
+  return loose?.[0];
+}
