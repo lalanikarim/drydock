@@ -138,8 +138,26 @@ export interface RefineTaskOptions {
   notify?: Notifier;
 }
 
+/** What `refine_issue` creates the task with (#173). */
+export type RefineInput = {
+  issueNumber: number;
+  guidance: string;
+  trigger: "label" | "comment";
+  sender: string;
+  provider: string;
+  modelId: string;
+};
+
+/** Durable checkpoint of the refinement task. */
+export type RefineState =
+  | { phase: "spawn"; convId?: undefined }
+  | { phase: "wait"; convId: ConversationId };
+
+/** What a successful refinement leaves in the task record. */
+export type RefineResult = { posted: boolean; commentUrl: string; brief: string };
+
 export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerRefine = 600, pathScope, notify }: RefineTaskOptions) {
-  return defineTask({
+  return defineTask<RefineInput, RefineState, RefineResult>({
     name: "factory.refine",
     version: 1,
     initial: () => ({ phase: "spawn" }),
@@ -218,7 +236,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
             /* abort of an already-finished run is not an error worth failing for */
           }
           await runtime.commit(
-            () => ({ status: "completing", outcome: { status: "aborted", reason: `refinement exceeded ${wallSecsPerRefine}s` } }),
+            () => ({ status: "terminal", outcome: { status: "aborted", reason: `refinement exceeded ${wallSecsPerRefine}s` } }),
             ctx,
           );
           return;
@@ -235,7 +253,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
           }
         }
         if (!answer) {
-          await runtime.commit(() => ({ status: "completing", outcome: { status: "failed", error: { message: "refiner produced no output" } } }), ctx);
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: "refiner produced no output" } } }), ctx);
           return;
         }
 
@@ -244,7 +262,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
         const parsed = parseRefineBrief(answer);
         if (!parsed.ok) {
           await runtime.commit(
-            () => ({ status: "completing", outcome: { status: "failed", error: { message: `refinement not posted: ${parsed.reason}` }, raw: answer.slice(0, 4000) } }),
+            () => ({ status: "terminal", outcome: { status: "failed", error: { message: `refinement not posted: ${parsed.reason}`, detail: { raw: answer.slice(0, 4000) } } } }),
             ctx,
           );
           return;
@@ -257,7 +275,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
         const fresh = await fetchIssueForRefine(fixturesRepo, issueNumber, token);
         if (!fresh || fresh.state !== "open") {
           await runtime.commit(
-            () => ({ status: "completing", outcome: { status: "failed", error: { message: `refinement not posted: issue #${issueNumber} is no longer open` } } }),
+            () => ({ status: "terminal", outcome: { status: "failed", error: { message: `refinement not posted: issue #${issueNumber} is no longer open` } } }),
             ctx,
           );
           return;
@@ -276,7 +294,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
           }
         }
         await runtime.commit(
-          () => ({ status: "completing", outcome: { status: "completed", result: { posted: true, commentUrl: url, brief: parsed.brief } } }),
+          () => ({ status: "terminal", outcome: { status: "completed", result: { posted: true, commentUrl: url, brief: parsed.brief } } }),
           ctx,
         );
       },
@@ -289,7 +307,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
         const issue = task?.input?.issueNumber ?? "?";
         console.error(`[factory.refine] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
       }
-      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "refinement") }), ctx);
+      await runtime.commit(() => ({ status: "terminal", outcome: abortedOutcome(task, "refinement") }), ctx);
     },
   });
 }
@@ -297,7 +315,7 @@ export function factoryRefineTask({ workDir, fixturesRepo, gitAuth, wallSecsPerR
 /** Orchestrator-facing tool: run one refinement pass for an issue and post the brief as a comment. */
 // TaskDefinition, not ToolTask: ToolTask is the kernel's class for a model-issued tool call, which is a different
 // thing from a defineTask() result. Nothing checked this annotation before #173.
-export function refineIssueTool({ taskDef, modelRef }: { taskDef: Task<any, { phase: string }, any, any>; modelRef: { provider: string; modelId: string } }) {
+export function refineIssueTool({ taskDef, modelRef }: { taskDef: Task<RefineInput, RefineState, RefineResult, object>; modelRef: { provider: string; modelId: string } }) {
   return defineTool({
     name: "refine_issue",
     description:
@@ -310,15 +328,18 @@ export function refineIssueTool({ taskDef, modelRef }: { taskDef: Task<any, { ph
     }),
     replay: "unsafe", // spawns a child task and posts a public comment
     execute: async (args, api: ToolExecutionApi, ctx: Context) => {
+      // Named input, so the task's declared input type is what actually gets checked. An anonymous literal
+      // inferred on the fly is how field drift survived (#173).
+      const input: RefineInput = {
+        issueNumber: args.issueNumber,
+        guidance: args.guidance ?? "",
+        trigger: args.trigger === "comment" ? "comment" : "label",
+        sender: args.sender ?? "unknown",
+        ...modelRef,
+      };
       const id = await api.createTask(
         taskDef,
-        {
-          issueNumber: args.issueNumber,
-          guidance: args.guidance ?? "",
-          trigger: args.trigger === "comment" ? "comment" : "label",
-          sender: args.sender ?? "unknown",
-          ...modelRef,
-        },
+        input,
         { ownership: { kind: "task", taskId: api.taskId } },
         ctx,
       );

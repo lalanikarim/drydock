@@ -23,7 +23,7 @@ import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, defineTask, defineTool, type Task, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import { configure, defineTask, defineTool, type ConversationId, type PhaseHandler, type RunningTask, type Task, type TaskRuntime, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 // ConversationMeta is part of the kernel's declared public surface (app/src/core.ts;
 // engram #44 closed in v0.2.0) — reach it through that seam, not the internal module.
@@ -271,9 +271,35 @@ export function budgetStopNotification(o: {
   };
 }
 
+/** What `delegate` hands the worker (#173: this was implicit, so `task.input` typed as `unknown`). */
+export type WorkerInput = {
+  issueNumber: number;
+  provider: string;
+  modelId: string;
+  /** Rework request (#67) — re-authorized against live PR state in the spawn phase, never trusted as given. */
+  feedback?: { prNumber?: number; directive?: string; instruction?: string };
+  [key: string]: unknown;
+};
+
+/** Durable checkpoint: `spawn` before a worker conversation exists, `wait` after it does. */
+export type WorkerState =
+  | { phase: "spawn"; convId?: undefined }
+  | { phase: "wait"; convId: ConversationId };
+
+/**
+ * The worker's durable result. Abort facts live in `outcome.result` because the kernel's TaskOutcome union is closed
+ * (#173) — `budgetAborted`/`attempts`/`retryable` were previously smuggled in as extra keys on the outcome itself,
+ * which persisted but was never promised by anything.
+ */
+export type WorkerAbortFacts = { reclaimedAtBoot?: boolean; budgetAborted?: boolean; attempts?: number; retryable?: boolean };
+export type WorkerResult = { answer: string } | WorkerAbortFacts;
+
 export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth, pathScope, notify }: WorkerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
-  const guarded = (label: string, fn: Parameters<typeof defineTask>[0]["phases"][string]) => async (task: any, runtime: any, ctx: Context) => {
+  // Generic over the per-phase narrowing so wrapping does not erase it: the kernel hands each handler
+  // `Extract<S, { phase: P }>` as its checkpoint, and `guarded` is a logging pass-through, nothing more.
+  const guarded = <P extends WorkerState>(label: string, fn: PhaseHandler<WorkerInput, P, WorkerState, WorkerResult, object>) =>
+    async (task: RunningTask<WorkerInput, P, WorkerResult>, runtime: TaskRuntime<WorkerInput, WorkerState, WorkerResult, object>, ctx: Context) => {
     try {
       return await fn(task, runtime, ctx);
     } catch (e) {
@@ -282,7 +308,7 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
     }
   };
 
-  return defineTask({
+  return defineTask<WorkerInput, WorkerState, WorkerResult>({
     name: "factory.worker",
     version: 1,
     initial: () => ({ phase: "spawn" }),
@@ -343,7 +369,7 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           .installed()
           .flatMap((e: any) => e.tools ?? [])
           .filter((t: any) => ["read", "write", "edit", "bash"].includes(t.name));
-        let convId: number;
+        let convId: ConversationId | undefined;
         await runtime.commit(async (tx: any) => {
           const rec = await tx.createConversation({ ownership: { kind: "task", taskId: task.id } });
           // Sandbox flag + workspace: the core's envFor routes this conversation's
@@ -362,16 +388,21 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           return undefined;
         }, ctx);
 
-        const handle = await runtime.conversation(convId, ctx);
+        if (convId === undefined) throw new Error("worker phase committed no conversation id (internal: configure recorded nothing)");
+        // Bound to a const: convId is assigned inside the commit callback above, so TypeScript will not carry
+        // the narrowing across the awaits below (#173).
+        const spawnedConvId = convId;
+        const handle = await runtime.conversation(spawnedConvId, ctx);
         if (handle === undefined) throw new Error("worker conversation missing");
         await handle.submit(
           { type: "input", content: workerPrompt({ issueNumber, issueText, lessons, testCommand, rework: reworkPrompt, pathScope }), requestId: `worker-${task.id}` },
           ctx,
         );
-        await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId } }), ctx);
+        await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId: spawnedConvId } }), ctx);
       }),
       wait: guarded("WAIT", async (task, runtime, ctx) => {
         const convId = task.state.checkpoint.convId;
+        if (convId === undefined) throw new Error("worker wait phase has no conversation in its checkpoint — spawn never committed one");
         const handle = await runtime.conversation(convId, ctx);
         if (handle === undefined) throw new Error("worker conversation missing");
 
@@ -395,8 +426,8 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
                 const doc = await tx.doc(BudgetLedgerDoc);
                 note = noteBudgetAbort(doc, task.input.issueNumber, { reason });
                 return {
-                  status: "completing",
-                  outcome: { status: "aborted", reason, budgetAborted: true, attempts: note.attempts, retryable: false },
+                  status: "terminal",
+                  outcome: { status: "aborted", reason, result: { budgetAborted: true, attempts: note.attempts, retryable: false } },
                 };
               },
               ctx,
@@ -438,12 +469,12 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           // Container teardown is owned by the core (run_end → dispose).
           if (answer === "") {
             await runtime.commit(
-              () => ({ status: "completing", outcome: { status: "failed", error: { message: "worker produced no final answer" } } }),
+              () => ({ status: "terminal", outcome: { status: "failed", error: { message: "worker produced no final answer" } } }),
               ctx,
             );
             return;
           }
-          await runtime.commit(() => ({ status: "completing", outcome: { status: "completed", result: { answer } } }), ctx);
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { answer } } }), ctx);
         } finally {
           // (no manual teardown — core-owned)
         }
@@ -462,7 +493,7 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
         const issue = (task as { input?: { issueNumber?: number } })?.input?.issueNumber ?? "?";
         console.error(`[factory.worker] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
       }
-      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "worker") }), ctx);
+      await runtime.commit(() => ({ status: "terminal", outcome: abortedOutcome(task, "worker") }), ctx);
     }),
   });
 }
@@ -472,7 +503,7 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
  * or the scheduler will never dispatch it. */
 // `TaskDefinition`, not `ToolTask` (the kernel's model-tool-call class) — a defineTask() result is the former,
 // and nothing checked this annotation before #173.
-export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<any, { phase: string }, any, any>; modelRef: { provider: string; modelId: string } }) {
+export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<WorkerInput, WorkerState, WorkerResult, object>; modelRef: { provider: string; modelId: string } }) {
   return defineTool({
     name: "delegate",
     description:

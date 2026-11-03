@@ -63,8 +63,8 @@ jobs:
       - name: Unit suite
         run: npm test
 
-      # Issue #173. Not `npm run typecheck`: the tree has pre-existing errors (see gates/typecheck-baseline.json),
-      # and a check that can never be green is a check that gets removed. The ratchet runs the same strict compile
-      # and fails on any INCREASE, per file — so the number only moves down. Swap it for `npm run typecheck` at zero.
-      - name: Typecheck ratchet
-        run: npm run typecheck:ratchet
+      # Issue #173. This ran as a per-file ratchet for exactly one PR (#182, baseline 29 errors) and became the real
+      # check when #183 took the count to zero. If it ever goes red again, fix the code: do not reintroduce a
+      # baseline file without saying why in the PR.
+      - name: Typecheck
+        run: npm run typecheck

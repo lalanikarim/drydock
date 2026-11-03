@@ -67,7 +67,10 @@ for (const [kind, task] of definitions) {
     await definitionOf(kind).abort({ state: { checkpoint: {} }, input: {} }, runtime, { ctxToken: "ctx" });
     assert.equal(committed.length, 1, "abort must commit exactly once");
     const outcome = committed[0];
-    assert.equal(outcome.status, "completing", "terminal transition goes through completing");
+    // `terminal`, not `completing`: NextTaskState allows running | waiting | terminal, and `completing` is what the
+    // KERNEL stores on the way to terminal while owned work below the task is live. We used to write `completing` by
+    // hand — which skips that same-commit check and depends on internal reconciliation to settle the record (#173).
+    assert.equal(outcome.status, "terminal", "an abort handler must commit the documented terminal state");
     assert.ok(outcome.outcome && typeof outcome.outcome === "object", "an outcome object must be supplied");
     assert.equal(outcome.outcome.status, "aborted", JSON.stringify(outcome));
     assert.ok(String(outcome.outcome.reason ?? "").length > 3, `the reason must name the cause, got ${JSON.stringify(outcome.outcome.reason)}`);
@@ -153,8 +156,9 @@ test("a reclaim never inherits an operator stop's reason, and an operator stop k
     assert.equal(operator.reason, `${label} aborted`, "historical strings are unchanged (#164's evidence matches on these)");
     assert.equal(reclaimed.reason, `${label} reclaimed at boot`);
     assert.notEqual(reclaimed.reason, operator.reason);
-    assert.equal(reclaimed.reclaimedAtBoot, true);
-    assert.equal(operator.reclaimedAtBoot, undefined, "only the reclaim sets the flag");
+    // Facts ride in `result` — TaskOutcome is a closed union and extra keys on the outcome were never promised (#173).
+    assert.deepEqual(reclaimed.result, { reclaimedAtBoot: true });
+    assert.equal(operator.result, undefined, "only the reclaim sets the flag");
   }
 });
 
