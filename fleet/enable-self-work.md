@@ -725,9 +725,30 @@ was examined at all, or the watermark is corrupt. A run that opened zero stores 
 | `aborted` | task aborted with no reason (an operator using `POST /factory/runs/abort`, #141), or a submission `unanswered` with `reason=aborted` | no, reported |
 | `restarted` | task aborted with `abortReason=restart` — reclaimed by a restart | no, churn |
 | `unsettled` | submission still `queued` / `placed` | no, gauge only |
+| `inFlight` | task whose **kernel state column** is `pending`/`running`/`waiting`/`completing` — no outcome can exist yet (#186) | no, gauge only |
 
 An operator stopping a run is information, not evidence the model flailed; charging it to an incident counter trains
 everyone to mute the counter. That is the same reasoning #141 used for the wall-budget cap.
+
+### Work in progress is not failed work (#186)
+
+The task table's `status` **column** is the kernel state machine; the outcome lives at
+`$.state.outcome.status`. Reading only the outcome — which is all this gate did before #186 — makes every live run
+classify as an unrecognized outcome, i.e. `failing`. Verified 2026-11-03 against a fleet doing real work: the window
+exited 2 with `"status": "unknown", "whenMs": null` while the worker was mid-run. A gate that is red whenever anything
+is running gets muted, which is the outcome #165 exists to prevent.
+
+Two rules follow, both regression-tested over real sqlite stores:
+
+- **Open kernel states are their own class.** `pending|running|waiting|completing` (the four in the store's own
+  `CHECK`) become `inFlight`. Everything else is judged by outcome, including unrecognized states — fail-closed, so a
+  wedged row cannot hide by looking novel (`classifyTask("zombie", "", "") === "failing"`).
+- **The watermark advances only over settled rows.** Ids are allocated before work starts, so an open row is already
+  the table maximum; advancing past it meant *a run that failed five minutes after the last gate pass was never seen
+  again* — not delayed, permanently below the mark. Submissions had the same hole (`queued`/`placed` advanced).
+  Holding the mark costs re-reading one row next pass and buys late settlement being reported exactly once. A row
+  that never settles pins the mark and keeps showing up as open: a visible stall beats an invisible failure, and
+  `inFlight`/`unsettled` never alarm, so pinning cannot fabricate an incident.
 
 ### First run baselines, deliberately
 

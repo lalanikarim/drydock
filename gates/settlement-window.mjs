@@ -102,7 +102,10 @@ if (!isBaseline && alarming.length > 0) {
       instructions: [
         "failing = a task failed or faulted; unanswered = a submission no model answered (the #133 shape).",
         "aborted and restarted are reported separately and never alarm — an operator using POST /factory/runs/abort",
-        "(#141) is information, not an incident.",
+        "(#141) is information, not an incident. inFlight (a task still running) and unsettled (a queued/placed",
+        "submission) never alarm either, and the watermark does not advance past them, so a run that fails after",
+        "this pass still shows up in the next one (#186). If inFlight is large and permanent, look at the fleet,",
+        "not at this gate.",
         "Look at one:  sqlite3 \"file:factory-instances/<store>/engram-data/agent.sqlite?mode=ro\" \\",
         "               \"select json_extract(record,'$.state') from tasks where id=<id>;\"",
       ],
@@ -156,7 +159,7 @@ if (asJson) {
     out(`window: ${fresh.length} new row(s) since last run`);
     console.log(ledger.formatSummary(summaryFresh));
     const a = summaryAll.counts;
-    out(`lifetime (context only): completed=${a.completed} failing=${a.failing} unanswered=${a.unanswered} aborted=${a.aborted} restarted=${a.restarted} unsettled=${a.unsettled}`);
+    out(`lifetime (context only): completed=${a.completed} failing=${a.failing} unanswered=${a.unanswered} aborted=${a.aborted} restarted=${a.restarted} unsettled=${a.unsettled} inFlight=${a.inFlight}`);
   }
   if (process.exitCode !== 2) {
     out("");
