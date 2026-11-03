@@ -40,7 +40,8 @@ export type SettlementClass =
   | "aborted"     // operator/other abort; reported, never alarmed (#141 design)
   | "restarted"   // reclaimed by a restart (abortReason "restart"); churn, not an incident
   | "unanswered"  // accepted work that no model answered — the #133 shape, alarms unless aborted
-  | "unsettled";  // queued/placed: still open, or wedged forever
+  | "unsettled"   // queued/placed: still open, or wedged forever
+  | "inFlight";   // task row whose kernel state is not terminal yet — no outcome exists to judge (#186)
 
 export type SettlementRow = {
   store: string;
@@ -48,6 +49,8 @@ export type SettlementRow = {
   id: number;
   kind: string | null;
   status: string;
+  /** Kernel task state (`terminal`, `running`, …) for task rows; null for submissions. */
+  kernelStatus?: string | null;
   cls: SettlementClass;
   whenMs: number | null;
   detail: string;
@@ -93,7 +96,21 @@ function truncate(s: string): string {
  * the #141 verb or something we cannot explain — both go to `aborted`, which is reported but never alarmed,
  * because charging a human's stop to an incident counter trains everyone to mute the counter.
  */
-export function classifyTask(outcomeStatus: string, abortReason: string): SettlementClass {
+/**
+ * Kernel task states that mean "this row is still open". Verified against the store's own CHECK constraint
+ * (`pending|running|waiting|completing|terminal`) on 2026-11-03, plus `waiting` as observed live.
+ *
+ * Anything NOT in this set falls through to outcome classification, so an unrecognized kernel state stays
+ * fail-closed: it is judged by its outcome and lands in `failing` if there is no outcome. Guessing "open" for
+ * unknown values would hide exactly the wedged-terminal rows this ledger exists to catch.
+ */
+const OPEN_KERNEL_STATUSES: ReadonlySet<string> = new Set(["pending", "running", "waiting", "completing"]);
+
+export function classifyTask(kernelStatus: string, outcomeStatus: string, abortReason: string): SettlementClass {
+  // An open task has no outcome by definition. Reading only `$.state.outcome.status` made every in-flight run
+  // classify as an unknown outcome — i.e. alarming — so the window was red whenever anything was actually
+  // running, which is when an operator most needs it to be readable (#186).
+  if (OPEN_KERNEL_STATUSES.has(clean(kernelStatus).toLowerCase())) return "inFlight";
   const s = clean(outcomeStatus).toLowerCase();
   if (s === "completed") return "completed";
   if (s === "failed" || s === "faulted") return "failing";
@@ -137,6 +154,7 @@ function queryJson(dbPath: string, sql: string): Array<Record<string, unknown>> 
 const TASK_SQL = `
 select id,
        json_extract(kind, '$')                        as kind,
+       status                                         as kernel_status,
        coalesce(json_extract(record, '$.state.outcome.status'), '') as status,
        coalesce(json_extract(record, '$.abortReason'), '')          as abort_reason,
        json_extract(record, '$.endedAt')                            as ended_at,
@@ -175,8 +193,11 @@ export function readStore(
       table: "task",
       id: Number(t.id),
       kind: kind || null,
+      // `status` stays the outcome (it is what an operator greps for); the kernel state rides along for diagnosis
+      // because "no outcome" means two completely different things depending on it.
       status: clean(t.status) || "unknown",
-      cls: classifyTask(String(t.status ?? ""), String(t.abort_reason ?? "")),
+      kernelStatus: clean(t.kernel_status) || null,
+      cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? "")),
       whenMs: typeof t.ended_at === "number" ? t.ended_at : null,
       detail: truncate(clean(t.error_message ?? "")),
     });
@@ -203,7 +224,7 @@ export function readStore(
 }
 
 function emptyCounts(): Record<SettlementClass, number> {
-  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0 };
+  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0, inFlight: 0 };
 }
 
 export function summarize(rows: SettlementRow[], storesScanned: number): SettlementSummary {
@@ -284,10 +305,22 @@ export function unseen(rows: SettlementRow[], wm: Watermark): SettlementRow[] {
   return rows.filter((r) => r.id > (wm.highWater[keyFor(r.store, r.table)] ?? 0));
 }
 
-/** Advance per-key maxima. Monotone by construction — `Math.max` means a pruned row can never pull it backwards. */
+/**
+ * Advance per-key maxima. Monotone by construction — `Math.max` means a pruned row can never pull it backwards.
+ *
+ * Rows that have not settled yet are **skipped**, and this is the difference between a ledger and a memory hole:
+ * ids are allocated before work runs, so an in-flight task or a `placed` submission is already the highest id in
+ * its table. Advancing past it meant that when it finally failed five minutes later, no window would ever look at
+ * it again — the failure existed only in the store and never in the alarm (#186). Holding the mark below open rows
+ * costs a re-read of one row next pass; it buys late settlement being seen exactly once.
+ *
+ * A row that stays open forever (a wedged queue) pins the mark, which is correct: it keeps showing up as open
+ * rather than disappearing from view.
+ */
 export function advance(wm: Watermark, rows: SettlementRow[], now = Date.now()): Watermark {
   const highWater = { ...wm.highWater };
   for (const r of rows) {
+    if (r.cls === "inFlight" || r.cls === "unsettled") continue;
     const k = keyFor(r.store, r.table);
     highWater[k] = Math.max(highWater[k] ?? 0, r.id);
   }
@@ -305,7 +338,7 @@ export function writeWatermark(file: string, wm: Watermark): void {
 export function formatSummary(s: SettlementSummary): string {
   const c = s.counts;
   const line = (label: string, x: Record<SettlementClass, number>) =>
-    `${label}: completed=${x.completed} failing=${x.failing} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled}`;
+    `${label}: completed=${x.completed} failing=${x.failing} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled} inFlight=${x.inFlight}`;
   const out = [
     line("all", c),
     line("  factory", s.byFamily.factory),

@@ -53,7 +53,7 @@ function makeStore(name) {
      * `kind` is JSON-encoded because production stores it that way (`"factory.worker"` including the quotes).
      * Pass encodeKind:false to reproduce what happens when someone forgets.
      */
-    task({ id, kind = "factory.worker", outcomeStatus = "completed", stateStatus = "terminal", abortReason = null, endedAt = 1_793_600_000_000, errorMessage = null }) {
+    task({ id, kind = "factory.worker", outcomeStatus = "completed", stateStatus = "terminal", kernelStatus = "terminal", abortReason = null, endedAt = 1_793_600_000_000, errorMessage = null }) {
       const record = {
         id,
         conversationId: 1,
@@ -69,8 +69,19 @@ function makeStore(name) {
         endedAt,
         ...(abortReason === null ? {} : { abortReason }),
       };
+      // The `status` COLUMN is the kernel's state machine; the record's outcome is a different thing. They are
+      // passed independently here on purpose — an in-flight row is exactly (column=running, no outcome).
       sql(db, `insert into tasks (id, conversation_id, kind, status, abort_requested, background, record)
-               values (${id}, 1, ${sqlLit(JSON.stringify(kind))}, 'terminal', ${abortReason ? 1 : 0}, 0, ${sqlLit(JSON.stringify(record))});`);
+               values (${id}, 1, ${sqlLit(JSON.stringify(kind))}, ${sqlLit(kernelStatus)}, ${abortReason ? 1 : 0}, 0, ${sqlLit(JSON.stringify(record))});`);
+      return this;
+    },
+    /**
+     * Move a row from open to settled in place, the way the kernel would between two passes of this gate.
+     * Used to prove the watermark held below an open row and therefore still sees its late failure (#186).
+     */
+    settleTask(id, { outcomeStatus = "failed", errorMessage = "verification exited 1", endedAt = 1_793_600_500_000 } = {}) {
+      const outcome = JSON.stringify(errorMessage ? { status: outcomeStatus, error: { message: errorMessage } } : { status: outcomeStatus, result: {} });
+      sql(db, `update tasks set status='terminal', record=json_set(record,'$.state.status','terminal','$.state.outcome',json(${sqlLit(outcome)}),'$.endedAt',${endedAt}) where id=${id};`);
       return this;
     },
     submission({ id, status = "done", reason = null, requestId = `issue-${id}` }) {
@@ -92,21 +103,24 @@ function sqlLit(s) {
 // ── classification (the part that decides whether an operator gets woken) ─────────────────────────
 
 test("failed and faulted alarm; completed does not", () => {
-  assert.equal(ledger.classifyTask("completed", ""), "completed");
-  assert.equal(ledger.classifyTask("failed", ""), "failing");
-  assert.equal(ledger.classifyTask("faulted", ""), "failing");
+  assert.equal(ledger.classifyTask("terminal", "completed", ""), "completed");
+  assert.equal(ledger.classifyTask("terminal", "failed", ""), "failing");
+  assert.equal(ledger.classifyTask("terminal", "faulted", ""), "failing");
 });
 
 test("a restart-reclaimed abort is churn, an unexplained one is just reported — neither alarms", () => {
   // Observed in production: abortReason 'restart' for reclaimed tasks, empty for operator aborts via #141.
-  assert.equal(ledger.classifyTask("aborted", "restart"), "restarted");
-  assert.equal(ledger.classifyTask("aborted", ""), "aborted");
-  assert.equal(ledger.classifyTask("aborted", "aborted by operator"), "aborted");
+  assert.equal(ledger.classifyTask("terminal", "aborted", "restart"), "restarted");
+  assert.equal(ledger.classifyTask("terminal", "aborted", ""), "aborted");
+  assert.equal(ledger.classifyTask("terminal", "aborted", "aborted by operator"), "aborted");
 });
 
 test("an outcome we do not recognize is alarming, never silently 'completed'", () => {
-  assert.equal(ledger.classifyTask("", ""), "failing");
-  assert.equal(ledger.classifyTask("exploded", ""), "failing");
+  assert.equal(ledger.classifyTask("terminal", "", ""), "failing");
+  assert.equal(ledger.classifyTask("terminal", "exploded", ""), "failing");
+  // Fail-closed on the kernel side too: only the four known open states count as in-flight. An unrecognized state
+  // is judged by its outcome, so a wedged row cannot hide by looking novel.
+  assert.equal(ledger.classifyTask("zombie", "", ""), "failing");
 });
 
 test("submissions: unanswered alarms unless a human aborted it; queued/placed are unsettled", () => {
@@ -116,6 +130,89 @@ test("submissions: unanswered alarms unless a human aborted it; queued/placed ar
   assert.equal(ledger.classifySubmission("unanswered", "no_model"), "unanswered");
   assert.equal(ledger.classifySubmission("queued", ""), "unsettled");
   assert.equal(ledger.classifySubmission("placed", ""), "unsettled");
+});
+
+// ── #186: work that has not finished is not work that failed ───────────────────────────────────────
+
+test("REGRESSION (#186): an in-flight task has no outcome, and reading only the outcome alarmed every live run",
+  () => {
+    // Production shape verified 2026-11-03 while a worker was mid-run: column status 'running', no
+    // $.state.outcome at all. The old classifier saw "" → failing, so `settlement-window` exited 2 whenever the
+    // fleet was actually doing something — which is precisely when an operator reads it.
+    assert.equal(ledger.classifyTask("running", "", ""), "inFlight");
+    assert.equal(ledger.classifyTask("waiting", "", ""), "inFlight");
+    assert.equal(ledger.classifyTask("pending", "", ""), "inFlight");
+    assert.equal(ledger.classifyTask("completing", "", ""), "inFlight");
+
+    const s = makeStore("in-flight");
+    try {
+      s.task({ id: 64, outcomeStatus: null, kernelStatus: "running" });
+      const rows = ledger.readStore("in-flight", s.db);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].cls, "inFlight");
+      assert.equal(rows[0].kernelStatus, "running");
+      const summary = ledger.summarize(rows, 1);
+      assert.deepEqual(summary.alarms, [], "a running task must not appear in alarms");
+      assert.equal(summary.counts.inFlight, 1);
+      assert.equal(summary.counts.failing, 0);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+test("REGRESSION (#186): the watermark holds below open rows, so a failure that lands later is still seen",
+  () => {
+    // Ids are allocated before work starts, so an open row is already the table maximum. Advancing past it meant
+    // "failed five minutes after I looked" was invisible forever — the store knew, the alarm never did.
+    const s = makeStore("late-failure");
+    try {
+      s.task({ id: 100, outcomeStatus: null, kernelStatus: "running" });
+      s.submission({ id: 101, status: "placed" });
+
+      let wm = ledger.emptyWatermark();
+      const pass1 = ledger.unseen(ledger.readStore("late-failure", s.db), wm);
+      assert.equal(pass1.length, 2, "both open rows are new");
+      wm = ledger.advance(wm, pass1);
+      assert.deepEqual(wm.highWater, {}, "open rows must not advance the watermark at all");
+
+      // The kernel settles them between passes.
+      s.settleTask(100, { outcomeStatus: "failed", errorMessage: "verification exited 1" });
+      s.submission({ id: 102, status: "done" });
+
+      const pass2 = ledger.unseen(ledger.readStore("late-failure", s.db), wm);
+      const ids = pass2.map((r) => r.id).sort((a, b) => a - b);
+      assert.deepEqual(ids, [100, 101, 102], "the settled ex-open rows are still unseen and now judgeable");
+      const summary = ledger.summarize(pass2, 1);
+      assert.equal(summary.alarms.length, 1, "the late failure alarms exactly once");
+      assert.equal(summary.alarms[0].id, 100);
+
+      // And after it has been reported, it is not reported again.
+      wm = ledger.advance(wm, pass2);
+      assert.equal(ledger.unseen(ledger.readStore("late-failure", s.db), wm).length, 0);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+test("gate: a live run does not make the window red (#186)", () => {
+  const s = makeStore("gate-live-run");
+  try {
+    s.task({ id: 7, outcomeStatus: null, kernelStatus: "running" });
+    s.submission({ id: 8, status: "placed" });
+    const stateFile = join(s.root, "state.json");
+    // Pass 1 baselines (that is the documented first-run behavior). Pass 2 is the interesting one: the same open
+    // rows are still ahead of the watermark and must classify as in-flight, not as failures.
+    runGate(["--instances-root", s.root, "--state-file", stateFile]);
+    const r = runGate(["--instances-root", s.root, "--state-file", stateFile]);
+    assert.equal(r.code, 0, `a running worker is not an incident; gate said: ${r.out.slice(0, 300)}`);
+    // The task is in-flight; the submission is unsettled. Two open buckets, neither alarming.
+    assert.match(r.out, /inFlight=1/);
+    assert.match(r.out, /unsettled=1/);
+    assert.doesNotMatch(r.out, /failing=[1-9]/);
+    assert.match(r.out, /window clean/);
+  } finally {
+    s.cleanup();
+  }
 });
 
 // ── reading a real store ────────────────────────────────────────────────────────────────────────
