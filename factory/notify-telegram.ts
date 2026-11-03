@@ -55,6 +55,21 @@ export type NotifyEvent =
       reachable: number;
       total: number;
       detail?: string;
+    }
+  | {
+      /**
+       * A repo stopped being supervised (#185): its boot failures exhausted the restart budget, so the
+       * supervisor quarantined THAT repo and kept its siblings serving. Before that change one bad config
+       * key in one repo was a fleet-wide kill switch, and the component best placed to report it (the
+       * adapter) was killed as part of the outage.
+       *
+       * `reason` must be operator-safe text — the child's last fault line, never a token. Quarantine is
+       * sticky within a supervisor process, so this fires once per repo; see notifyEventKey.
+       */
+      kind: "repo_quarantined";
+      repo: string;
+      attempts: number;
+      reason: string;
     };
 
 const SHORT = (s: string | null | undefined, n = 9): string => (s ? String(s).slice(0, n) : "");
@@ -80,6 +95,9 @@ export function renderNotifyMessage(e: NotifyEvent): string {
     }
     case "refine_posted": {
       return `${name}: refinement brief posted on issue #${e.issueNumber}${e.commentUrl ? ` ${e.commentUrl}` : ""}`.trim();
+    }
+    case "repo_quarantined": {
+      return `factory: ${name} quarantined after ${e.attempts} failed boots — ${e.reason}. Its deliveries are refused with 503; siblings unaffected`.trim();
     }
   }
 }
@@ -257,6 +275,12 @@ export function notifyEventKey(e: NotifyEvent): string {
       // The state IS the event — an outage and its recovery are different messages, and a fleet that went from
       // 1/2 to 0/2 is news again.
       return `inference_state:${e.state}:${e.reachable}/${e.total}`;
+    case "repo_quarantined":
+      // Deliberately NOT keyed by reason or attempt count: quarantine is sticky (nothing lifts it inside a
+      // process lifetime), so a repeat would be the same news re-worded. Two repos quarantining IS two news
+      // items, which is why repo is in the key — and a supervisor that dies and re-quarantines the same repo
+      // starts a fresh dedupe table, which is correct: that is a second outage.
+      return `repo_quarantined:${e.repo}`;
     default: {
       // Unreachable while NotifyEvent is exhaustive. Structurally keyed so a future kind cannot silently share
       // another's dedupe window; it also keeps this function total, because a notification defect must never

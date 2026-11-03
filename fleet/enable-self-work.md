@@ -850,6 +850,66 @@ before opening anything, because the original #157 repro queried by conversation
 
 ---
 
+## 7f. One repo quarantines itself; the fleet keeps serving (#185)
+
+Before this, `MAX_RESTARTS` on **one** repo was a fleet-wide kill switch. The incident: one typo in engram's runtime
+config (`_comment_setup` — only `_comment` and `_notes` are inert), ten restarts, then:
+
+```
+[supervisor] factory:lalanikarim/engram exceeded 10 restarts — giving up and exiting non-zero
+[supervisor] terminating 2 child process group(s): factory:lalanikarim/drydock, adapter
+```
+
+`drydock` was healthy. It died next to its neighbour, along with the adapter — the one component that could have
+reported the outage. Strict-at-boot is still correct (a config field nobody reads is a policy nobody applies); what
+was wrong is that "gave up" was global.
+
+### What you see now
+
+```
+[supervisor] QUARANTINE factory:lalanikarim/engram after 11 failed boots: [factory] fatal: Error: unknown config field: _comment_setup
+[supervisor] factory:lalanikarim/engram will not be restarted; 1 of 2 repo(s) still served. Fix the cause and restart the supervisor (runbook §7).
+```
+
+plus one Telegram message (`repo_quarantined`, deduped per repo per supervisor process), plus a marker in the routes
+file. The reason is the child's last error line — not `exit code 1`, and deliberately not a stack frame.
+
+```bash
+# who is sick, and why (reason is present only on quarantined routes)
+python3 -c "import json;[print(r['repo'], '→', r.get('quarantined') or r.get('target')) for r in json.load(open('fleet/data/routes.json'))]"
+```
+
+### Consequences that are intentional
+
+- **The quarantined repo keeps its route.** Deleting it would leave the adapter without its webhook secret, so its
+  deliveries would fail signature checks and look like an attack rather than an outage.
+- **Its deliveries get `503 {"error":"…quarantined by the supervisor…","code":"repo_quarantined"}`** — refused, not
+  accepted-and-dropped. GitHub retries 5xx, so work queued during a quarantine can still land once it is lifted.
+  Grep delivery logs for `repo_quarantined`; that is the whole audit trail of what was refused and when.
+- **Quarantine is sticky.** Nothing in a running supervisor can fix a bad config file, so re-spawning is waste and
+  re-alerting is noise. There is no un-quarantine verb: fix the cause, then restart the supervisor (§10).
+- **The supervisor still exits non-zero when nothing can serve** — every managed repo quarantined, or the shared
+  adapter exhausting its own budget. "Gave up" must keep looking like a failure to whatever watches pids (#127);
+  that is the half of the old behavior worth keeping.
+- **`quarantined` is runtime state, not authority**, excluded from the policy fingerprint exactly like `target`
+  (#81). If it were not, marking a repo sick would terminate the adapter for every *other* repo — i.e. the same bug
+  wearing a different hat. `test/quarantine-blast-radius.test.mjs` asserts that exclusion directly.
+
+### Test seams
+
+`FACTORY_MAX_RESTARTS` (default 10) and `FACTORY_RESTART_BACKOFF_MS` (default 5000) exist so the quarantine path is
+testable in seconds instead of a minute. A bad value is logged and ignored rather than crashing the supervisor — a
+recovery-path knob that can be mistyped into a crash is the same class of defect as this issue.
+
+### Alerts
+
+Quarantine alerts use the same notifier as inference edges (§8), so `TELEGRAM_API_BASE` redirects them too, and they
+are missing-and-silent when credentials are absent — the boot log says so once:
+`[supervisor] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — supervisor alerts (quarantine, #185) are disabled`.
+That line is worth grepping after any deploy; a fleet that cannot alert has already lost half the value of alerting.
+
+---
+
 ## 8. Operator notifications (Telegram, #64)
 
 Optional outbound pings so the factory does not have to be polled. Enabled by two variables in `.env`; with

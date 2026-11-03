@@ -25,6 +25,7 @@ import {
   classifyWebhookEvent,
   directiveFromEvent,
   RoutesDriftedError,
+  RepoUnavailableError,
   type Route,
 } from "./intake.ts";
 import { fetchIssueState } from "./gh-read.ts";
@@ -65,7 +66,10 @@ export function policyFingerprint(routes: unknown): string {
     if (value && typeof value === "object") {
       const out: Record<string, unknown> = {};
       for (const key of Object.keys(value).sort()) {
-        if (key === "target") continue; // runtime state, not authority
+        // `target` and `quarantined` are runtime state, not authority (#81, #185). Quarantine in particular
+        // flips while the fleet is running — that is its whole purpose — so treating it as policy would make a
+        // repo going sick look like an authority change and terminate the adapter for every OTHER repo.
+        if (key === "target" || key === "quarantined") continue;
         out[key] = project((value as Record<string, unknown>)[key]);
       }
       return out;
@@ -136,15 +140,20 @@ export function makeRoutesDriftCheck({ routesFile, startupHash, terminate, liveR
         parsed = undefined; // unparsable is never benign
       }
       if (parsed !== undefined && policyFingerprint(parsed) === knownPolicy) {
-        const before = liveRoutes.map((r) => `${r.repo}:${r.target ?? "-"}`).join(", ");
+        const summary = (list: Route[]) => list.map((r) => `${r.repo}:${r.target ?? "-"}${r.quarantined ? "(quarantined)" : ""}`).join(", ");
+        const before = summary(liveRoutes);
         const next = parsed as Route[];
         for (const route of liveRoutes) {
           const fresh = next.find((r) => r?.repo === route.repo);
           if (fresh && typeof fresh.target === "string") route.target = fresh.target;
           else if (!fresh || fresh.target === undefined) delete route.target; // factory exited: refuse until it returns
+          // Quarantine travels the same way as target (#185): the supervisor marks a repo sick while the
+          // adapter keeps serving its siblings, so this must be adoptable in place rather than fatal.
+          if (fresh && typeof fresh.quarantined === "string") route.quarantined = fresh.quarantined;
+          else delete route.quarantined;
         }
         knownHash = current;
-        const changed = liveRoutes.map((r) => `${r.repo}:${r.target ?? "-"}`).join(", ");
+        const changed = summary(liveRoutes);
         if (before !== changed) {
           console.log(`[adapter] routes refreshed at runtime: target-only change adopted in place (policy ${knownPolicy.slice(0, 16)}, file ${current.slice(0, 16)}; ${changed})`);
         }
@@ -198,6 +207,11 @@ export function makeRouteDispatch(
   const auth: GitAuth = gitAuth ?? createGitAuth();
   return async (repo: string, event: any) => {
     const route = byRepo.get(repo);
+    // Checked before the missing-target case and before any GitHub read: a quarantined repo is not "starting
+    // up", it is a repo the supervisor gave up on, and the answer must be distinguishable in delivery logs.
+    if (route?.quarantined) {
+      throw new RepoUnavailableError(`repo ${repo} is quarantined by the supervisor: ${route.quarantined}`, "repo_quarantined");
+    }
     if (!route?.target) throw new Error(`no instance target configured for ${repo}`);
 
     // Same classifier the intake used to accept this delivery — re-derived rather than trusted from

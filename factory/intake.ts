@@ -237,6 +237,28 @@ export function verifyGitHubSignature({ signatureHeader, rawBody, secret }: { si
  */
 export class RoutesDriftedError extends Error {}
 
+/**
+ * A route exists, but its instance is deliberately not serving (#185).
+ *
+ * Distinct from the generic dispatch failure (502) because the operator action differs: 502 means "the
+ * instance rejected or could not be reached — retrying may work", while this means "the supervisor stopped
+ * supervising this repo; nothing will change until a human fixes it and restarts". GitHub retries both, so
+ * the status code is not the whole story — `code` is what makes the refusal greppable in delivery logs.
+ *
+ * The HTTP layer keys off `httpStatus` (duck-typed) rather than `instanceof`, because this class is thrown
+ * from factory/adapter.ts and caught in factory/intake.ts; a structural check keeps that working without an
+ * import cycle, and survives a test double throwing its own equivalent.
+ */
+export class RepoUnavailableError extends Error {
+  readonly httpStatus = 503;
+  readonly code: string;
+  constructor(message: string, code = "repo_unavailable") {
+    super(message);
+    this.name = "RepoUnavailableError";
+    this.code = code;
+  }
+}
+
 export interface Route {
   repo: string;
   secret: string;
@@ -259,6 +281,13 @@ export interface Route {
   refine?: boolean;
   /** Label that requests a refinement. Defaults to "refine"; ignored when it equals eligibilityLabel. */
   refineLabel?: string;
+  /**
+   * Set by the supervisor when this repo exhausted its restart budget (#185): the reason it could not boot.
+   * Runtime state, NOT authority — `policyFingerprint` ignores it exactly like `target`, otherwise marking a
+   * repo sick would look like a policy change and take the whole adapter down, which is the opposite of the
+   * blast-radius fix. A route with no target and no quarantine just means "still starting".
+   */
+  quarantined?: string;
 }
 
 /** Validate a multi-repo route list (multi-repo plan §3.2). */
@@ -631,15 +660,23 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
             await mkdir(dirname(logPath), { recursive: true });
             await appendFile(logPath, JSON.stringify(failLine) + "\n");
           }
-          res.writeHead(502, { "content-type": "application/json" });
-          return res.end(JSON.stringify({ error: (e as Error).message }));
+          // A refusal that carries its own status (RepoUnavailableError → 503) is reported as such; everything
+          // else stays the upstream-failure 502 it has always been.
+          const carried = (e as { httpStatus?: unknown; code?: unknown } | null)?.httpStatus;
+          const status = typeof carried === "number" && carried >= 400 && carried <= 599 ? carried : 502;
+          const code = typeof (e as { code?: unknown } | null)?.code === "string" ? String((e as { code: string }).code) : undefined;
+          res.writeHead(status, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: (e as Error).message, ...(code ? { code } : {}) }));
         }
       }
       res.writeHead(result.accepted ? 202 : 200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: (err as Error).message }));
+      const carried = (err as { httpStatus?: unknown; code?: unknown } | null)?.httpStatus;
+      const status = typeof carried === "number" && carried >= 400 && carried <= 599 ? carried : 500;
+      const code = typeof (err as { code?: unknown } | null)?.code === "string" ? String((err as { code: string }).code) : undefined;
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: (err as Error).message, ...(code ? { code } : {}) }));
     }
   });
   return new Promise((resolve) => {
