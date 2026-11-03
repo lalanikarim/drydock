@@ -2,7 +2,11 @@
 // composition. Host-side: races the conversation's idle-wait against a
 // deadline; the caller decides how to abort on overrun.
 
-import type { ConversationHandle, Context } from "@earendil-works/pi-durable";
+import type { ConversationHandle } from "@earendil-works/pi-durable";
+// `Context` belongs to chord, not pi-durable — the sandbox contract takes one and so does
+// ConversationHandle.waitForIdle. Importing it from pi-durable cost nothing at runtime (types are
+// stripped) and reported TS2305 the first time a compiler was pointed at this tree (#173).
+import type { Context } from "@earendil-works/chord/context";
 
 /** Deadline in ms from now (budgetSecs <= 0 means no budget). */
 export function budgetDeadlineMs(budgetSecs: number): number | null {

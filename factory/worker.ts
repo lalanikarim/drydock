@@ -23,7 +23,8 @@ import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, defineTask, defineTool, type Context, type ToolExecutionApi, type ToolTask } from "@earendil-works/pi-durable";
+import { configure, defineTask, defineTool, type Task, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 // ConversationMeta is part of the kernel's declared public surface (app/src/core.ts;
 // engram #44 closed in v0.2.0) — reach it through that seam, not the internal module.
 import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
@@ -469,7 +470,9 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
 /** Orchestrator-facing tool: run the sandboxed worker for one issue.
  * The caller MUST register `taskDef` with the harness registry (extension tasks)
  * or the scheduler will never dispatch it. */
-export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: ToolTask; modelRef: { provider: string; modelId: string } }) {
+// `TaskDefinition`, not `ToolTask` (the kernel's model-tool-call class) — a defineTask() result is the former,
+// and nothing checked this annotation before #173.
+export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<any, { phase: string }, any, any>; modelRef: { provider: string; modelId: string } }) {
   return defineTool({
     name: "delegate",
     description:

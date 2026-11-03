@@ -15,6 +15,7 @@
 // endpoint is unreachable the test skips cleanly (like engram's live suites).
 
 import assert from "node:assert/strict";
+import type { ConversationId } from "@earendil-works/pi-durable"; // branded id boundary (#173)
 import { test } from "node:test";
 import http from "node:http";
 import { createRequire } from "node:module";
@@ -126,7 +127,9 @@ test("engram core seam spike (issue #30 phase 0)", { timeout: 120_000 }, async (
 
     const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
     const ctx = BACKGROUND_CONTEXT;
-    const root = await inst.harness.conversation(inst.rootConversationId, ctx);
+    // Branded id boundary (#173): the spike handle holds a plain number, pi-durable wants ConversationId.
+    // Casting here is honest; letting a bare number flow in would also have accepted a TaskId.
+    const root = await inst.harness.conversation(inst.rootConversationId as ConversationId, ctx);
     assert(root, "root conversation exists");
     const toolNames = (await root.agent(ctx)).tools.map((x) => x.name);
 

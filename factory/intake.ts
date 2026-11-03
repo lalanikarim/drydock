@@ -315,12 +315,14 @@ export function loadRoutes(path: string): Route[] {
  * (without buffering) as soon as the running size passes the cap; the caller
  * refuses with 413 and destroys the connection rather than reading the rest.
  */
-function readBoundedBody(req: http.IncomingMessage, cap: number): Promise<{ body?: Buffer; tooLarge: boolean }> {
+// Discriminated on purpose (#173): with `{ body?: Buffer; tooLarge: boolean }` a caller could check `tooLarge`, then
+// read `.body` and have `undefined` in its face — which is exactly what the two signature/parse sites below did.
+function readBoundedBody(req: http.IncomingMessage, cap: number): Promise<{ tooLarge: true } | { tooLarge: false; body: Buffer }> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
     let settled = false;
-    const settle = (v: { body?: Buffer; tooLarge: boolean }) => {
+    const settle = (v: { tooLarge: true } | { tooLarge: false; body: Buffer }) => {
       if (settled) return;
       settled = true;
       resolve(v);
@@ -333,8 +335,8 @@ function readBoundedBody(req: http.IncomingMessage, cap: number): Promise<{ body
       }
       chunks.push(chunk);
     });
-    req.on("end", () => settle({ body: Buffer.concat(chunks), tooLarge: false }));
-    req.on("error", () => settle({ body: Buffer.concat(chunks), tooLarge: false }));
+    req.on("end", () => settle({ tooLarge: false, body: Buffer.concat(chunks) }));
+    req.on("error", () => settle({ tooLarge: false, body: Buffer.concat(chunks) }));
   });
 }
 
@@ -641,6 +643,12 @@ export function startIntakeServer({ port = 0, host = "127.0.0.1", webhookSecret,
     }
   });
   return new Promise((resolve) => {
-    server.listen(port, host, () => resolve({ server, port: server.address().port as number, host }));
+    server.listen(port, host, () => {
+      // address() is `AddressInfo | string | null`. After listen() on a TCP server it is an AddressInfo, but that is
+      // a fact about the world and not one the compiler has, so it is checked rather than asserted (#173).
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error(`intake server has no TCP address after listen (${JSON.stringify(addr)})`);
+      resolve({ server, port: addr.port, host });
+    });
   });
 }

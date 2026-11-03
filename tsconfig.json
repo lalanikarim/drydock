@@ -1,0 +1,34 @@
+{
+  // TypeScript configuration for the factory + fleet (issue #173).
+  //
+  // This file did not exist for the repository's whole life, which is why #164 — a task definition whose `abort`
+  // handler sat under `phases` where the kernel never reads it — survived every test ever run. The compiler had been
+  // naming that bug from the first commit; nobody asked it to.
+  //
+  // It does NOT yet pass clean, so it is not wired into CI as a gate. What IS in CI is `npm run typecheck:ratchet`
+  // (gates/typecheck-ratchet.mjs): the same compile against a committed per-file baseline, red on any increase. The
+  // count can go down and never up. When it hits zero, replace the ratchet with `npm run typecheck` in ci.yml.
+  //
+  // Deliberate choices:
+  //   - allowImportingTsExtensions: factory/*.ts import each other (and vendor/engram) by explicit .ts path, which is
+  //     how they are actually executed (node --experimental-strip-types / tsx). Type-only resolution must match.
+  //   - allowJs: the fleet imports a few plain-JS tools (fleet/redeliver-failed.mjs, gates/*.mjs). Inferring types
+  //     from them beats hand-written declarations — a hand-written surface for redeliver-failed.mjs was wrong on its
+  //     first try and found nothing.
+  //   - skipLibCheck: dependency internals are their own business; our code is this file's business.
+  //   - vendor/ excluded: an other team's tree, and its errors would drown ours. Revisit if we ever patch it in
+  //     place (we do carry one local fix to engram's config loader).
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "types": ["node"]
+  },
+  "include": ["factory/**/*.ts", "fleet/**/*.ts", "gates/**/*.ts"],
+  "exclude": ["factory-instances", "vendor", "node_modules"]
+}

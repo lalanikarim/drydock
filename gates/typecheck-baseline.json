@@ -1,0 +1,7 @@
+{
+  "errors": 29,
+  "byFile": {
+    "factory/worker.ts": 16,
+    "factory/reviewer.ts": 13
+  }
+}

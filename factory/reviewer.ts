@@ -25,7 +25,8 @@ import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { configure, defineTask, defineTool, type Context, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import { configure, defineTask, defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 // ConversationMeta is part of the kernel's declared public surface (app/src/core.ts;
 // engram #44 closed in v0.2.0) — reach it through that seam, not the internal module.
 import { ConversationMeta } from "../vendor/engram/app/src/core.ts";
@@ -129,21 +130,30 @@ export function makeReviewerRoleTools({ workDir, testCommand = "node --test" }: 
     description: `Run the repository's test suite (\`${testCommand}\`) inside the sandboxed checkout. Returns pass/fail counts and the output tail.`,
     parameters: Type.Object({}),
     replay: "safe", // deterministic given the fixed branch under review
-    execute: async (_args, api: ToolExecutionApi) => {
+    // `ExecutionEnv.exec` is (command, options, context) and the third argument is dereferenced immediately
+    // (`const signal = context.abortSignal`). Called with two arguments, EVERY invocation threw TypeError; the old
+    // catch turned that into "[exec error: ...]" and still returned `suite: pass=0 fail=0`, which reads to a
+    // reviewing model like a suite that ran and passed nothing. The first typecheck this repository ever ran found
+    // it (#173); a test now runs this tool against a real execution env so the contract cannot drift back.
+    execute: async (_args, api: ToolExecutionApi, ctx: Context) => {
       if (!api.env) throw new Error("no execution environment for this reviewer conversation (sandbox not active)");
       let out = "";
-      let res;
-      try {
-        // exec streams output via onOutput (the result carries only exitCode);
-        // timeout is in SECONDS per the ExecutionEnv contract.
-        res = await api.env.exec(testCommand, { timeout: 300, onOutput: (t) => (out += t) });
-      } catch (e) {
-        res = { ok: false, error: { message: String((e as Error).message) } };
+      // timeout is in SECONDS per the ExecutionEnv contract; output streams via onOutput (the result carries only
+      // exitCode), which is why the tail below comes from the sink and not the return value.
+      const res = await api.env.exec(testCommand, { timeout: 300, onOutput: (t) => (out += t) }, ctx);
+      if (!res.ok) {
+        // A suite that never ran is NOT a suite with zero failures. Say it in the same sentence the model reads.
+        return {
+          output: [{
+            type: "text" as const,
+            text: `suite: NOT RUN (exec error: ${res.error?.message ?? "unknown"})\nThe test command could not be executed. Do not treat this as a passing or failing suite, and do not approve on this basis.`,
+          }],
+        };
       }
-      if (!res.ok) out += "\n[exec error: " + (res.error?.message ?? "unknown") + "]";
+      const exitCode = res.value?.exitCode ?? -1;
       const pass = [...out.matchAll(/^# pass (\d+)$/gm)].map((m) => Number(m[1])).reduce((a, b) => a + b, 0);
       const fail = [...out.matchAll(/^# fail (\d+)$/gm)].map((m) => Number(m[1])).reduce((a, b) => a + b, 0);
-      return { output: [{ type: "text" as const, text: `suite: pass=${pass} fail=${fail}\n\n${out.slice(-2500)}` }] };
+      return { output: [{ type: "text" as const, text: `suite: pass=${pass} fail=${fail} exit=${exitCode}\n\n${out.slice(-2500)}` }] };
     },
   });
 

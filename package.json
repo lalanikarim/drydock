@@ -15,6 +15,13 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types factory/pipeline.test.ts && node --experimental-strip-types factory/intake.test.ts && node --experimental-strip-types --test 'test/*.test.mjs'",
-    "test:boot": "node --experimental-strip-types factory/core-spike.test.ts && node --experimental-strip-types factory/pipeline-boot.test.ts"
+    "test:boot": "node --experimental-strip-types factory/core-spike.test.ts && node --experimental-strip-types factory/pipeline-boot.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:ratchet": "node gates/typecheck-ratchet.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
   }
 }
