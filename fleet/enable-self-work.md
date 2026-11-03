@@ -783,6 +783,52 @@ Disabling self-work entirely is one line in the registry (`enabled: false`), whi
 
 **What stays published is a decision, not a default.** A funnel URL is an HTTPS listener on a laptop that anyone on the internet can post signed-looking requests to; the refusals above are what makes that tolerable, and they only hold while the secret stays secret and the loopback bind stays loopback. If self-work is driven in bursts rather than continuously, tear the funnel down between bursts and re-run `tailscale funnel --bg 9700` when needed — GitHub retries failed deliveries with backoff, but that is not a durable queue you should rely on: if the window matters, re-add the label once the listener is back (nothing was recorded while it was down, so the same issue dispatches cleanly — `requestId` only deduplicates against work that actually started).
 
+## 7e. A boot-time reclaim is not an operator stop (#157)
+
+When a factory instance dies holding a task reservation, the **kernel** reclaims it on the next boot. Tasks created
+under a tool that does not resume carry `abandonOnRestart: true`; the replacement instance's first scheduler pass
+abort-marks them with `abortReason: "restart"`, and our abort handler commits the terminal outcome. Verified against
+real processes rather than inferred — a running `factory.worker` task, its instance SIGKILLed, a replacement booted on
+the same store:
+
+```console
+killed instance pid 76801; immediately after: {"columnStatus":"running","abortRequested":0,"stateStatus":"running",
+    "abandonOnRestart":true,"checkpoint":{"phase":"spawn"}}
+instance 2 up on the same store
+t=  5s  {"columnStatus":"terminal","abortRequested":1,"stateStatus":"terminal",
+         "outcome":{"status":"aborted","reason":"worker aborted"}}
+```
+
+So `running` in the store after a crash is not a permanent lie, and no manual cleanup step belongs here. Two things make
+that claim checkable instead of something you have to trust (both shipped after the transcript above, which is why it
+still shows the older reason string):
+
+- **The reason distinguishes the two events.** An operator abort reads `"<kind> aborted"` (`worker aborted`,
+  `reviewer aborted`, `refinement aborted`); a boot reclaim reads `"<kind> reclaimed at boot"`. Both are
+  `outcome.status: "aborted"`, so nothing that counts aborts changes.
+- **A reclaim logs one line.** `[factory.worker] RESTART-RECLAIM (#157): issue #N settled at boot — the reservation
+  belonged to a previous instance`. Before this, a full reclaim produced zero matching lines in the instance log,
+  which is why "nothing reclaims it" was the reasonable reading of the store.
+
+The settlement window (§7d) classifies these as `restarted` from the kernel's own `abort_reason` column and reports
+them without ever alarming on them — a crash-recovery settlement is not an incident, and charging it to one is how
+operators learn to mute the counter.
+
+**What this issue actually was.** #157 reported that nothing reclaims a dead task. The mechanism was always there; what
+it hit was #164 — our `abort` handler was nested under `phases`, so the reclaim threw instead of settling. Same
+reproduction, pre-fix branch:
+
+```console
+t=  5s  {"columnStatus":"terminal","abortRequested":1,"stateStatus":"terminal",
+         "outcome":{"status":"faulted","error":{"message":"erased(...).abort is not a function"}}}
+```
+
+If you ever see a task stuck non-terminal across a boot whose **kind** is `pi.generation` or `pi.tool`, that is a
+different mechanism (kernel-internal work, which the replacement instance may legitimately resume) — record the kind
+before opening anything, because the original #157 repro queried by conversation and never captured it.
+
+---
+
 ## 8. Operator notifications (Telegram, #64)
 
 Optional outbound pings so the factory does not have to be polled. Enabled by two variables in `.env`; with

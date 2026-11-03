@@ -50,6 +50,7 @@ import {
   type PrDirectiveKind,
 } from "./pr-feedback.ts";
 import { sanitizeUntrusted, wrapUntrusted } from "./untrusted.ts";
+import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -453,7 +454,14 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
     // `erased(...).abort is not a function` and the task faulted instead of settling (#164). The repo had no
     // type-check step, so a missing required interface member was invisible; see also test/task-definition-contract.test.mjs.
     abort: guarded("ABORT", async (task, runtime, ctx) => {
-      await runtime.commit(() => ({ status: "completing", outcome: { status: "aborted", reason: "worker aborted" } }), ctx);
+      // #157: `abortReason: "restart"` means this reservation belonged to a previous instance that died holding it, and
+      // the kernel's boot-time reclaim is driving the abort. That reclaim works — what it did not do was say so, or
+      // leave anything in the record distinguishing it from an operator stopping a run.
+      if (isRestartAbort(task)) {
+        const issue = (task as { input?: { issueNumber?: number } })?.input?.issueNumber ?? "?";
+        console.error(`[factory.worker] RESTART-RECLAIM (#157): issue #${issue} settled at boot — the reservation belonged to a previous instance`);
+      }
+      await runtime.commit(() => ({ status: "completing", outcome: abortedOutcome(task, "worker") }), ctx);
     }),
   });
 }
