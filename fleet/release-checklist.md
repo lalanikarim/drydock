@@ -84,8 +84,15 @@ curl -s http://127.0.0.1:9700/health    # build.sha MUST equal the merge commit 
 ps -eo pid,ppid,command | grep -E "factory/main[.]ts|adapter[.]ts"   # every child's ppid = supervisor
 grep -ci quarantin /tmp/fleet-*.log     # 0 unless a repo genuinely failed to boot (#185)
 node --experimental-strip-types gates/approval-block-probe.mjs       # detection still explains real stores (#188)
-node --experimental-strip-types gates/settlement-window.mjs          # no new alarms beyond what you expect
+node --experimental-strip-types gates/settlement-window.mjs          # read the ids, not just the color — see below
 ```
+
+**Known state while #204 is open:** on this fleet the settlement window exits 2 with four *historical* engram rows
+(two `setup command failed`, two `reviewer never called submit_verdict`) and cannot drain, because it refuses to advance
+its watermark while anything alarms and there is no way to record that a row was examined. So "read the ids" is the step:
+compare against those four, and treat only unseen ids as news. Do not paper over it with `--reset-watermark` — that clears
+marks for every family, including ones being tracked correctly, and it makes the next real failure look like this one.
+Delete this paragraph when #204 lands; until then, a red window is expected output and therefore not evidence.
 
 `status:"ok"` means the listener lives, **not** that work will complete. What `/health` cannot see is a host answering
 `/models` without the pinned model loaded — those failures surface as task outcomes carrying

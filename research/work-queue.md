@@ -38,7 +38,9 @@ collided). Traps remain consumables and the state of play is now: fixture #86/#8
 **any future run must start by running the service and the suite** — a title that still reads like a bug proves nothing.
 Fixture PR #59 remains the only other open one. **Accepted, not queued:** fixture protection posture (R14).
 
-**Local branch debris awaiting an operator decision (nothing deleted).** `docs/work-queue-fifth-refresh` and `docs/work-queue-seventh-refresh` are 0 commits ahead of `main` — pure bookkeeping. `fix/supervisor-orphan-lifecycle` is **superseded, not pending**: its one commit adds a `lalanikarim/engram` registry entry, and that content already landed via #128 (the trunk entry additionally carries `webhookId: 706043067`), so merging it would create a duplicate repo entry and re-encode em-dashes in the registry `$comment`. Deleting is right, but a branch delete is not mine to take on your behalf.
+**Local branch debris awaiting an operator decision (nothing deleted).** Verified against `main` = `e9baf0a`, so this line is current rather than inherited: seven local branches are **fully merged** (`ahead=0` and `merge-base --is-ancestor` says yes) — `docs/work-queue-fifth-refresh`, `docs/work-queue-seventh-refresh`, `docs/work-queue-tenth-refresh`, `feature/release-checklist-c5`, `fix/approval-block-classification`, `fix/g5-default-lesson-shape`, `fix/model-unavailable-classification`. Their remote branches are already gone (deleted on merge); these are local bookkeeping, and `gh stack view` keeps listing the stacked ones marked merged, which is expected state rather than debris.
+
+One branch is genuinely unmerged: `fix/supervisor-orphan-lifecycle`, 1 commit ahead, **superseded rather than pending** — its only change adds a `lalanikarim/engram` registry entry that already landed via #128 (the trunk copy additionally carries `webhookId: 706043067`), so merging it would create a duplicate repo entry and re-encode em-dashes in the registry `$comment`. Deleting is correct; a branch delete is not mine to take on your behalf.
 
 ---
 
