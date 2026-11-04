@@ -1317,3 +1317,20 @@ merge-safety failure, and neither was written up as a pass.
 owns the required sections and pass regexes, production builds bodies from it and gates check through
 `checkEvidenceBody()` — see #144, which exists because four duplicated lists drifted and three gates failed on one
 stale heading while exactly-once merge, isolation and budget abort were all passing underneath.
+
+---
+
+## 13. Release checklist (C5) — `fleet/release-checklist.md`
+
+One page: **`fleet/release-checklist.md`**. It answers "what has to run before a pin bump or a posture change, and how do
+I know the fleet is actually running what I released", in order, with the commands and the observations that make each
+step mean something.
+
+Use it when you would otherwise say "CI is green, deploying". It exists because those two phrases hid three separate
+defects this week: a suite that skipped and was reported as passing, a restart that looked clean while `build.sha` still
+reported the old commit, and a battery run against a fixture base that had been red since two PRs collided — every result
+from it was interpretable and none of it was true.
+
+The short form, when there is no time for the page: **local verify + boot tests → infra truth (`/health`, app/registry
+checks) → battery only for pin/posture changes, on a green fixture base → §10 restart with one `SIGTERM` → confirm
+`build.sha` and parentage → write down what you measured.**
