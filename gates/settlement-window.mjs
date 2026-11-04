@@ -101,6 +101,10 @@ if (!isBaseline && alarming.length > 0) {
     {
       instructions: [
         "failing = a task failed or faulted; unanswered = a submission no model answered (the #133 shape).",
+        "modelUnavailable = the endpoint never served the pinned model, or errored mid-generation (kernel reasons",
+        "no_model / model_error). It alarms because accepted work was lost, but it is NOT an agent defect: fix the pin",
+        "or load the model. If a whole repo shows only these, its models.modelId names something not served — check",
+        "GET /health/inference (token-gated) before reading any worker log.",
         "aborted and restarted are reported separately and never alarm — an operator using POST /factory/runs/abort",
         "(#141) is information, not an incident. inFlight (a task still running) and unsettled (a queued/placed",
         "submission) never alarm either, and the watermark does not advance past them, so a run that fails after",

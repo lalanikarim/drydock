@@ -42,7 +42,8 @@ export type SettlementClass =
   | "unanswered"  // accepted work that no model answered — the #133 shape, alarms unless aborted
   | "unsettled"   // queued/placed: still open, or wedged forever
   | "inFlight"   // task row whose kernel state is not terminal yet — no outcome exists to judge (#186)
-  | "waiting";   // terminal run a gate stopped for a human approval (#188) — reported, never alarmed
+  | "waiting"   // terminal run a gate stopped for a human approval (#188) — reported, never alarmed
+  | "modelUnavailable"; // the endpoint never served the pinned model (#161 follow-up) — alarming, but NOT an agent defect
 
 /**
  * `waiting` (#188): the run stopped because a gate asked a human for an approval.
@@ -78,7 +79,7 @@ export type SettlementSummary = {
   collected: boolean;
 };
 
-const ALARMING: ReadonlySet<SettlementClass> = new Set(["failing", "unanswered"]);
+const ALARMING: ReadonlySet<SettlementClass> = new Set(["failing", "unanswered", "modelUnavailable"]);
 const DETAIL_MAX = 220;
 
 /** Strip the JSON encoding off a text column value and keep it short enough to print. */
@@ -121,7 +122,23 @@ const OPEN_KERNEL_STATUSES: ReadonlySet<string> = new Set(["pending", "running",
  * outcome status on purpose: the row IS a failure in kernel terms (the run did not complete) and reporting it as one
  * would bury the only actionable fact in the row — that a human is being asked, with which key.
  */
-export function classifyTask(kernelStatus: string, outcomeStatus: string, abortReason: string, blockedKey = ""): SettlementClass {
+/**
+ * Kernel reasons meaning "inference did not happen", verified in `pi-durable/dist/harness/generation.js`:
+ * `failNoModel` settles the task `failed` with `error.detail.reason:"no_model"` AND its submission
+ * `unanswered/no_model`; a provider error mid-generation settles `model_error`. Neither is an agent defect, and both
+ * used to land in the anonymous `failing` bucket — so an operator read "the worker broke" for "the model you configured
+ * is not served by this endpoint", which is #161's complaint one layer down.
+ *
+ * It stays alarming: accepted work was lost and a human has to fix a pin or load a model. What changes is that the count
+ * names the cause, making a misconfigured repo legible in one line instead of a store dive.
+ */
+const MODEL_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set(["no_model", "model_error"]);
+
+export function modelUnavailableReason(errorReason: string): boolean {
+  return MODEL_UNAVAILABLE_REASONS.has(clean(errorReason).toLowerCase());
+}
+
+export function classifyTask(kernelStatus: string, outcomeStatus: string, abortReason: string, blockedKey = "", errorReason = ""): SettlementClass {
   // An open task has no outcome by definition. Reading only `$.state.outcome.status` made every in-flight run
   // classify as an unknown outcome — i.e. alarming — so the window was red whenever anything was actually
   // running, which is when an operator most needs it to be readable (#186).
@@ -129,7 +146,7 @@ export function classifyTask(kernelStatus: string, outcomeStatus: string, abortR
   if (clean(blockedKey).length > 0) return "waiting";
   const s = clean(outcomeStatus).toLowerCase();
   if (s === "completed") return "completed";
-  if (s === "failed" || s === "faulted") return "failing";
+  if (s === "failed" || s === "faulted") return modelUnavailableReason(errorReason) ? "modelUnavailable" : "failing";
   if (s === "aborted") return clean(abortReason).toLowerCase() === "restart" ? "restarted" : "aborted";
   // Anything else — including an empty outcome on a terminal row — is alarming rather than completed. An unknown
   // shape in the one column we aggregate is exactly when reporting success is most expensive.
@@ -139,7 +156,11 @@ export function classifyTask(kernelStatus: string, outcomeStatus: string, abortR
 export function classifySubmission(status: string, reason: string): SettlementClass {
   const s = clean(status).toLowerCase();
   if (s === "done") return "completed";
-  if (s === "unanswered") return clean(reason).toLowerCase() === "aborted" ? "aborted" : "unanswered";
+  if (s === "unanswered") {
+    const r = clean(reason).toLowerCase();
+    if (MODEL_UNAVAILABLE_REASONS.has(r)) return "modelUnavailable";
+    return r === "aborted" ? "aborted" : "unanswered";
+  }
   if (s === "queued" || s === "placed") return "unsettled";
   return "failing";
 }
@@ -176,7 +197,8 @@ select id,
        json_extract(record, '$.endedAt')                            as ended_at,
        coalesce(json_extract(record, '$.state.outcome.error.message'), '')          as error_message,
        coalesce(json_extract(record, '$.state.outcome.result.blocked.key'), '')     as blocked_key,
-       coalesce(json_extract(record, '$.state.outcome.result.blocked.tool'), '')    as blocked_tool
+       coalesce(json_extract(record, '$.state.outcome.result.blocked.tool'), '')    as blocked_tool,
+       coalesce(json_extract(record, '$.state.outcome.error.detail.reason'), '')     as error_reason
   from tasks
  order by id;
 `;
@@ -215,10 +237,13 @@ export function readStore(
       // because "no outcome" means two completely different things depending on it.
       status: clean(t.status) || "unknown",
       kernelStatus: clean(t.kernel_status) || null,
-      cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? ""), String(t.blocked_key ?? "")),
+      cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? ""), String(t.blocked_key ?? ""), String(t.error_reason ?? "")),
       whenMs: typeof t.ended_at === "number" ? t.ended_at : null,
-      // For a blocked row the key is the whole point of the row, so it leads the detail even if the message is long.
-      detail: clean(t.blocked_key ?? "")
+      // For a blocked row the key is the whole point of the row, so it leads the detail even if the message is long. A
+      // model row leads with its reason for the same reason: "failed" alone hides whether the agent or the pin is wrong.
+      detail: modelUnavailableReason(String(t.error_reason ?? "")) && clean(t.status ?? "") !== "completed"
+        ? truncate(`${clean(t.error_reason)} — ${clean(t.error_message ?? "")}`)
+        : clean(t.blocked_key ?? "")
         ? truncate(`approval ${clean(t.blocked_key)}${clean(t.blocked_tool) ? ` (${clean(t.blocked_tool)})` : ""} — ${clean(t.error_message ?? "")}`)
         : truncate(clean(t.error_message ?? "")),
     });
@@ -245,7 +270,7 @@ export function readStore(
 }
 
 function emptyCounts(): Record<SettlementClass, number> {
-  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0, inFlight: 0, waiting: 0 };
+  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0, inFlight: 0, waiting: 0, modelUnavailable: 0 };
 }
 
 export function summarize(rows: SettlementRow[], storesScanned: number): SettlementSummary {
@@ -359,7 +384,7 @@ export function writeWatermark(file: string, wm: Watermark): void {
 export function formatSummary(s: SettlementSummary): string {
   const c = s.counts;
   const line = (label: string, x: Record<SettlementClass, number>) =>
-    `${label}: completed=${x.completed} failing=${x.failing} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled} inFlight=${x.inFlight} waiting=${x.waiting}`;
+    `${label}: completed=${x.completed} failing=${x.failing} modelUnavailable=${x.modelUnavailable} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled} inFlight=${x.inFlight} waiting=${x.waiting}`;
   const out = [
     line("all", c),
     line("  factory", s.byFamily.factory),

@@ -53,7 +53,7 @@ function makeStore(name) {
      * `kind` is JSON-encoded because production stores it that way (`"factory.worker"` including the quotes).
      * Pass encodeKind:false to reproduce what happens when someone forgets.
      */
-    task({ id, kind = "factory.worker", outcomeStatus = "completed", stateStatus = "terminal", kernelStatus = "terminal", abortReason = null, endedAt = 1_793_600_000_000, errorMessage = null }) {
+    task({ id, kind = "factory.worker", outcomeStatus = "completed", stateStatus = "terminal", kernelStatus = "terminal", abortReason = null, endedAt = 1_793_600_000_000, errorMessage = null, errorReason = null }) {
       const record = {
         id,
         conversationId: 1,
@@ -62,7 +62,7 @@ function makeStore(name) {
           status: stateStatus,
           ...(outcomeStatus === null ? {} : {
             outcome: errorMessage
-              ? { status: outcomeStatus, error: { message: errorMessage } }
+              ? { status: outcomeStatus, error: { message: errorMessage, ...(errorReason ? { detail: { reason: errorReason } } : {}) } }
               : { status: outcomeStatus, result: { entryId: 7 } },
           }),
         },
@@ -79,8 +79,10 @@ function makeStore(name) {
      * Move a row from open to settled in place, the way the kernel would between two passes of this gate.
      * Used to prove the watermark held below an open row and therefore still sees its late failure (#186).
      */
-    settleTask(id, { outcomeStatus = "failed", errorMessage = "verification exited 1", endedAt = 1_793_600_500_000 } = {}) {
-      const outcome = JSON.stringify(errorMessage ? { status: outcomeStatus, error: { message: errorMessage } } : { status: outcomeStatus, result: {} });
+    settleTask(id, { outcomeStatus = "failed", errorMessage = "verification exited 1", errorReason = null, endedAt = 1_793_600_500_000 } = {}) {
+      const outcome = JSON.stringify(errorMessage
+        ? { status: outcomeStatus, error: { message: errorMessage, ...(errorReason ? { detail: { reason: errorReason } } : {}) } }
+        : { status: outcomeStatus, result: {} });
       sql(db, `update tasks set status='terminal', record=json_set(record,'$.state.status','terminal','$.state.outcome',json(${sqlLit(outcome)}),'$.endedAt',${endedAt}) where id=${id};`);
       return this;
     },
@@ -126,8 +128,9 @@ test("an outcome we do not recognize is alarming, never silently 'completed'", (
 test("submissions: unanswered alarms unless a human aborted it; queued/placed are unsettled", () => {
   assert.equal(ledger.classifySubmission("done", ""), "completed");
   assert.equal(ledger.classifySubmission("unanswered", "aborted"), "aborted");
-  // The #133 shape: no model answered. Must never be folded into the abort bucket.
-  assert.equal(ledger.classifySubmission("unanswered", "no_model"), "unanswered");
+  // The #133 shape: no model answered. Never folded into the abort bucket — and since the #161 follow-up it is its own
+  // class rather than generic `unanswered`, because "nothing was served" and "nobody replied" need different fixes.
+  assert.equal(ledger.classifySubmission("unanswered", "no_model"), "modelUnavailable");
   assert.equal(ledger.classifySubmission("queued", ""), "unsettled");
   assert.equal(ledger.classifySubmission("placed", ""), "unsettled");
 });
@@ -278,7 +281,9 @@ test("submissions are read alongside tasks and carry their reason", () => {
     const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
     assert.equal(byId[30].cls, "completed");
     assert.equal(byId[31].cls, "aborted");
-    assert.equal(byId[32].cls, "unanswered");
+    // Changed intentionally with the #161 follow-up: no_model is its own class now. It still alarms (see below), so
+    // nothing about the window's sensitivity changed — only the name the operator has to act on.
+    assert.equal(byId[32].cls, "modelUnavailable");
     assert.equal(byId[33].cls, "unsettled");
     // No timestamp exists for submissions in the store; inventing one would be an invented fact.
     assert.equal(byId[32].whenMs, null);
@@ -462,6 +467,52 @@ test("gate: --all-kinds surfaces kernel failures the default scope hides", () =>
     const wide = runGate(["--instances-root", s.root, "--state-file", stateFile, "--all-kinds"]);
     assert.equal(wide.code, 2, wide.out);
     assert.match(wide.out, /Tool read threw/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+// ── #161 follow-up: a model that was never served is not "the agent failed" ────────────────────────────────
+//
+// The kernel settles these itself (`failNoModel` in pi-durable's generation.js): task → failed with
+// error.detail.reason="no_model", submission → unanswered/no_model; a provider blow-up mid-generation is model_error.
+// Both used to dissolve into `failing`, so the window read "worker broke" for "this repo pins a model the endpoint does
+// not serve". They stay alarming — accepted work was lost — but they must arrive named.
+
+test("classification: no_model and model_error are modelUnavailable, not anonymous failure", () => {
+  assert.equal(ledger.classifyTask("terminal", "failed", "", "", "no_model"), "modelUnavailable");
+  assert.equal(ledger.classifyTask("terminal", "failed", "", "", "model_error"), "modelUnavailable");
+  assert.equal(ledger.classifyTask("terminal", "failed", "", ""), "failing", "a failure with no kernel reason stays failing");
+  // A stray reason on a run that completed is not evidence of anything; reclassifying it would invent incidents.
+  assert.equal(ledger.classifyTask("terminal", "completed", "", "", "no_model"), "completed");
+  assert.equal(ledger.classifySubmission("unanswered", "model_error"), "modelUnavailable");
+  assert.equal(ledger.classifySubmission("unanswered", "aborted"), "aborted", "a human abort is still never a model problem");
+});
+
+test("classification: an approval block still outranks a model reason (#188 precedence preserved)", () => {
+  // Two rules now want to own the same row. The blocked key wins because it names the only action available; a model
+  // reason on a blocked row is downstream noise compared with "a human is being asked".
+  assert.equal(ledger.classifyTask("terminal", "failed", "", "abc123", "no_model"), "waiting");
+});
+
+test("store: no_model rows classify, alarm, and lead their detail with the reason", () => {
+  const s = makeStore("model-unavailable");
+  try {
+    s.task({ id: 300, outcomeStatus: "failed", errorMessage: "Model aurora/pinned-thing is not available", errorReason: "no_model" });
+    s.task({ id: 301, outcomeStatus: "failed", errorMessage: "verification exited 1" });
+    s.submission({ id: 302, status: "unanswered", reason: "no_model" });
+
+    const byId = new Map(ledger.readStore("model-unavailable", s.db).map((r) => [r.id, r]));
+    assert.equal(byId.get(300).cls, "modelUnavailable");
+    assert.match(byId.get(300).detail, /^no_model — Model aurora\/pinned-thing is not available$/, "the reason leads, so one line diagnoses it");
+    assert.equal(byId.get(301).cls, "failing", "an ordinary failure must not be absorbed by the new class");
+    assert.equal(byId.get(302).cls, "modelUnavailable");
+
+    const sum = ledger.summarize([...byId.values()], 1);
+    assert.equal(sum.counts.modelUnavailable, 2);
+    assert.equal(sum.counts.failing, 1);
+    assert.equal(sum.alarms.length, 3, "lost work alarms whether the cause is inference or the agent");
+    assert.match(ledger.formatSummary(sum), /modelUnavailable=2/, "the operator-facing line carries the new count");
   } finally {
     s.cleanup();
   }
