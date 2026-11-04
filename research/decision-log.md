@@ -505,3 +505,41 @@ returns nothing is indistinguishable from a world where nothing is blocked.
 **Deviation recorded.** #188 proposed "new outcome status **or** `outcome.result.blocked`". There is no new status:
 `TaskOutcome` is a closed union (`completed | failed | aborted`), so the kernel decided, and `failed` is honest — the run
 did not complete. What had been dishonest was the message, not the status.
+
+---
+
+## 2026-11-04 — #204: an alarm needs a state for "examined", and attribution has to be able to decline
+
+**Decision.** Two separate mechanisms, deliberately not merged into one clever feature.
+
+1. **Read history back.** The ledger now reads approval markers out of the `entries` table (`readConversationApprovals`)
+   and applies them to rows (#204), because #188's detector runs *inside* a task and therefore cannot see rows written
+   before it shipped. The rule is asymmetric on purpose: reclassify to `waiting` only when **exactly one** alarming row
+   exists in that conversation; otherwise keep the class and append the marker as context, with `attribution` naming
+   which branch produced the claim. Markers belong to conversations — entry records carry `toolCallId`/`toolName` and
+   nothing tying them to a task id — so "one candidate" is the only inference available, and taking it silently would be
+   guessing dressed as data.
+2. **Make looking an action.** `--ack <store/table:id> --ack-reason "…"` records a judgment in the state file. An acked
+   row stays **counted** (`failing=4 … 4 acknowledged`) and stops alarming; it never rewrites history, needs a reason
+   string to be accepted, and is undone by deleting one key. `--reset-watermark` is documented inside the gate's own
+   instructions as *not* a substitute: it clears marks for every family, including ones tracked correctly, which makes
+   the next real failure look like the one you just dismissed.
+
+**Why the split.** "Alarm until someone looks" was written with an honest intent and no terminal state — looking is not
+something you can DO, so four historical rows pinned the watermark from Nov 2 and `lalanikarim_engram/task` never had a
+family mark at all. The fix is not a louder alarm; it is a way to finish alarming about a specific row.
+
+**The prediction I got wrong.** This issue said two of the four rows would reclassify automatically. Against a copy of
+the real stores: **0 attributed, 4 annotated as context** — all four failing tasks (46, 51, 268, 475) live in conversation
+32, and its marker is `dc0fcf59f723` for `open_draft_pr`, unrelated to a reviewer's missing verdict. I had checked "does
+this conversation have a marker" and not "is this conversation otherwise quiet". The ambiguity rule declined, which is
+the outcome that kept the report honest; what actually unfroze the gate was the ack half.
+
+**Evidence, because a mute button has to be proven not-mute.** After acking the four: `exit 0`, and the state file gained
+`"lalanikarim_engram/task": 475`. Then a new failure was inserted into the copy — task 900, `brand new failure after the
+acks` — and the gate exited 2 reporting **exactly that one row**, watermark held. A test asserts the ambiguous case is not
+blamed on the approval; it exists because production paid for it, not because it was easy to write.
+
+**The general rules.** (a) A prediction about historical data is a claim about data you have not read — run the read
+before writing down what the fix will accomplish. (b) Suppressing an alarm is acceptable exactly when it keeps counting
+and still fires on anything unseen; prove the second half by manufacturing one, not by arguing it.

@@ -18,6 +18,11 @@
 //
 //   node gates/settlement-window.mjs [--json] [--all-kinds] [--state-file f] [--reset-watermark]
 //                                    [--no-advance] [--no-baseline]
+//   node --experimental-strip-types gates/settlement-window.mjs \
+//        --ack lalanikarim_engram/task:46 --ack-reason "sandbox npm install was broken then; not an incident"
+//          → sign ONE examined row off (#204): it stays counted, stops alarming, and stops pinning the watermark.
+//            An ack records a judgment with a reason; `--reset-watermark` is not a substitute — it clears marks for
+//            every family, including ones being tracked correctly, and makes the next real failure look like this one.
 import { rmSync } from "node:fs";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -35,6 +40,13 @@ const stateFile = val("--state-file") ?? `${ROOT}/fleet/data/last-settlements.js
 // fleet whose stores live off-repo — can point this gate somewhere real instead of trusting a fixture.
 const instancesRoot = val("--instances-root") ?? process.env.FACTORY_INSTANCES_ROOT ?? ROOT;
 const kinds = has("--all-kinds") ? null : ["factory."];
+
+/** Every `--ack <store/table:id>` occurrence; acks are per-row and repeatable (#204). */
+const ackRefs = () => {
+  const refs = [];
+  for (let i = 0; i < argv.length; i++) if (argv[i] === "--ack" && argv[i + 1]) refs.push(argv[i + 1]);
+  return refs;
+};
 
 const out = (s) => { if (!asJson) console.log(s); };
 function die(msg, extra) {
@@ -77,7 +89,10 @@ const all = [];
 const readFailures = [];
 for (const s of stores) {
   try {
-    all.push(...ledger.readStore(s.store, s.dbPath, { kinds }));
+    const rows = ledger.readStore(s.store, s.dbPath, { kinds });
+    // Pre-#188 rows carry no blocked key, so their approval blocks are only visible in the conversation's entries.
+    // Attributing them here is what lets an old row stop reporting as an anonymous agent failure (#204).
+    all.push(...ledger.attributeHistoricalBlocks(rows, ledger.readConversationApprovals(s.dbPath)));
   } catch (e) {
     // One unreadable store must not erase the others' verdict — but it must not be silent either.
     readFailures.push({ store: s.store, error: String(e?.message ?? e) });
@@ -88,6 +103,23 @@ if (readFailures.length === stores.length) {
   die("every store failed to read — nothing was examined", readFailures);
   process.exit(2);
 }
+
+// Acks are applied before anything is counted as alarming: an examined row stays in the totals (it happened) but
+// stops pinning the watermark, which is the state "alarm until someone looks" was always missing (#204).
+const ackList = ackRefs();
+if (ackList.length) {
+  const reason = val("--ack-reason") ?? "";
+  try {
+    for (const ref of ackList) watermark = ledger.withAck(watermark, ref, reason);
+  } catch (e) {
+    die(String(e?.message ?? e));
+    process.exit(2);
+  }
+  ledger.writeWatermark(stateFile, watermark);
+  for (const ref of ackList) out(`acknowledged ${ref}: ${reason}`);
+  out("(recorded in the state file — re-running now reports without these rows; delete the entry to un-ack)");
+}
+ledger.applyAcks(all, watermark);
 
 const fresh = ledger.unseen(all, watermark);
 const summaryFresh = ledger.summarize(fresh, stores.length - readFailures.length);
@@ -112,7 +144,12 @@ if (!isBaseline && alarming.length > 0) {
         "not at this gate.",
         "waiting (a terminal run a gate stopped for a human approval, #188) never alarms either, and its detail names",
         "the key: GET /approvals to see it, POST /approvals/<key> {\"decision\":\"approved\"} to clear it. A large",
-        "waiting count means the fleet is idle on you, not broken.",
+        "waiting count means the fleet is idle on you, not broken. Rows attributed from conversation evidence say so",
+        "(`attributed from conversation N`); those are pre-#188 rows read back through the entries table.",
+        "Examined a row and it is not an incident? Say so in the record, or it alarms forever and you start skimming:",
+        "  node --experimental-strip-types gates/settlement-window.mjs --ack <store/table:id> --ack-reason \"why\"",
+        "An ack keeps the row counted and stops it alarming; it never rewrites history, and `--reset-watermark` is NOT",
+        "a substitute — that clears marks for every family, including ones being tracked correctly (#204).",
         "Look at one:  sqlite3 \"file:factory-instances/<store>/engram-data/agent.sqlite?mode=ro\" \\",
         "               \"select json_extract(record,'$.state') from tasks where id=<id>;\"",
       ],
@@ -128,10 +165,11 @@ if (!isBaseline && alarming.length > 0) {
 }
 
 if (!has("--no-advance") && process.exitCode !== 2) {
-  // Advance only when we are not reporting a failure: rows that alarmed must alarm again until someone looks.
+  // Advance only when we are not reporting a failure: rows that alarmed must alarm again until someone looks — and
+  // now "looked" is a state you can actually record, via --ack (#204).
   ledger.writeWatermark(stateFile, ledger.advance(watermark, all));
 } else if (process.exitCode === 2) {
-  out("(watermark left where it was — an unexamined failure alarms again next run)");
+  out("(watermark left where it was — an unexamined failure alarms again next run; --ack <store/table:id> --ack-reason … to sign one off)");
 }
 
 const payload = {
@@ -145,7 +183,13 @@ const payload = {
   countsWindow: summaryFresh.counts,
   countsLifetime: summaryAll.counts,
   byFamilyWindow: summaryFresh.byFamily,
-  alarming: alarming.map((a) => ({ store: a.store, table: a.table, id: a.id, kind: a.kind, status: a.status, detail: a.detail })),
+  attributed: all.filter((r) => r.attribution === "retroactive-approval").length,
+  approvalContext: all.filter((r) => r.attribution === "approval-context").length,
+  acknowledged: all.filter((r) => r.acked).length,
+  alarming: alarming.map((a) => ({
+    store: a.store, table: a.table, id: a.id, kind: a.kind, status: a.status, detail: a.detail,
+    ...(a.attribution ? { attribution: a.attribution } : {}),
+  })),
   // Samples come from the window when there is one. Printing lifetime samples next to "window clean" reads like
   // four live problems in a run that found none — which is how alert output gets ignored.
   samples: (isBaseline ? summaryAll : summaryFresh).samples.map((s) => ({
@@ -158,6 +202,9 @@ if (asJson) {
 } else {
   out(`stores: ${payload.storesScanned}/${stores.length} read-only${readFailures.length ? ` (${readFailures.length} FAILED)` : ""}  kinds: ${payload.kindsScoped}`);
   for (const f of readFailures) out(`  ! unreadable store ${f.store}: ${f.error}`);
+  if (payload.attributed || payload.approvalContext || payload.acknowledged) {
+    out(`read-back over pre-#188 rows: ${payload.attributed} attributed to an approval block, ${payload.approvalContext} carry one as context (not attributed), ${payload.acknowledged} acknowledged`);
+  }
   if (isBaseline) {
     out("BASELINE RUN — every row is new; counts below are lifetime");
     console.log(ledger.formatSummary(summaryAll));

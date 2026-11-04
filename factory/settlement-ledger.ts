@@ -33,6 +33,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { extractBlockedApprovals, type BlockedApproval } from "./approval-state.ts";
 
 export type SettlementClass =
   | "completed"   // produced an answer/result
@@ -63,6 +64,12 @@ export type SettlementRow = {
   /** Kernel task state (`terminal`, `running`, …) for task rows; null for submissions. */
   kernelStatus?: string | null;
   cls: SettlementClass;
+  /** Conversation the row ran in, when the record carries one. Needed to attribute pre-#188 approval blocks (#204). */
+  conversationId?: number | null;
+  /** Set when this row's class came from conversation-level evidence rather than from its own outcome. */
+  attribution?: "retroactive-approval" | "approval-context" | null;
+  /** True when an operator signed this exact row off (`--ack`): counted, never alarming again. */
+  acked?: boolean;
   whenMs: number | null;
   detail: string;
 };
@@ -198,7 +205,8 @@ select id,
        coalesce(json_extract(record, '$.state.outcome.error.message'), '')          as error_message,
        coalesce(json_extract(record, '$.state.outcome.result.blocked.key'), '')     as blocked_key,
        coalesce(json_extract(record, '$.state.outcome.result.blocked.tool'), '')    as blocked_tool,
-       coalesce(json_extract(record, '$.state.outcome.error.detail.reason'), '')     as error_reason
+       coalesce(json_extract(record, '$.state.outcome.error.detail.reason'), '')     as error_reason,
+       json_extract(record, '$.conversationId')                                      as conv_id
   from tasks
  order by id;
 `;
@@ -207,7 +215,8 @@ const SUBMISSION_SQL = `
 select id,
        status,
        coalesce(json_extract(record, '$.reason'), '') as reason,
-       coalesce(json_extract(record, '$.requestId'), '') as request_id
+       coalesce(json_extract(record, '$.requestId'), '') as request_id,
+       coalesce(json_extract(record, '$.conversationId'), 0) as conv_id
   from submissions
  order by id;
 `;
@@ -237,6 +246,7 @@ export function readStore(
       // because "no outcome" means two completely different things depending on it.
       status: clean(t.status) || "unknown",
       kernelStatus: clean(t.kernel_status) || null,
+      conversationId: Number(t.conv_id) > 0 ? Number(t.conv_id) : null,
       cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? ""), String(t.blocked_key ?? ""), String(t.error_reason ?? "")),
       whenMs: typeof t.ended_at === "number" ? t.ended_at : null,
       // For a blocked row the key is the whole point of the row, so it leads the detail even if the message is long. A
@@ -258,6 +268,7 @@ export function readStore(
       id: Number(s.id),
       kind: clean(s.request_id) || null,
       status: clean(s.status) || "unknown",
+      conversationId: Number(s.conv_id) > 0 ? Number(s.conv_id) : null,
       cls: classifySubmission(String(s.status ?? ""), reason),
       // Deliberately null: submissions carry no timestamp (verified 2026-11-03). Reporting a fabricated "when"
       // would be an invented fact in an operator-facing count.
@@ -285,7 +296,9 @@ export function summarize(rows: SettlementRow[], storesScanned: number): Settlem
     counts[r.cls] += 1;
     const family = r.table === "submission" ? "factory" : (r.kind ?? "").startsWith("factory.") ? "factory" : "kernel";
     byFamily[family][r.cls] += 1;
-    if (ALARMING.has(r.cls)) alarms.push(r);
+    // An acked row is still counted — it happened — but it stopped alarming, which is the whole point of being able to
+    // record that someone looked (#204).
+    if (ALARMING.has(r.cls) && !r.acked) alarms.push(r);
   }
 
   // Newest-first samples across every class, so a human sees shape rather than only a number.
@@ -305,11 +318,19 @@ export function summarize(rows: SettlementRow[], storesScanned: number): Settlem
   };
 }
 
+export type Acknowledgement = { reason: string; atMs: number };
+
 export type Watermark = {
   version: 1;
   updatedAt: number;
   /** Highest row id seen per store per table. Ids are monotone (shared allocator), so this never needs to move back. */
   highWater: Record<string, number>;
+  /**
+   * Rows an operator examined and signed off, keyed `store/table:id` (#204). Without this the gate's rule "alarm until
+   * someone looks" has no terminal state: looking is not something you can DO, so a historical failure pins the
+   * watermark forever and the alarm turns into noise. A reason is required so the record says why, not merely that.
+   */
+  acked?: Record<string, Acknowledgement>;
 };
 
 export function emptyWatermark(): Watermark {
@@ -339,11 +360,130 @@ export function readWatermark(file: string): Watermark {
   if (!w || w.version !== 1 || typeof w.highWater !== "object" || w.highWater === null) {
     throw new Error(`settlement watermark ${file} has an unexpected shape; re-run with --reset-watermark`);
   }
-  return { version: 1, updatedAt: Number(w.updatedAt ?? 0), highWater: w.highWater as Record<string, number> };
+  return {
+    version: 1,
+    updatedAt: Number(w.updatedAt ?? 0),
+    highWater: w.highWater as Record<string, number>,
+    // Files written before #204 simply have no acks; that is an empty set, not a corrupt file.
+    ...(w.acked && typeof w.acked === "object" ? { acked: w.acked as Record<string, Acknowledgement> } : {}),
+  };
 }
 
 export function keyFor(store: string, table: "task" | "submission"): string {
   return `${store}/${table}`;
+}
+
+/** A single row's identity in an acknowledgement record. */
+export function ackKeyFor(store: string, table: "task" | "submission", id: number): string {
+  return `${store}/${table}:${id}`;
+}
+
+export function parseAckRef(ref: string): { key: string } | { error: string } {
+  const m = /^(.+)\/(task|submission):(\d+)$/.exec(ref.trim());
+  if (!m) return { error: `ack reference "${ref}" is not store/table:id (e.g. lalanikarim_engram/task:46)` };
+  return { key: `${m[1]}/${m[2]}:${Number(m[3])}` };
+}
+
+/** Immutable add: a new watermark carrying this ack, with the reason that justifies it. */
+export function withAck(wm: Watermark, ref: string, reason: string, now = Date.now()): Watermark {
+  const parsed = parseAckRef(ref);
+  if ("error" in parsed) throw new Error(parsed.error);
+  const trimmed = reason.trim();
+  if (!trimmed) throw new Error(`ack for ${parsed.key} needs --ack-reason: the record must say why this is not an incident`);
+  return { ...wm, updatedAt: now, acked: { ...(wm.acked ?? {}), [parsed.key]: { reason: trimmed, atMs: now } } };
+}
+
+/** Flag rows the operator already signed off. Classification is untouched — an ack changes alarming, not history. */
+export function applyAcks(rows: SettlementRow[], wm: Watermark): SettlementRow[] {
+  const acked = wm.acked ?? {};
+  for (const r of rows) if (acked[ackKeyFor(r.store, r.table, r.id)]) r.acked = true;
+  return rows;
+}
+
+/**
+ * Approval markers present per conversation, read straight from the entries table.
+ *
+ * This exists because #188's detector runs **inside** a task and reads its live context; rows written before that deploy
+ * have no `outcome.result.blocked` and would otherwise report as anonymous agent failures forever. The marker text lives
+ * in committed entries either way, so the history is legible — it just has to be read from the store side.
+ */
+export function readConversationApprovals(dbPath: string): Map<number, BlockedApproval[]> {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = queryJson(
+      dbPath,
+      "select conversation_id as cid, record from entries where cast(record as text) like '%Approval request:%' order by id;",
+    );
+  } catch (e) {
+    const msg = String((e as Error)?.message ?? e);
+    // A store with no entries table has no markers — that is an empty answer, not a failure. Anything else (a renamed
+    // column, a corrupt db) propagates: silently reporting "no approvals here" when the schema moved is exactly the
+    // confident-wrong read this module was built to stop making.
+    if (/no such table: entries/.test(msg)) return new Map();
+    throw new Error(`cannot read approval markers from ${dbPath}: ${msg}`);
+  }
+  const perConv = new Map<number, unknown[]>();
+  for (const r of rows) {
+    const cid = Number(r.cid);
+    if (!Number.isFinite(cid)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(String(r.record));
+    } catch {
+      continue; // An entry we cannot parse is evidence of nothing.
+    }
+    if (!perConv.has(cid)) perConv.set(cid, []);
+    perConv.get(cid)!.push(parsed);
+  }
+  const out = new Map<number, BlockedApproval[]>();
+  for (const [cid, entries] of perConv) {
+    const blocks = extractBlockedApprovals(entries);
+    if (blocks.length) out.set(cid, blocks);
+  }
+  return out;
+}
+
+/**
+ * Attribute pre-#188 approval blocks without inventing a cause (#204).
+ *
+ * Markers are attributable to a **conversation**, never to a task id: entry records carry `toolCallId`/`toolName` and
+ * nothing tying them to a row (verified against the engram store on 2026-11-04). So the rule is deliberately asymmetric:
+ *
+ *  - exactly one alarming row in that conversation → it is THE run that blocked: reclassify `waiting`, key in the
+ *    detail, `attribution: "retroactive-approval"` so the report says where the claim came from;
+ *  - more than one → we cannot tell which failure the marker explains, so **no reclassification**: keep the class and
+ *    append the marker as context (`attribution: "approval-context"`).
+ *
+ * The second branch is the one that matters for honesty. Auto-blaming approvals for every failing row in a busy
+ * conversation would be exactly the spelling-based misdiagnosis this line of work replaced.
+ */
+export function attributeHistoricalBlocks(
+  rows: SettlementRow[],
+  approvalsByConversation: Map<number, BlockedApproval[]>,
+): SettlementRow[] {
+  if (approvalsByConversation.size === 0) return rows;
+  const alarmingPerConversation = new Map<string, number>();
+  for (const r of rows) {
+    if ((r.cls !== "failing" && r.cls !== "unanswered") || r.conversationId == null) continue;
+    const k = `${r.store}#${r.conversationId}`;
+    alarmingPerConversation.set(k, (alarmingPerConversation.get(k) ?? 0) + 1);
+  }
+  for (const r of rows) {
+    if ((r.cls !== "failing" && r.cls !== "unanswered") || r.conversationId == null) continue;
+    const blocks = approvalsByConversation.get(r.conversationId);
+    if (!blocks || !blocks.length) continue;
+    const b = blocks[blocks.length - 1]; // the latest marker is the one that stopped the run
+    const label = `approval ${b.key} (${b.tool})`;
+    if ((alarmingPerConversation.get(`${r.store}#${r.conversationId}`) ?? 0) === 1) {
+      r.attribution = "retroactive-approval";
+      r.cls = "waiting";
+      r.detail = truncate(`${label} — attributed from conversation ${r.conversationId} (pre-#188 row); was: ${r.detail}`);
+    } else {
+      r.attribution = "approval-context";
+      r.detail = truncate(`${r.detail} | conversation ${r.conversationId} also carries ${label} — check before blaming the agent`);
+    }
+  }
+  return rows;
 }
 
 /** Rows the caller has not seen before. Never uses a timestamp: submissions do not have one. */

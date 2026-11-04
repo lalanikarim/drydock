@@ -517,3 +517,146 @@ test("store: no_model rows classify, alarm, and lead their detail with the reaso
     s.cleanup();
   }
 });
+
+// ── #204: reading approval blocks back out of history, and recording that a row was examined ─────
+//
+// Two defects these tests hold shut. (1) #188's detector runs inside a task, so rows written before it shipped have no
+// blocked key and reported forever as anonymous agent failures — the marker text is in the conversation's entries, but
+// nothing read it from the store side. (2) The window refused to advance its watermark while anything alarmed, with no
+// way to record "someone looked", so four historical rows froze the gate indefinitely.
+
+const ENTRIES_DDL = `
+CREATE TABLE entries (
+			id INTEGER PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			head INTEGER,
+			commit_seq INTEGER NOT NULL,
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT;
+`;
+
+/** Add the real `entries` table to a fixture store (DDL copied from a production store). */
+function withEntries(store) {
+  sql(store.db, ENTRIES_DDL);
+  return store;
+}
+
+/** One committed entry whose nested text carries an approval marker, shaped like the kernel's tool-result entries. */
+function approvalEntry(store, { id, cid, key = "a1b2c3d4e5f6", tool = "submit_verdict" }) {
+  const record = {
+    kind: "pi.tool-result",
+    data: {
+      note:
+        `Approval request: {"key":"${key}","tool":"${tool}","args":{"verdict":"pass"},"tier":"destructive"}\n` +
+        `Do not retry this action until the user has approved it.`,
+    },
+  };
+  sql(store.db, `insert into entries (id, conversation_id, head, commit_seq, record)
+                 values (${id}, ${cid}, null, ${id}, ${sqlLit(JSON.stringify(record))});`);
+  return store;
+}
+
+const MARKER = "a1b2c3d4e5f6";
+
+test("readConversationApprovals finds the marker's key and tool from the entries table", () => {
+  const store = approvalEntry(withEntries(makeStore("approvals-read")), { id: 500, cid: 32 });
+  const found = ledger.readConversationApprovals(store.db);
+  assert.equal(found.get(32)?.[0]?.key, MARKER);
+  assert.equal(found.get(32)?.[0]?.tool, "submit_verdict");
+  store.cleanup();
+});
+
+test("a store with no entries table reads as 'no markers', not as an error", () => {
+  // Real stores always have `entries`; fixtures and half-migrated roots do not. Confusing "absent" for "broken" would
+  // make the gate fail on a store it can otherwise read fine.
+  const store = makeStore("approvals-no-table");
+  assert.equal(ledger.readConversationApprovals(store.db).size, 0);
+  store.cleanup();
+});
+
+test("a pre-#188 failure in a conversation with exactly one alarming row becomes waiting, key and all", () => {
+  const store = withEntries(makeStore("retroactive-unique"));
+  store.task({ id: 268, outcomeStatus: "failed", errorMessage: "reviewer never called submit_verdict" });
+  // conversation_id is a column AND in the record; the ledger reads the record (that is what production carries).
+  sql(store.db, `update tasks set conversation_id=32, record=json_set(record,'$.conversationId',32) where id=268;`);
+  approvalEntry(store, { id: 259, cid: 32 });
+
+  const rows = ledger.attributeHistoricalBlocks(
+    ledger.readStore("retroactive-unique", store.db, { kinds: ["factory."] }),
+    ledger.readConversationApprovals(store.db),
+  );
+  const row = rows.find((r) => r.table === "task" && r.id === 268);
+  assert.equal(row.cls, "waiting", "the run did not fail — a gate was waiting on a human");
+  assert.equal(row.attribution, "retroactive-approval", "the report must say the claim came from conversation evidence");
+  assert.match(row.detail, new RegExp(MARKER), "the key is the actionable part");
+  assert.match(row.detail, /reviewer never called submit_verdict/, "and it keeps what the row originally said");
+
+  // The point of all this: an approval wait does not alarm.
+  const summary = ledger.summarize(rows, 1);
+  assert.equal(summary.counts.waiting, 1);
+  assert.deepEqual(summary.alarms.map((a) => a.id), []);
+  store.cleanup();
+});
+
+test("two alarming rows in one conversation are NOT both blamed on the approval", () => {
+  // Markers belong to conversations, not task ids — verified against production entries, which carry toolCallId and
+  // nothing tying them to a row. Guessing here would be the spelling-based misdiagnosis this line of work replaced.
+  const store = withEntries(makeStore("retroactive-ambiguous"));
+  store.task({ id: 10, outcomeStatus: "failed", errorMessage: "verification exited 1" });
+  store.task({ id: 11, outcomeStatus: "failed", errorMessage: "reviewer never called submit_verdict" });
+  sql(store.db, `update tasks set conversation_id=44, record=json_set(record,'$.conversationId',44);`);
+  approvalEntry(store, { id: 600, cid: 44, tool: "bash" });
+
+  const rows = ledger.attributeHistoricalBlocks(
+    ledger.readStore("retroactive-ambiguous", store.db, { kinds: ["factory."] }),
+    ledger.readConversationApprovals(store.db),
+  );
+  const both = rows.filter((r) => r.table === "task");
+  assert.deepEqual(both.map((r) => r.cls), ["failing", "failing"], "ambiguity keeps the honest class");
+  assert.ok(both.every((r) => r.attribution === "approval-context"));
+  assert.ok(both.every((r) => /check before blaming the agent/.test(r.detail)));
+  assert.equal(ledger.summarize(rows, 1).alarms.length, 2, "both still alarm — context is not an excuse");
+  store.cleanup();
+});
+
+// ── acknowledgements: making "someone looked" a state instead of a hope ──────────────────────────
+
+test("an ack keeps the row counted and stops it alarming", () => {
+  const rows = [
+    { store: "s", table: "task", id: 46, kind: "factory.worker", status: "failed", cls: "failing", whenMs: null, detail: "setup command failed (exit 1)" },
+    { store: "s", table: "task", id: 99, kind: "factory.worker", status: "failed", cls: "failing", whenMs: null, detail: "brand new failure" },
+  ];
+  let wm = ledger.emptyWatermark();
+  wm = ledger.withAck(wm, "s/task:46", "sandbox npm install was broken then; not an incident");
+  ledger.applyAcks(rows, wm);
+  const summary = ledger.summarize(rows, 1);
+  assert.equal(summary.counts.failing, 2, "an ack is not a deletion — the failure still happened");
+  assert.deepEqual(summary.alarms.map((a) => a.id), [99], "only the unexamined row wakes anyone");
+});
+
+test("an ack needs a reference we can resolve and a reason that explains it", () => {
+  const wm = ledger.emptyWatermark();
+  assert.throws(() => ledger.withAck(wm, "task:46", "no store"), /not store\/table:id/);
+  assert.throws(() => ledger.withAck(wm, "s/task:notanumber", "x"), /not store\/table:id/);
+  assert.throws(() => ledger.withAck(wm, "s/task:46", "   "), /needs --ack-reason/);
+});
+
+test("acks survive the state file, and a pre-#204 file loads without them", () => {
+  const dir = mkdtempSync(join(tmpdir(), "settlement-ack-"));
+  const file = join(dir, "last-settlements.json");
+  let wm = ledger.emptyWatermark();
+  wm = ledger.advance(wm, [{ store: "s", table: "task", id: 5, kind: "factory.worker", status: "completed", cls: "completed", whenMs: 1, detail: "" }]);
+  wm = ledger.withAck(wm, "s/task:46", "examined 2026-11-04: pre-#188 approval wait");
+  ledger.writeWatermark(file, wm);
+  const back = ledger.readWatermark(file);
+  assert.equal(back.highWater["s/task"], 5);
+  assert.equal(back.acked["s/task:46"].reason, "examined 2026-11-04: pre-#188 approval wait");
+
+  // A file written before this feature: no `acked` key at all must not be treated as corrupt (the alternative is the
+  // operator being told to --reset-watermark, which would silently discard the whole window).
+  writeFileSync(file, JSON.stringify({ version: 1, updatedAt: 1, highWater: { "s/task": 5 } }));
+  const legacy = ledger.readWatermark(file);
+  assert.equal(legacy.highWater["s/task"], 5);
+  assert.equal(legacy.acked, undefined);
+  rmSync(dir, { recursive: true, force: true });
+});
