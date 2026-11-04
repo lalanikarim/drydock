@@ -29,10 +29,16 @@ in the PR rather than reporting green. Both commands were last run against produ
 ## Step 2 — infrastructure truth, before your code is blamed for it
 
 ```bash
-node --experimental-strip-types gates/github-app-check.mjs   # App installation + permission shape
-node --experimental-strip-types gates/registry-targets.mjs   # every managed repo resolves and is reachable
+node --experimental-strip-types gates/github-app-check.mjs   # App installation + permission shape, per managed repo
 curl -s http://127.0.0.1:9700/health                         # status, build.sha, inference state
 ```
+
+**Corrected 2026-11-04:** this page used to list `node gates/registry-targets.mjs` as a step. That file is a **library** —
+it exports `registryRepoNames()` for `github-app-check.mjs` and `test/config-driven-targets.test.mjs`, has no entry point,
+prints nothing, and exits 0. Running it verified nothing while reporting success, which is the exact failure mode §R6b/R10
+exists to catch ("not collected" and "passing" are the same color). Per-repo reachability is `github-app-check`'s job: it
+prints one line per registry-derived repo (`lalanikarim/engram: issues HTTP 200, pulls HTTP 200`) and warns when the App's
+reach exceeds the registry.
 
 Read `inference.state` before diagnosing anything else. A boot that fails because the endpoint is down exhausts the
 restart budget, and `giveUp()` takes the adapter with it — **webhook deliveries during that window are lost, GitHub

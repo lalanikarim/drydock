@@ -559,3 +559,34 @@ and still fires on anything unseen; prove the second half by manufacturing one, 
 **What the run still buys.** The trap design is fixed: baseline reproduced the anti-pattern rather than wiring an existing rule and invalidating the comparison. And a real open question, stated without inflation: arm B's *style* differed from arm A's (typed error + one guard vs inline `Object.assign`), but arms differed in trap as well as lesson — #93 was a value passed through, #94 a list needing parsing — so at n=1 that difference is not attributable. Next clean test needs a twin pair, same shape twice, different parameter names; or the reviewer-side lever, which is the only one downstream code enforces today.
 
 **The rule.** A verdict you have not read belongs to your classifier, not to your experiment. Every signal in this gate now names the file set it read.
+
+---
+
+## 2026-11-04 — #168 measured dead, and the fixture could not have said otherwise
+
+**Decision.** Close #168 on its own pre-registered wording — *prompt-side and review-side guidance both inert as levers; enforce in gates* — retire the queued twin trap pair, and move rule-placement discipline to `gates/fix-pattern.mjs` (#212). Also recorded: an approval-blocked run must not fault a worker for lacking a PR number (#214), and per-file destructive approvals make engram runs attended (evidence on engram#69).
+
+**What triggered it.** The reviewer-side lever shipped in #209 was prompt presence proven, behavior unproven. Four arms ran: `agent/issue-94` (typed error + guard at the route) and `agent/issue-93` (inline `Object.assign` in the handler), each reviewed **with and without** one lesson, delivery proven from the durable store rather than logged as intended.
+
+| arm | lessons | verdict | lesson quoted verbatim |
+|---|---|---|---|
+| controlA (`issue-94`) | empty | pass | — |
+| specimen (`issue-94`) | one | pass | 0 words |
+| controlB_nolesson (`issue-93`) | empty | fail | 0 words |
+| controlB (`issue-93`) | one | fail | 24-word run ×3 |
+
+Verdicts identical within each pair. Where the diff was genuinely broken, `reviewerPrompt` step 4's pre-existing "fix that addresses a symptom while leaving the root cause intact" instruction did the work with zero lessons — and did it *better*, naming `bucketDays=1e21` where the lesson arm said `4294967296`.
+
+**The confound that mattered more than the result.** The lesson rule is "if the same defect stays reachable from another caller, the issue is NOT satisfied". In `factory-fixture`, `toCsv` and `agingBuckets` each have **exactly one caller — the route**. There is no second caller to be reachable from, so a boundary-only fix genuinely closes every live path; the reviewer applied the criterion, found it unmet in fact ("no other caller can reach the defect, so the guard covers every place the rule applies"), and passed. That verdict is correct *and* uninformative about lessons. The previous session's note — "#93/#94 differed in kind, confounding style with location" — was the same problem observed one level up: it was never about the pair differing, it was that neither trap had two callers. A twin pair of the same design would have produced another expensive non-result.
+
+**The control I got wrong first.** The spec called for "same review, empty lessons" and "`agent/issue-93` with the lesson present". That leaves the informative cell empty: controlB failed *with* a lesson on a diff that is actually broken, which credits nothing to the lesson until you show it also fails without one. It does. A fail on a genuinely defective diff is evidence about the reviewer's competence, not about the intervention — so any experiment whose arms can differ in true-defect-ness needs the no-intervention arm on **the same artifact**.
+
+**Incidental: running the experiment found a shipped defect.** `factory/reviewer.ts`'s jq program was corrupted by an automated edit spliced into the string literal (`dfd13f4`, deployed as `23a3e19`): every review died at SPAWN with `invalid escape sequence "\i"`. 611 tests and strict CI green; latent only because no review had executed since the deploy. Fixed in #211 and asserted against the real `jq` binary.
+
+**The dispatch, which was the point.** Labeling `engram#65` produced **engram PR #74** — first factory-authored change in a second repo, draft, `unit-suite` pass, plus the first production `pr_opened` notification (`message_id=183`), the observation #64 was waiting on. It cost two human approvals (one per new file) and produced one new defect (#214). "Unattended" is false for engram today; the safety properties held throughout because `autoMerge: false` was never the thing being tested.
+
+**The rules.**
+- A string that only a *remote* tool interprets (jq, SQL, shell) is invisible to a type checker. Test it against the real interpreter, or assume it is broken.
+- Before crediting an intervention with changing an outcome, show the same artifact failing/succeeding without it. Matched pairs, not before/after.
+- A measurement instrument must be able to express the property it claims to measure. Traps with one caller cannot measure "reachable from another caller", no matter how the lesson is worded.
+- Status documents expire. This file's own readiness verdict said "P0 items 1–4: ~3–4 days" when all four had shipped; a stale-but-once-true line misroutes effort worse than an obvious gap.
