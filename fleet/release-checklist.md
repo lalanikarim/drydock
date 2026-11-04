@@ -84,15 +84,24 @@ curl -s http://127.0.0.1:9700/health    # build.sha MUST equal the merge commit 
 ps -eo pid,ppid,command | grep -E "factory/main[.]ts|adapter[.]ts"   # every child's ppid = supervisor
 grep -ci quarantin /tmp/fleet-*.log     # 0 unless a repo genuinely failed to boot (#185)
 node --experimental-strip-types gates/approval-block-probe.mjs       # detection still explains real stores (#188)
-node --experimental-strip-types gates/settlement-window.mjs          # read the ids, not just the color — see below
+node --experimental-strip-types gates/settlement-window.mjs          # exits 0 only when every alarming row is examined
 ```
 
-**Known state while #204 is open:** on this fleet the settlement window exits 2 with four *historical* engram rows
-(two `setup command failed`, two `reviewer never called submit_verdict`) and cannot drain, because it refuses to advance
-its watermark while anything alarms and there is no way to record that a row was examined. So "read the ids" is the step:
-compare against those four, and treat only unseen ids as news. Do not paper over it with `--reset-watermark` — that clears
-marks for every family, including ones being tracked correctly, and it makes the next real failure look like this one.
-Delete this paragraph when #204 lands; until then, a red window is expected output and therefore not evidence.
+**Reading it (#204).** The window alarms only for rows nobody has examined, and "examined" is now a recorded state:
+
+```console
+$ node --experimental-strip-types gates/settlement-window.mjs \
+      --ack lalanikarim_engram/task:46 --ack-reason "sandbox npm build failed then; historical, not an incident"
+```
+
+An ack keeps the row **counted** and stops it alarming; un-acking is deleting one key from
+`fleet/data/last-settlements.json`. `--reset-watermark` is not a shortcut for this — it clears marks for every family,
+including ones being tracked correctly, and makes the next real failure look like the one you just dismissed. Four pre-#188
+engram rows were acknowledged on 2026-11-04 with reasons in that file, so a red window means news again. Verify that claim
+rather than trusting it: after any ack, `exit 0` must be accompanied by the watermark advancing in the state file — the
+class of bug here was an alarm that could never finish, and "I muted it" looks identical to "it drained" until you read the
+file. Rows attributed from conversation evidence say so in their detail; rows sharing a conversation with a marker are
+annotated, not reclassified, because attribution to a task id is not available in the store.
 
 `status:"ok"` means the listener lives, **not** that work will complete. What `/health` cannot see is a host answering
 `/models` without the pinned model loaded — those failures surface as task outcomes carrying
