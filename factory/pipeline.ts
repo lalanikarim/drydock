@@ -190,6 +190,9 @@ export function factoryPipeline(opts: PipelineOptions) {
     : null;
   const reviewerTaskDef = factoryReviewerTask({
     workDir: opts.workDir,
+    // One lessons file, two readers (#168): the worker was told, the reviewer never was, so a lesson that named a rule
+    // could be contradicted in full view of the reviewer and still merge.
+    lessonsFile,
     fixturesRepo: opts.fixturesRepo,
     image,
     setupCommand: opts.setupCommand,

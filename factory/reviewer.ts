@@ -21,6 +21,7 @@
 // exec error, matching current engram product behavior.
 
 import { execFile } from "node:child_process";
+import { readLessons, reviewerLessonsSection } from "./lessons.ts";
 import { promisify } from "node:util";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
@@ -66,7 +67,7 @@ export function reviewCwd(branch: string): string {
 }
 
 async function fetchIssue(fixturesRepo: string, issueNumber: number, env: NodeJS.ProcessEnv): Promise<string> {
-  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], { env });
+  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\import { readLessons, reviewerLessonsSection } from "./lessons.ts";\nn--- body ---\\n" + (.body // "")'], { env });
 }
 
 async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber, auth }: { workDir: string; fixturesRepo: string; branch: string; issueNumber: number; auth: GitAuth }): Promise<string> {
@@ -88,7 +89,8 @@ async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumb
 }
 
 /** Exported for tests (#95): the envelope a reviewer sees must be as tight as the worker's. */
-export function reviewerPrompt({ branch, issueNumber, issueText }: { branch: string; issueNumber: number; issueText: string }): string {
+export function reviewerPrompt({ branch, issueNumber, issueText, lessons = "" }: { branch: string; issueNumber: number; issueText: string; lessons?: string }): string {
+  const lessonSection = reviewerLessonsSection(lessons);
   return [
     `You are an independent code reviewer for a software factory. The repository is checked out in /sandbox on branch ${branch}, containing a candidate fix for GitHub issue #${issueNumber}. You have no write or shell tools — read, diff, and test only.`,
     "",
@@ -97,6 +99,9 @@ export function reviewerPrompt({ branch, issueNumber, issueText }: { branch: str
     // Shared envelope with the worker (#95). The reviewer reads the same attacker-writable text, so it
     // gets the same treatment — a hole in one of two readers is a hole.
     ...wrapUntrusted(issueText, `issue #${issueNumber}`),
+    // Trusted section, placed after the untrusted envelope for the same reason the worker's is: lessons are host-side
+    // state and must not sit inside the attacker-writable block (#95 envelope contract).
+    ...(lessonSection ? ["", lessonSection] : []),
     "",
     "Review procedure:",
     "1. Use git_diff to see exactly what changed (diff vs main + file list).",
@@ -189,6 +194,11 @@ export interface ReviewerTaskOptions {
   sandboxPolicy?: { allowImages: string[]; mountRoot: string } | null;
   /** Credential for issue fetch + fallback clone (B1-rev). Defaults to the environment's resolution. */
   gitAuth?: GitAuth;
+  /**
+   * Durable lessons document (#168). Read fresh at each review, so a lesson recorded today can gate a review today —
+   * the worker has read these since Phase 5 and nothing downstream ever did, which is why ignoring one was free.
+   */
+  lessonsFile?: string | null;
 }
 
 /** What the review stage is created with (#173). */
@@ -216,8 +226,11 @@ export type ReviewerState =
   | { phase: "spawn"; convId?: undefined }
   | { phase: "wait"; convId: ConversationId };
 
-export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null, gitAuth }: ReviewerTaskOptions) {
+export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", setupCommand = null, wallSecsPerIssue = 900, sandboxPolicy = null, gitAuth, lessonsFile }: ReviewerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
+  // Same default the worker resolves to (`pipeline.ts`), so the two readers of the feedback loop cannot silently point at
+  // different files — a lesson one side sees and the other does not is worse than no lesson at all.
+  const lessonsPath = lessonsFile ?? join(workDir, "..", "lessons.md");
   // Generic over the per-phase narrowing (see the same note in worker.ts): the kernel narrows the checkpoint per phase.
   const guarded = <P extends ReviewerState>(label: string, fn: PhaseHandler<ReviewerInput, P, ReviewerState, ReviewerResult, object>) =>
     async (task: RunningTask<ReviewerInput, P, ReviewerResult>, runtime: TaskRuntime<ReviewerInput, ReviewerState, ReviewerResult, object>, ctx: Context) => {
@@ -277,7 +290,7 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
         const handle = await runtime.conversation(spawnedConvId, ctx);
         if (handle === undefined) throw new Error("reviewer conversation missing");
         await handle.submit(
-          { type: "input", content: reviewerPrompt({ branch, issueNumber, issueText }), requestId: `reviewer-${task.id}` },
+          { type: "input", content: reviewerPrompt({ branch, issueNumber, issueText, lessons: readLessons(lessonsPath) }), requestId: `reviewer-${task.id}` },
           ctx,
         );
         await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId: spawnedConvId } }), ctx);
