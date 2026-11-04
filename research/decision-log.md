@@ -426,3 +426,52 @@ an argument to a running process (#164's abort placement, #157's phantom reserva
 **The lesson that cost the time.** engram has *two* lockfiles and the complete one was the wrong one: `app/package-lock.json` (pre-workspace, never read by a root-level `npm ci`) carried all 20 variants while the root lock — the file npm actually uses — carried one. Checking "the lockfile" showed a healthy graph while installs kept failing. Two locks over one dependency graph is not redundancy; it is a plausible-looking second source of truth, and stale ones cost more than absent ones.
 
 **Keep this one too.** A `--ignore-scripts` in a setup command is a load-bearing flag with no owner: nothing recorded why it was there, so removing the workaround never gets scheduled. Removing the workaround is part of fixing the defect. (engram's own `Dockerfile` also uses `--ignore-scripts`, deliberately, so the app image skips `prepare` without devDependencies — that one stays; this is not a general "flags bad" rule.)
+
+---
+
+## 2026-11-04 — #168: the default lesson becomes the shape that measured effective, and G5 finds two instrument defects
+
+**Decision.** `LESSON_TEXT` in `gates/g5-traps.mjs` — what arm B receives when no `--lesson-file` is passed — was an
+abstract principle. It is now the structure that measured effective: a typed error carrying its own status plus one guard
+to define once, written on **value limits** rather than request payloads. The abstract sentence survives at
+`test/fixtures/g5/lesson-abstract.md` as a labelled negative control. Option B ("keep it abstract, document the red gate
+as intentional") was rejected because it left the battery permanently 8/9 for a reason no artifact stated, and because a
+canonical run that is known-in advance to change nothing measures nothing.
+
+**Why mismatched surface stays.** #176 proved transfer with a lesson whose identifiers the worker copied zero of. Making
+the default speak the traps' vocabulary would reintroduce the ambiguity between "the rule transferred" and "the worker
+matched words", so the mismatch is now asserted by test rather than incidental.
+
+**The re-run failed, and both reasons are instrument problems, not lesson problems.** Fresh pair seeded on the fixture
+repo (#86 `PUT /invoices/:id/status` answers 500 + V8 wording for a `null` body; #87 `POST /invoices/batch` accepts
+top-level fields its siblings reject by name) — both verified live against a running server before spending the run,
+because issue titles outlive their fixes and the two historical pairs are closed precisely because merged arms removed
+the defects from `main`.
+
+- **The fixture base was red.** `main` at `9d19c1f` fails 1 of 126: PR #82's handler guard and PR #83's store guard answer
+  the same rule with different wording, and #83 asserted its own. Both arms therefore had "make the suite green" as an
+  unstated extra requirement and both edited that unrelated assertion. Fixed in [fixture#91](https://github.com/lalanikarim/factory-fixture/pull/91)
+  (126/126), with the underlying duplication left open as [fixture#90](https://github.com/lalanikarim/factory-fixture/issues/90)
+  rather than silently picking a winner. Two locally-correct merged PRs colliding in the suite is the mechanism; a gate
+  run from a red base measures contamination, not agents.
+- **The classifier was blind to reuse.** Arm A — with *no* lesson — produced the structurally right fix: declare
+  `BATCH_FIELDS`, call the module's existing `rejectUnknownFields` from the batch path, update README. It read as neither
+  root fix nor handler patch, because every root-fix signal required something **new** in the diff. That asymmetry always
+  lands on the good shape: a repository that already owns the helper can only produce reuse, so G5 would keep reporting
+  "no improvement" for improvements it cannot see. `detectsExistingRuleReuse` now counts it (narrowly: an added call to a
+  non-declared rule-named function **and** an added/referenced rule set), with the two arms' diffs captured as fixtures
+  and an explicit anti-rubber-stamp test.
+
+**Arm B's result stands as recorded, not re-scored:** it copied the inline sibling guard (`throw Object.assign(new Error(…),
+{ statusCode: 400 })`) into `setInvoiceStatus` — handler patch, lesson verified present in its prompt from arm B's own
+durable store (the entry carries the lessons header and the new text byte-for-byte). Kept as
+`test/fixtures/g5/arm-b-handler-patch-issue-86.diff`. Two candidate explanations, both untested: three existing copies of
+the exact inline guard outvote one lesson line, and #86's rule is transport-level with no domain function to move it into,
+so "put the check beside the rule" has nowhere to land. Neither exonerates the default; both say the next run needs traps
+whose root fix has a place to go.
+
+**The general rule.** A measurement that fails twice for instrument reasons has still produced two facts worth more than
+the reading it was chasing: **check the base is green before spending an agent run on it**, and **an instrument that can
+only see novel code under-credits exactly the fixes a lesson is trying to cause**. Fourth time this week a running
+process beat a recorded assumption — the assumption here was mine, written two hours earlier, that the traps I seeded were
+sound.

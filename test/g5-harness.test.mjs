@@ -213,7 +213,10 @@ test("arm A's lessons file reads as no lessons; arm B's reads as exactly one", (
 test("a lesson present in the file appears in the worker prompt; an empty file adds no section", () => {
   const withLesson = workerPrompt({ issueNumber: 63, issueText: "body", lessons: readLessons(writeTemp(lessonsContent(true))) });
   assert.match(withLesson, /Standing factory lessons from prior review findings/);
-  assert.match(withLesson, /fix the rule where the error originates/);
+  // Assert the shipped lesson appears verbatim rather than matching a fragment of its wording: pinning prose made this
+  // test fail for a legitimate change to the default (#168), which is the same exact-equality-on-text defect recorded
+  // for the fixture repo's tests.
+  assert.ok(withLesson.includes(LESSON_TEXT.trim()), "the default lesson must reach the prompt byte-for-byte");
 
   const without = workerPrompt({ issueNumber: 62, issueText: "body", lessons: readLessons(writeTemp(lessonsContent(false))) });
   assert.doesNotMatch(without, /Standing factory lessons/, "an empty lessons file must not add an empty trusted section");
@@ -246,6 +249,34 @@ const { validateLessonText } = await import("../gates/g5-traps.mjs");
 test("the shipped LESSON_TEXT passes its own validator", () => {
   // If this goes red, the validator and the assertion above have diverged and one of them is decorative.
   assert.deepEqual(validateLessonText(LESSON_TEXT), []);
+});
+
+
+// #168 — the default lesson is now a measurement result, so both halves of its contract are pinned: it must carry an
+// imitable shape (that is what changed worker behavior) and it must keep a surface that does NOT match the traps (that
+// is what makes a green run mean transfer rather than vocabulary matching).
+test("the default LESSON_TEXT carries an imitable shape, not a principle", () => {
+  assert.match(LESSON_TEXT, /class\s+\w*Error\s+extends\s+Error/, "declares an error type in code");
+  assert.match(LESSON_TEXT, /this\.statusCode\s*=\s*/, "the error carries its own status");
+  assert.match(LESSON_TEXT, /function\s+assert\w*\s*\(|function\s+require\w*\s*\(/, "names one guard to define once");
+  // The failure mode this guards against is subtle: prose that *describes* the pattern passes every other check here
+  // and measures nothing, which is precisely the state #168 found and reported.
+  assert.doesNotMatch(LESSON_TEXT, /fix the rule where the error originates — give/, "the abstract sentence that measured no change must not be the default again");
+});
+
+test("the default lesson keeps a mismatched surface so green still means transfer (#176)", () => {
+  // Traps are about request payloads; the default is about limits on a value. If someone rewrites the default to speak
+  // the trap's language, a passing G5 stops distinguishing rule-transfer from word-matching and this assertion says so.
+  assert.doesNotMatch(LESSON_TEXT, /request body|JSON object|payload/i, "the default must not name the traps' surface");
+  assert.deepEqual(validateLessonText(LESSON_TEXT), []);
+});
+
+test("the abstract negative control is kept, valid, and deliberately shapeless", () => {
+  // It lost the measurement; it is not deleted, because re-measuring it must stay one flag away.
+  const text = readFileSync(join(FX, "lesson-abstract.md"), "utf8");
+  assert.deepEqual(validateLessonText(text), [], "the control is held to the same rules as the default");
+  assert.doesNotMatch(text, /class\s+\w*Error\s+extends\s+Error/, "no code shape — that absence IS the finding");
+  assert.match(text, /NEGATIVE CONTROL/i, "and it says so in the file, so nobody mistakes it for guidance to ship");
 });
 
 test("the imitable variant is a valid lesson and actually contains an imitable shape", () => {
@@ -387,4 +418,43 @@ test("verdict: the pre-existing failures still fail", () => {
 
   const sameArtifact = experimentVerdict([armOf("A"), { ...armOf("B"), prNumber: 82, issue: 71, branch: "agent/issue-71" }]);
   assert.ok(sameArtifact.fails.some((f) => /not isolated/.test(f)));
+});
+
+// ── the reuse blind spot, captured 2026-11-04 (fixture PR #88, G5 arm A) ─────────────────────────────────
+//
+// Arm A — the arm with NO lesson — fixed fixture #87 by declaring `const BATCH_FIELDS = new Set(["invoices"])` and
+// calling the module's existing `rejectUnknownFields` from the batch handler. One rule, now covering every path. The
+// classifier read it as neither root fix nor handler patch, because every root-fix signal demanded something new in
+// the diff. That asymmetry always falls on the good shape: a codebase that already owns the helper can only produce
+// reuse, so the gate would keep reporting "no improvement" for improvements it is blind to.
+
+test("captured PR #88: wiring an existing shared rule into a bare path counts as a root fix", () => {
+  const c = classifyFixPattern(diff("arm-a-existing-rule-reuse.diff"), contractFor(87));
+  assert.equal(c.measured, true);
+  assert.equal(c.rootFix, true, `expected reuse to be seen: ${JSON.stringify(c.reasons)}`);
+  assert.equal(c.signals.ruleReuse, "rejectUnknownFields");
+  assert.ok(c.reasons.rootFix.some((r) => /existing shared rule/.test(r)), "the reason must name reuse so a reviewer can disagree with it");
+});
+
+test("captured PR #89: the arm that HAD the lesson still patched the handler, and is scored as such", () => {
+  // The negative result from the same run, kept as a fixture so nobody quietly re-scores it later. Arm B copied the
+  // inline sibling guard (throw Object.assign(new Error(...), { statusCode: 400 })) into setInvoiceStatus.
+  const c = classifyFixPattern(diff("arm-b-handler-patch-issue-86.diff"), contractFor(86));
+  assert.equal(c.rootFix, false, "an inline guard copied from a sibling is not a root fix");
+  assert.equal(c.handlerPatch, true);
+});
+
+test("the reuse signal is not a rubber stamp", () => {
+  // The historical anti-pattern must stay non-root even with the new signal: it touches validation-adjacent code and
+  // would be the diff most likely to false-positive.
+  const c = classifyFixPattern(diff("handler-patch-7bdb147.diff"), contractFor(62));
+  assert.equal(c.rootFix, false, `reuse signal overfired: ${JSON.stringify(c.signals)}`);
+  assert.equal(c.signals.ruleReuse, null);
+
+  // A call to a validation-named function with no rule set is not enough on its own.
+  const bare = classifyFixPattern(
+    ["--- a/src/x.mjs", "+++ b/src/x.mjs", "@@ -1 +1 @@", "+  validateThing(body);"].join("\n"),
+    { domainPaths: ["src/store.mjs"], handlerPaths: ["src/x.mjs"] },
+  );
+  assert.equal(bare.rootFix, false, "calling a validation-ish name with no rule set proves nothing");
 });
