@@ -66,8 +66,19 @@ export function reviewCwd(branch: string): string {
   return `review-${branch.replace(/[^a-zA-Z0-9]+/g, "-")}`;
 }
 
+/**
+ * The jq program that assembles the issue text a reviewer reads (#209 shipped this string corrupted: an automated
+ * edit spliced the new `import { readLessons, … }` line into the middle of the jq literal, so every review threw at
+ * SPAWN with `invalid escape sequence "\i"`. It survived 611 unit tests and CI because nothing called `fetchIssue`.
+ *
+ * Exported and asserted against the real `jq` binary in `test/reviewer-issue-text.test.mjs` — a string literal that
+ * only ever gets interpreted by a remote tool is exactly the kind of contract a type checker cannot see, and this one
+ * silently halted every draft PR the factory would have opened.
+ */
+export const ISSUE_TEXT_JQ = '.title + "\\n--- body ---\\n" + (.body // "")';
+
 async function fetchIssue(fixturesRepo: string, issueNumber: number, env: NodeJS.ProcessEnv): Promise<string> {
-  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\import { readLessons, reviewerLessonsSection } from "./lessons.ts";\nn--- body ---\\n" + (.body // "")'], { env });
+  return sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", ISSUE_TEXT_JQ], { env });
 }
 
 async function prepareReviewWorkspace({ workDir, fixturesRepo, branch, issueNumber, auth }: { workDir: string; fixturesRepo: string; branch: string; issueNumber: number; auth: GitAuth }): Promise<string> {
