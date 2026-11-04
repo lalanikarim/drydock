@@ -6,6 +6,44 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Twelfth refresh — 2026-11-04 (late)
+
+Verified state: drydock `main` = **`723161b`** (615 tests / 614 pass / 0 fail, one pre-existing skip; typecheck clean; boot tests executed against live inference, no skips). Fleet restarted onto it and verified per `fleet/release-checklist.md` steps 4–5: `/health` → `{status: ok, build.sha: 723161b, inference: reachable}`, single-SIGTERM shutdown took ~1 s, lock released, zero orphans, 0 quarantine lines, approval probe 5/5 explained, settlement window exit 0. Fixture `main` unchanged (`1378884`), suite green (132/132) before any gate ran.
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **Review + merge engram PR #74** — first factory-authored change in a second repo (`app/src/core.ts` re-asserts `rootAgent` on every start; new test wired into `test:unit`; `unit-suite` pass). Read the diff by hand: it is a real fix for a real kernel defect, and merging it makes engram's `main` carry factory work for the first time. | 🧑 |
+| 2 | **#212 — enforce rule placement in gates.** #168's disposition: prompts measured inert on both channels, so "the guard belongs where the rule lives" becomes a diff-position check in `gates/fix-pattern.mjs`. Acceptance requires a **two-caller** specimen, which the fixture does not have today. | 🤖 |
+| 3 | **#214 — `delegate` refuses model-supplied `feedback.prNumber = 0` by faulting at SPAWN.** Move the refusal to the tool boundary so the orchestrator gets an actionable result; keep the spawn-phase guard for direct `/tasks` submissions. Small, well-specified, good next task. | 🤖 |
+| 4 | **C4 partial-run recovery.** Still the largest remaining implementation. Note before starting: its acceptance criterion ("a real aborted run whose branch is reused") has **no specimen** — zero `agent/*` branches exist in either managed repo, so the session begins by deliberately aborting a live worker. Budget for that, not just for `factory/resume-context.ts`. | 🤖 |
+| 5 | **#161 emit half** — instance raises the inference edge on `modelUnavailable`; most self-contained item left, no fixture or fleet dependency. | 🤖 |
+| 6 | **#213 off-host backups** (needs a destination + encryption decision) · #147 passive (waiting on a live T2 stall) · #172 upstream kernel owner · reach residual (`modelarena`, `collective`) · #42 design doc | mixed 🧑 |
+
+**Closed this session:** **#168** — measured, not argued. Four arms on matched pairs (`agent/issue-94` and `agent/issue-93`, each reviewed with and without one lesson), delivery proven from the durable store: verdicts identical regardless of lessons. Where a diff was genuinely broken the pre-existing rubric caught it unaided; where the lesson's rule would have mattered, the fixture cannot instantiate it (`toCsv` and `agingBuckets` each have exactly **one** caller — the route). Closed on its own pre-registered wording: *enforce in gates, not prompts*.
+
+**Retired, not deferred:** the **twin trap pair** (eleventh refresh, rank 2). controlB already answers what it would have measured, and a trap pair without second callers cannot answer it at all. Do not spend the remaining fixture consumables on it — `agent/issue-93`/`agent/issue-94` and PRs #95/#96 are now spent specimens.
+
+**Shipped:** **#211 → `723161b`** — (a) fixed a **shipped defect**: an automated edit in `dfd13f4` (#209) spliced an import statement into a jq string literal in `factory/reviewer.ts`, so every review died at SPAWN; 611 tests and strict CI green, deployed as `23a3e19`, latent only because no review had run since. Now asserted against the real `jq` binary (`test/reviewer-issue-text.test.mjs`). (b) `gates/g5-reviewer-lever.mjs`, the four-arm gate that found it by executing for real.
+
+**Installed:** `com.drydock.backup` (daily, `--keep 7`, source of truth now committed as `fleet/launchd/com.drydock.backup.plist.example`), proven under launchd — `BACKUP DRILL PASSED`, four stores snapshot/verify/restore-count-compared/write-tested.
+
+**Filed:** **#212** (gate-side placement enforcement), **#213** (off-host encrypted copies; same-disk limit stated plainly), **#214** (`feedback.prNumber` fault-vs-refusal), plus production evidence on **engram#69** (one destructive approval per file written ⇒ engram runs are attended).
+
+**Runbook correction shipped in the same PR:** `fleet/release-checklist.md` step 2 listed `node gates/registry-targets.mjs` as a verification step. That file is a **library** — no entry point, prints nothing, exits 0. Running it verified nothing while reporting success: textbook R6b/R10.
+
+### The measurement that changed the plan, in one table
+
+| arm | branch | lessons | verdict | lesson quoted |
+|---|---|---|---|---|
+| controlA | `agent/issue-94` boundary guard | empty | pass | — |
+| specimen | `agent/issue-94` | one | pass | 0 words |
+| controlB_nolesson | `agent/issue-93` handler patch | empty | fail | 0 words |
+| controlB | `agent/issue-93` | one | fail | 24-word verbatim run ×3 |
+
+Incidental and true: the reviewer's counterexample on `agent/issue-93` reproduced outside the classifier — `curl "…/reports/aging?bucketDays=4294967296"` → `500 {"error":"Invalid array length"}`, suite green at 131/131. A review found a live defect its own test suite could not see.
+
+---
+
 # Eleventh refresh — 2026-11-04 (evening)
 
 Verified state: drydock `main` = **`23a3e19`** (611 tests / 610 pass / 0 fail), fleet running that build, fixture `main` = `1378884`. No open drydock PRs. Rows below the tenth refresh are history; the live ordering is:

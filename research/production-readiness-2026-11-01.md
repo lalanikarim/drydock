@@ -1,5 +1,11 @@
 # Production readiness assessment + session handoff — 2026-11-01
 
+> **Updated 2026-11-04 (late) — §1 verdict rewritten; the old one cited P0s that had all shipped.** Verified state: drydock `main` = **`723161b`**, suite **615 tests / 614 pass / 0 fail** (one pre-existing skip), typecheck clean, boot tests genuinely executed (live model answered; no skips). Fleet restarted onto `723161b`: `/health` → `{status: ok, build.sha: 723161b, inference: reachable}`, lock held by the supervisor pid, 0 quarantine lines, approval probe 5/5 explained, settlement window clean (exit 0).
+>
+> Four things changed the picture materially. **(1) A shipped defect was killing every review.** #209 (`dfd13f4`, deployed as `23a3e19`) spliced an import statement into a jq string literal in `factory/reviewer.ts`; `gh --jq` could not parse it, so **every review died at SPAWN** — 611 tests and strict CI green, latent only because no review had run since the deploy. Found by running the real thing (#211). **(2) The second repo did real work for the first time.** `engram#65` was labeled `build` at 19:33 UTC; at ~20:00 **engram PR #74** existed — draft, `+159/-5`, `app/src/core.ts` + a new 150-line test wired into `test:unit`, `unit-suite` pass. It needed **two destructive-write approvals** (one per new file) and delivered the first production `pr_opened` notification (`message_id=183`), which is the observation #64 was waiting on. **(3) #168 closed on its own pre-registered criterion**: reviewer-side lessons produced no discrimination across two matched pairs → enforce in gates (#212). The queued twin trap pair is **retired**. **(4) Backups are now scheduled and restore-proven** (`com.drydock.backup`, daily, `--keep 7`, proven via `launchctl kickstart`), with the off-host gap filed as #213.
+>
+> Two defects came out of the dispatch and are open: **#214** (model-supplied `feedback.prNumber = 0` faults a worker at SPAWN instead of refusing at the tool boundary) and **engram#69**, which now carries production evidence that per-file destructive approvals make engram runs *attended*.
+>
 > **Updated 2026-11-03.** Since the 2026-11-02 update: **#141 shipped and live** (durable per-issue wall-budget cap + `POST /factory/runs/abort`, #153, proven against a real running task), **#120 shipped** (runbook §7c containment, commands executed against production, #158), **#143 closed** (supervisor survives a bad config read in its own recovery path, #150), **#133 closed for items 1–2** with two alert-swallowing defects found and fixed on the way (#160: a catch-all dedupe key plus a time window that deleted the all-clear), and **#64 closed** — production made its first auditable Telegram send (`message_id=121`). Battery final tally recorded as **8 of 9**. New issue **#161**: settlements that produced no work are counted nowhere. Suite **448 pass / 0 fail**; fleet on `e4d89e1`.
 >
 > **Updated 2026-11-02.** Shipped since compilation: **P0-3 closed** (process-group ownership, bounded shutdown,
@@ -24,7 +30,26 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 
 ---
 
-## 1. Verdict
+## 1. Verdict (refreshed 2026-11-04; the pre-history verdict is preserved below it)
+
+**Bar A: met and demonstrated in two repositories. Bar B: no, and the blockers are infrastructure and human-in-the-loop policy, not code.**
+
+| bar | distance |
+|---|---|
+| Single-operator, single-host fleet: labeled issue → reviewed draft PR, cannot merge what it wasn't allowed to, announces when it stops | **Met.** All four P0s shipped (P0-4 now scheduled *and* restore-proven). Proven in drydock (`agent/issue-80`, `agent/issue-105` merged) and — first time as of 2026-11-04 — in a second repo: `engram#65` → **engram PR #74**, draft, CI green. The safety property held throughout: `autoMerge: false` everywhere, so nothing landed without a human |
+| Trustworthy without a human watching | **No.** Two independent reasons, both newly measured rather than assumed: **(a)** engram runs block on one destructive approval *per file written* (2 files → 2 gates → 2 Telegram alerts; see engram#69), so "unattended" is false in practice while the real controls (draft PR, required CI, human merge) remain intact; **(b)** one laptop, one inference endpoint, one public funnel, and backups on the same disk as the stores (#213). Infrastructure, not code quality |
+
+**What the old verdict got wrong.** It said "Not production-ready — P0 items 1–4: ~3–4 days". All four shipped; a reader taking that line at face value would have queued work that was already done. The lesson is the same one this repo keeps learning: **a status document is a claim with an expiry date**, and the honest failure mode is not "wrong" but "stale in a way that misroutes effort".
+
+**What is still unproven, stated without spin:**
+
+- **Throughput.** Two merged factory-authored PRs in drydock's entire history and one draft in engram — n=3. There is no reliability distribution behind the word "unattended", and #147 (one 900 s stall, passed in 48 s on re-run) is the only latency variance ever measured.
+- **Off-host recovery.** Restore is proven on the same disk. Nobody has rebuilt the factory from backups on a clean host (#213).
+- **Reach discipline.** `gates/github-app-check.mjs` still reports `modelarena` and `collective` as reachable-but-unmanaged; intake refuses them, so this is leaked-key blast radius, not ordinary operation.
+- **The feedback loop as a lever.** Both prompt channels (worker-side #168 hypothesis 1 at n=1, reviewer-side hypothesis 2 across two matched pairs) produced no reliable discrimination. Enforcement of rule placement moves to gates (#212).
+
+<details>
+<summary>Original verdict (2026-11-01), preserved because it explains why the fixes look the way they do</summary>
 
 **Not production-ready.** Closer than a week ago, and now specific about which claim is unproven.
 
@@ -32,6 +57,8 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 |---|---|
 | Single-operator, single-host fleet that takes a labeled issue → reviewed draft PR unattended, cannot merge what it wasn't allowed to, and announces when it stops | **P0 items 1–4: ~3–4 days + one full verification cycle** (estimates; the battery has added work every time it has been run) |
 | Trustworthy without a human watching | P1 as well: **2+ weeks and infrastructure that isn't a laptop.** A laptop, one inference endpoint, and an open public funnel are not production infra regardless of code quality |
+
+</details>
 
 ---
 
