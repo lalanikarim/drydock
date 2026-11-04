@@ -36,6 +36,15 @@ export interface ShutdownDeps {
   graceMs?: number;
   /** Injectable timer so tests are not paced by a real 3 s wait. */
   setTimer?: (fn: () => void, ms: number) => unknown;
+  /** Clear the armed deadline timer — used by early exit so the bound does not outlive the process. */
+  clearTimer?: (t: unknown) => void;
+  /**
+   * True once every tracked child has exited AND every group teardown begun by this shutdown has resolved
+   * (its process group confirmed empty, grandchildren included). The coordinator cannot know either fact
+   * itself — the supervisor owns both — so the default is `false`: a caller that does not provide it gets
+   * exactly the old behavior (wait out the deadline).
+   */
+  settled?: () => boolean;
 }
 
 export interface ShutdownCoordinator {
@@ -46,6 +55,12 @@ export interface ShutdownCoordinator {
   begin: (reason: string, opts?: { exitCode?: number }) => void;
   /** True once teardown has started — child exit handlers consult this to suppress restarts. */
   isShuttingDown: () => boolean;
+  /**
+   * Exit before the deadline once `settled()` says there is nothing left to wait for (#196). Called from the
+   * supervisor on every child exit and on every group-teardown resolution; a no-op outside the graceful phase
+   * or while anything is still alive. The deadline stays armed as the backstop for a hung child.
+   */
+  maybeExitEarly: () => void;
   /** Introspection for logs and tests. */
   state: () => { phase: ShutdownPhase; requests: number; reason?: string; exitCode: number };
 }
@@ -60,11 +75,25 @@ export function createShutdownCoordinator({
   log,
   graceMs = 3_000,
   setTimer = (fn, ms) => setTimeout(fn, ms),
+  // Node's clearTimeout is a safe no-op on non-timeout handles, which is all the default needs.
+  clearTimer = (t: unknown) => clearTimeout(t as NodeJS.Timeout),
+  settled = () => false,
 }: ShutdownDeps): ShutdownCoordinator {
   let phase: ShutdownPhase = "running";
   let requests = 0;
   let reason: string | undefined;
   let exitCode = 0;
+  let deadlineTimer: unknown;
+
+  // A local function, not just an object property: begin() must be able to call it before the object
+  // it is returned on exists.
+  function maybeExitEarly() {
+    if (phase !== "graceful") return;
+    if (!settled()) return; // a live child or an in-flight group teardown means the deadline may still be needed
+    log(`[supervisor] all child groups settled — exiting early (deadline was ${graceMs} ms)`);
+    clearTimer(deadlineTimer);
+    exit(exitCode);
+  }
 
   return {
     begin(why, opts) {
@@ -100,13 +129,18 @@ export function createShutdownCoordinator({
         log(`[supervisor] terminating ${groups.length} child process group(s): ${groups.join(", ")}`);
       }
 
-      // Deliberately NOT unref'd, and never cleared: this timer is the bound. An unref'd deadline let the
-      // process linger on whatever handle a child left open — that is how a supervisor sat alive 13 s after
-      // logging "shutting down" and had to be SIGKILLed, which is what orphans children (#125).
-      setTimer(() => exit(exitCode), graceMs);
+      // Deliberately NOT unref'd: an unref'd deadline let the process linger on whatever handle a child left
+      // open — that is how a supervisor sat alive 13 s after logging "shutting down" and had to be SIGKILLed,
+      // which is what orphans children (#125). It IS now clearable, though: #196 measured the bound being
+      // paid in full (3.2 s) while every child had already settled at ~200 ms, because nothing ever asked
+      // "is there anything left to wait for?". Early exit clears it; a hung child still falls through to it.
+      deadlineTimer = setTimer(() => exit(exitCode), graceMs);
+      maybeExitEarly();
     },
 
     isShuttingDown: () => phase === "graceful",
+
+    maybeExitEarly,
 
     state: () => ({ phase, requests, reason, exitCode }),
   };

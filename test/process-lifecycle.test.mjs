@@ -13,8 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import { execPath } from "node:process";
+import { spawn } from "node:child_process";
 import { spawnInProcessGroup, terminateProcessGroup, killProcessGroupNow, listProcessGroup } from "../fleet/proc-group.ts";
 import { createShutdownCoordinator } from "../fleet/shutdown-coordinator.ts";
+import { releaseChildStreams } from "../fleet/supervisor.ts";
 import { parseSupervisorPid, detectOrphan, startParentWatchdog, SUPERVISOR_PID_ENV } from "../factory/parent-watchdog.ts";
 
 const WATCHDOG_TS = new URL("../factory/parent-watchdog.ts", import.meta.url).pathname;
@@ -508,4 +510,234 @@ test("a child that already exited is not terminated twice: tracked() reflects li
   h.coord.begin("received SIGTERM");
   assert.ok(!h.events.includes("term:factory:a"));
   assert.ok(h.events.includes("term:adapter"));
+});
+
+// ---------------------------------------------------------------------------
+// #196 — early exit and stream release.
+//
+// Measured before this change (isolated fleet, piped stdio): factory children settled at ~189 ms, the
+// adapter at ~224 ms, and the supervisor still exited at 3213 ms — the coordinator had no path to ask
+// "is there anything left to wait for?", so the bound was paid in full every shutdown. Two halves:
+//   * the coordinator exits early once `settled()` says nothing is alive (deadline stays as the backstop);
+//   * the supervisor releases the child stdio read ends on every exit path, so a writer still blocked at
+//     the deadline gets EPIPE instead of hanging on a pipe whose reader is gone.
+
+// Mirrors the supervisor's real wiring: settled means no live children AND no group teardown in flight.
+// `terminate` opens a teardown (the child is still alive); `childExited` drops it from the live set, as the
+// exit handler does; `settle` resolves one group teardown, as the .finally does. Both call maybeExitEarly,
+// exactly like the production wiring — early exit can come from either edge.
+function earlyExitHarness({ graceMs = 1_000, children = ["factory:a", "adapter"] } = {}) {
+  const events = [];
+  let live = [...children];
+  let pendingTeardowns = 0;
+  let forcedSettled = null;
+  let pendingTimer = null;
+  const coord = createShutdownCoordinator({
+    tracked: () => live,
+    settled: () => (forcedSettled ?? (live.length === 0 && pendingTeardowns === 0)),
+    terminate: (key) => {
+      events.push(`term:${key}`);
+      pendingTeardowns += 1;
+    },
+    forceKill: (key) => events.push(`kill:${key}`),
+    stopRestarts: () => events.push("stop-restarts"),
+    releaseLock: () => events.push("release-lock"),
+    exit: (code) => events.push(`exit:${code}`),
+    log: (line) => events.push(`log:${line}`),
+    graceMs,
+    setTimer: (fn, ms) => {
+      events.push(`arm-timer:${ms}`);
+      pendingTimer = { fn, ms };
+      return pendingTimer;
+    },
+    clearTimer: () => events.push("clear-timer"),
+  });
+  return {
+    coord,
+    events,
+    childExited: (key) => {
+      live = live.filter((k) => k !== key);
+      coord.maybeExitEarly();
+    },
+    settle: () => {
+      pendingTeardowns = Math.max(0, pendingTeardowns - 1);
+      coord.maybeExitEarly();
+    },
+    setSettled: (b) => { forcedSettled = b; },
+    fireTimer: () => pendingTimer?.fn(),
+  };
+}
+
+test("a shutdown with nothing left to wait for exits immediately (#196)", () => {
+  const h = earlyExitHarness({ children: [] }); // nothing tracked → settled from the start
+  h.coord.begin("received SIGTERM");
+  assert.ok(h.events.includes("exit:0"), "no tracked children → no reason to pay the deadline: " + h.events.join(" | "));
+  assert.ok(h.events.includes("clear-timer"), "the armed deadline must not outlive the process");
+  assert.ok(h.events.indexOf("clear-timer") < h.events.indexOf("exit:0"), "timer cleared before exit");
+});
+
+test("early exit waits for BOTH edges — last child out AND last teardown resolved (#196)", () => {
+  const h = earlyExitHarness();
+  h.coord.begin("received SIGTERM");
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "nothing settled → no exit yet");
+
+  h.childExited("factory:a"); // one child gone, but its group teardown is still in flight
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "a live child or an in-flight teardown means wait");
+  h.settle(); // that group confirmed empty — the other child is still alive
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "the other child is still alive → still no exit");
+
+  h.childExited("adapter"); // last child out, but its teardown is still in flight
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "exiting before the group is confirmed empty would orphan grandchildren (#125)");
+  h.settle(); // everything settled — this edge exits
+  assert.ok(h.events.includes("exit:0"), h.events.join(" | "));
+  assert.ok(h.events.includes("clear-timer"), "the bound is cleared, not merely ignored");
+  assert.ok(h.events.indexOf("clear-timer") < h.events.indexOf("exit:0"));
+});
+
+test("maybeExitEarly is a no-op while anything is still alive, and outside the graceful phase (#196)", () => {
+  const h = earlyExitHarness();
+  h.coord.begin("received SIGTERM");
+  h.coord.maybeExitEarly(); // settled=false: a live child or an in-flight teardown means wait
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "must not exit while unsettled");
+  const h2 = earlyExitHarness();
+  h2.setSettled(true);
+  h2.coord.maybeExitEarly(); // settled but never began — nothing to exit
+  assert.ok(!h2.events.some((e) => e.startsWith("exit:")));
+});
+
+test("early exit carries the give-up exit code (#196)", () => {
+  const h = earlyExitHarness({ children: [] }); // siblings already dead; nothing to wait for
+  h.coord.begin("all managed repos quarantined", { exitCode: 1 });
+  assert.ok(h.events.includes("exit:1"), "a give-up that settles fast still looks like a failure: " + h.events.join(" | "));
+});
+
+test("without a settled() dependency the old behavior holds: the deadline is paid in full (#196 regression guard)", () => {
+  const h = harness(); // no settled dep → default false
+  h.coord.begin("received SIGTERM");
+  assert.ok(!h.events.some((e) => e.startsWith("exit:")), "no early exit without settlement knowledge");
+  h.fireTimer();
+  assert.ok(h.events.includes("exit:0"));
+});
+
+// ---------------------------------------------------------------------------
+// #196 lifecycle: real processes, asserted on observable effects.
+// A child that writes continuously into its stdout pipe, TERMINATED mid-burst, must reach its handler and
+// exit promptly while the parent keeps draining — and releasing our read end must hand a stuck writer an
+// error instead of a hang. Stubs cannot answer these questions; real processes do.
+
+const DRAIN_DIR = mkdtempSync(join(tmpdir(), "drain-196-"));
+const drainMark = (name) => join(DRAIN_DIR, name);
+
+/** 8 KB log line every 10 ms — fills a 64 KB pipe buffer in well under a second when nobody drains. */
+function writerSource(markPath, { handleSigterm } = {}) {
+  return `
+import { appendFileSync } from "node:fs";
+const t0 = Date.now();
+const pad = "x".repeat(8192);
+const mark = (m) => appendFileSync(${JSON.stringify(markPath)}, JSON.stringify({ ms: Date.now() - t0, m }) + "\\n");
+const writeLine = (m, done) => process.stdout.write(JSON.stringify({ ms: Date.now() - t0, m }) + " " + pad + "\\n", (err) => {
+  if (err) { mark("write-errored:" + err.code); }
+  if (done) done(err);
+});
+let n = 0;
+setInterval(() => writeLine("tick " + (++n), (err) => { if (err) process.exit(3); }), 10);
+mark("child-boot");
+${handleSigterm ? `
+process.on("SIGTERM", () => {
+  mark("handler-entered");
+  writeLine("sigterm-log", (err) => {
+    mark(err ? "sigterm-write-errored:" + err.code : "sigterm-write-ok");
+    setTimeout(() => process.exit(0), 20);
+  });
+});` : `
+// No SIGTERM handler: this child can only leave through the write error, which is what the test asserts on.`}
+`;
+}
+
+function readMarks(path) {
+  try {
+    return String(readFileSync(path, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+async function waitForMark(path, marker, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (readMarks(path).some((m) => m.m === marker)) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
+
+test("a child writing continuously reaches its SIGTERM handler and exits promptly while we keep draining (#196)", async () => {
+  const markPath = drainMark("handled.jsonl");
+  const child = spawn(execPath, ["-e", writerSource(markPath, { handleSigterm: true })], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let drainedBefore = 0;
+  let drainedAfter = 0;
+  let termAt = 0;
+  child.stdout.on("data", (d) => ((termAt ? (drainedAfter += d.length) : (drainedBefore += d.length))));
+  child.stderr?.resume();
+
+  assert.ok(await waitForMark(markPath, "child-boot"), "child booted");
+  await new Promise((r) => setTimeout(r, 300)); // mid-burst: the pipe is actively carrying data
+  const tTerm = Date.now();
+  termAt = 1;
+  child.kill("SIGTERM");
+  const res = await Promise.race([
+    new Promise((res) => child.on("exit", (code, signal) => res({ code, signal }))),
+    new Promise((r) => setTimeout(() => r(null), 5_000)),
+  ]);
+  const latency = Date.now() - tTerm;
+
+  assert.ok(res, `child exited within 5 s of SIGTERM (latency ${latency} ms)`);
+  assert.ok(latency < 2_000, `child exited before the deadline it would otherwise have waited out: ${latency} ms`);
+  const marks = readMarks(markPath).map((m) => m.m);
+  assert.ok(marks.includes("handler-entered"), "the handler ran — a drained pipe is what let it: " + marks.join(", "));
+  assert.ok(marks.includes("sigterm-write-ok"), "the handler's own log write completed");
+  assert.ok(drainedAfter > 0, `parent kept draining after the signal (${drainedAfter} bytes) — that is the fix`);
+});
+
+test("releasing our read end hands a stuck writer an error instead of a hang (#196)", async () => {
+  const markPath = drainMark("stuck.jsonl");
+  const child = spawn(execPath, ["-e", writerSource(markPath, { handleSigterm: false })], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", () => {}); // flowing mode: we are draining
+  child.stderr?.resume();
+
+  assert.ok(await waitForMark(markPath, "child-boot"), "child booted");
+  await new Promise((r) => setTimeout(r, 300));
+  // Stop reading: no data listener means the stream pauses and the kernel buffer fills — this is the
+  // "nobody is draining" state. (A listener that ignores its bytes would still drain, which is exactly
+  // the mistake this test exists to keep honest.)
+  child.stdout.removeAllListeners("data");
+  child.stdout.pause();
+  await new Promise((r) => setTimeout(r, 500));
+
+  const tRelease = Date.now();
+  releaseChildStreams([child.stdout]); // the real supervisor exit-path code
+  const res = await Promise.race([
+    new Promise((res) => child.on("exit", (code, signal) => res({ code, signal }))),
+    new Promise((r) => setTimeout(() => r(null), 5_000)),
+  ]);
+  const latency = Date.now() - tRelease;
+
+  assert.ok(res, `stuck writer left within 5 s of the release (latency ${latency} ms)`);
+  assert.equal(res.code, 3, "left through the write error, not some other path: " + JSON.stringify(res));
+  const marks = readMarks(markPath).map((m) => m.m);
+  const errored = marks.find((m) => /^write-errored:/.test(m));
+  assert.ok(errored, "the writer's write failed instead of hanging: " + marks.join(", "));
+  assert.match(errored, /EPIPE|DESTROYED/, "the failure names the closed pipe, not a mystery");
+});
+
+test("releasing already-ended streams is a no-op (normal exit path) (#196)", async () => {
+  const child = spawn(execPath, ["-e", "process.stdout.write('done')"], { stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.resume();
+  child.stderr?.resume();
+  await new Promise((res) => child.on("exit", () => res(null)));
+  assert.doesNotThrow(() => releaseChildStreams([child.stdout, child.stderr]), "a normal exit must not error on release");
 });
