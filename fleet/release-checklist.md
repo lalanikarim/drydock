@@ -62,8 +62,16 @@ Prerequisites in §12 are load-bearing; the two that bite hardest:
 | adapter/transport/supervisor | `m1` two repos, `m2` isolation, `m4` budget, plus §10's shutdown verification |
 | lessons/feedback loop | `g5` — needs a fresh **equivalent pair**, one issue per arm (see `fleet/factory-lessons.md`) |
 
+**Corrected 2026-11-04: two names in that table are not runnable gates.** `gates/behavior-probes.mjs` is a **library**
+(its own header says "deliberately no invocation example: running this file does nothing") — it is read by
+`g2-worker-quality.mjs`. `gates/shutdown-handles.mjs` is a CLI but requires `--fleet <isolated fleet.json>` and, given
+none, prints its usage text and **exits 0**. Invoking either from a script reports green while measuring nothing — the
+third instance of this pattern alongside `registry-targets.mjs` above. Run the gate that *consumes* the library
+(`g2`), and give `shutdown-handles` an isolated fleet file before believing it.
+
 Run gates **sequentially** and capture exit codes; two of nine historical failures were fast `exit 2`s that a naive
-loop scored as done. G5's verdict is not final until both arms' diffs have been read by hand — the classifier can be
+loop scored as done. An `exit 0` from a gate that printed no assertions belongs in the same distrust bucket: check what
+it collected. G5's verdict is not final until both arms' diffs have been read by hand — the classifier can be
 blind to a correct fix (reuse of an existing shared rule was invisible to it until #201).
 
 ## Step 4 — merge, then restart (§8/§10 recipe; this part is not skippable)
