@@ -26,11 +26,45 @@
 // would only hide whether safety came from the guard or from the model behaving.
 export type InstanceGateTier = { tool: string; default?: "prompt"; containment?: "sandbox" };
 
-export type InstanceGatePolicy = { tiers: InstanceGateTier[] };
+/**
+ * Effect-bearing argument paths for the destructive floor (engram#69, vendored in v0.2.3).
+ *
+ * The kernel used to run its payload patterns against EVERY string argument of every call, so a call was judged on
+ * text that merely described something dangerous. In production that blocked: `write` of a test whose cleanup is
+ * `rmSync(dir,{recursive:true})`; `edit` of a file quoting a shell command; `submit_verdict` whose evidence array
+ * quoted the exploit the reviewer had just reproduced; `open_draft_pr` whose summary described device-write
+ * detection. Destructive keys can never be allow-listed, so each false positive cost a fresh human approval — and
+ * the count scaled with how precisely an agent documented risk (18 markers across four stores, 0 destructive
+ * effects).
+ *
+ * Declaring a tool here means the floor judges ONLY the listed arg paths for it. The values are the arguments that
+ * carry the effect; prose is not an effect. `[]` means "nothing this call carries can be destructive".
+ *
+ * What remains enforced for these tools is what actually constrains them: path scope and protected paths (§5.13),
+ * draft-only PR creation, the refusal budget, registry-declared capabilities, and — for merging — merge_pr below,
+ * which is deliberately NOT narrowed: a merge is the one effect in this factory that cannot be undone by closing a
+ * branch, so it keeps both its prompt tier and the full floor.
+ */
+export type InstanceGatePolicy = { tiers: InstanceGateTier[]; destructiveArgs: Record<string, string[]> };
 
 /** The exact object serialized to each instance's gates.json. */
 export function instanceGatesConfig(): InstanceGatePolicy {
   return {
     tiers: [{ tool: "merge_pr" }, { tool: "bash", containment: "sandbox" }],
+    destructiveArgs: {
+      // Both act on an issue number; the rest of their args are relayed prose (a reviewer's instruction may well
+      // quote the payload it is objecting to, which is exactly what blocked #63).
+      delegate: ["issueNumber"],
+      refine_issue: ["issueNumber"],
+      // Pushes the branch derived from this same integer and opens a DRAFT. title/summary are prose; what could
+      // ever be pushed is decided by path scope, not by a substring of the PR description.
+      open_draft_pr: ["issueNumber"],
+      // A verdict is a record of what the reviewer observed, and a review that cannot quote `rm -rf` cannot
+      // reject an `rm -rf`. Same for a lesson note. Neither call has any effect outside its own record.
+      submit_verdict: [],
+      note_lesson: [],
+      // Deliberately absent: merge_pr (the one irreversible effect), pr_status, git_diff, and every kernel tool
+      // not listed — undeclared means the full floor still applies.
+    },
   };
 }
