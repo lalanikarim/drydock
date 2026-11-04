@@ -117,6 +117,15 @@ const CONTRACTS = {
   "62": { domainPaths: ["src/store.mjs"], handlerPaths: ["src/invoices.mjs", "src/server.mjs"] },
   // POST /invoices/batch non-object element leaks an engine message (#63).
   "63": { domainPaths: ["src/store.mjs"], handlerPaths: ["src/invoices.mjs", "src/server.mjs"] },
+
+  // 2026-11-04 pair (fixture#92, verified on a running server with a green suite). Same shape twice: a route passes a
+  // raw query string into a domain function that assumes typed input, and the engine's own error text reaches the client
+  // as a 500. Separate modules because the shared rule an agent could simply wire is exactly what invalidated the last
+  // two traps — a baseline arm reusing an existing helper measures nothing about the feedback loop (#168).
+  //   #93 GET /reports/aging?bucketDays=abc        -> 500 "Invalid array length"    (domain: reporting.mjs)
+  //   #94 GET /exports/invoices?columns=id,customerId -> 500 "columns.join is not a function" (domain: exports.mjs)
+  "93": { domainPaths: ["src/reporting.mjs"], handlerPaths: ["src/server.mjs"] },
+  "94": { domainPaths: ["src/exports.mjs"], handlerPaths: ["src/server.mjs"] },
 };
 
 const DEFAULT_CONTRACT = { domainPaths: ["src/store.mjs"], handlerPaths: ["src/invoices.mjs", "src/server.mjs"] };
