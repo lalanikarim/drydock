@@ -29,6 +29,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { execFileSync } from "node:child_process";
+import type { Readable } from "node:stream";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { loadRootEnv, resolveWebhookSecret, webhookSecretVar } from "../factory/env-file.ts";
 import { createHash } from "node:crypto";
@@ -215,6 +216,19 @@ function spawnProc(name: string, args: string[], env: NodeJS.ProcessEnv): ChildP
   return child;
 }
 
+/**
+ * Stop forwarding and close the read ends we own (#196). Called on every supervisor exit path through the
+ * coordinator's `exit` seam. Destroying the read end is what a child blocked in `write(2)` is waiting for:
+ * its next write fails with EPIPE instead of hanging on a pipe whose reader is gone — bounded teardown,
+ * not a second hang. Safe to call on already-ended streams (a normal exit): destroy is then a no-op.
+ */
+export function releaseChildStreams(streams: Iterable<Readable>): void {
+  for (const s of streams) {
+    s.removeAllListeners("data");
+    s.destroy();
+  }
+}
+
 /** Resolve a fleet-file-relative path against the fleet file's directory. */
 function rel(fleetPath: string, p: string): string {
   return resolve(dirname(fleetPath), p);
@@ -274,6 +288,22 @@ async function runFleet(fleetPath: string): Promise<void> {
   /** key -> pid of a live child. Each pid is also its process group id (#127). */
   const managed = new Map<string, number>();
   /**
+   * key -> the child's stdio streams we own (#196). They are drained for the child's whole life — a child
+   * blocked writing a log line into an undrained pipe never reaches its SIGTERM handler — and released on
+   * every exit path, so that at the deadline a still-blocked writer gets EPIPE instead of hanging on a pipe
+   * whose reader is gone.
+   */
+  const childStreams = new Map<string, Readable[]>();
+  /** Group teardowns begun by THIS shutdown; early exit waits for all of them (grandchildren included). */
+  let pendingTeardowns = 0;
+  const settled = () => managed.size === 0 && pendingTeardowns === 0;
+
+  /** Stop forwarding and close the read ends we own, on every supervisor exit path (#196). See releaseChildStreams. */
+  const releaseAllChildStreams = () => {
+    for (const streams of childStreams.values()) releaseChildStreams(streams);
+    childStreams.clear();
+  };
+  /**
    * repo -> why it stopped booting (#185). Sticky for the life of this process: nothing here can fix a bad
    * config file, so re-spawning is waste and re-alerting is noise. Cleared only by a supervisor restart, which
    * is also the moment the operator has been told about again.
@@ -310,12 +340,20 @@ async function runFleet(fleetPath: string): Promise<void> {
   // The shutdown state machine lives in ./shutdown-coordinator.ts; this is the wiring to real processes.
   const coordinator = createShutdownCoordinator({
     tracked: () => [...managed.keys()],
+    settled,
     terminate: (key) => {
       const pid = managed.get(key);
-      if (pid === undefined) return;
+      if (pid === undefined) return; // reaped between begin()'s snapshot and this call — nothing to wait for
+      pendingTeardowns += 1;
       // Fire-and-forget on purpose: the coordinator's bounded exit timer is what ends this process, and a
-      // teardown that awaits each group serially would blow past that bound.
-      void terminateProcessGroup(pid).then((r) => reportGroup(key, r), (e) => console.error(`[supervisor] ${key}: group teardown failed: ${(e as Error).message}`));
+      // teardown that awaits each group serially would blow past that bound. The finally is what lets early
+      // exit know the group is confirmed empty — exiting before that would orphan grandchildren (#125).
+      void terminateProcessGroup(pid)
+        .then((r) => reportGroup(key, r), (e) => console.error(`[supervisor] ${key}: group teardown failed: ${(e as Error).message}`))
+        .finally(() => {
+          pendingTeardowns -= 1;
+          coordinator.maybeExitEarly();
+        });
     },
     forceKill: (key) => {
       const pid = managed.get(key);
@@ -327,7 +365,12 @@ async function runFleet(fleetPath: string): Promise<void> {
       restartTimers.clear();
     },
     releaseLock: () => lock.release(),
-    exit: (code) => process.exit(code),
+    // Every exit path — early, deadline, second signal, give-up — goes through here, so the streams are
+    // released exactly once and a child blocked writing is handed EPIPE rather than an orphaned pipe (#196).
+    exit: (code) => {
+      releaseAllChildStreams();
+      process.exit(code);
+    },
     log: (line) => console.log(line),
   });
 
@@ -508,6 +551,7 @@ async function runFleet(fleetPath: string): Promise<void> {
     console.log(`[supervisor] starting ${key} — attempt ${restarts.get(key)}`);
     const child = spawnProc(key, args, env);
     managed.set(key, child.pid ?? -1);
+    childStreams.set(key, [child.stdout, child.stderr].filter((s): s is Readable => s !== null));
     // Second reader on the same stream (spawnProc's pump is the first and keeps logging): keep the fault text
     // so a quarantine can name the cause instead of "exit code 1" (#185).
     child.stderr?.on("data", (d: Buffer) => rememberFault(key, String(d)));
@@ -525,7 +569,10 @@ async function runFleet(fleetPath: string): Promise<void> {
     child.on("exit", (code, signal) => {
       const pid = managed.get(key);
       managed.delete(key);
-      if (coordinator.isShuttingDown()) return;
+      if (coordinator.isShuttingDown()) {
+        coordinator.maybeExitEarly(); // the last child out is what may unblock early exit
+        return;
+      }
       bases.delete(f.repo);
       sweepLeftovers(key, pid);
       console.error(`[supervisor] ${key} exited (${signal ?? `code ${code}`}) — restarting in ${RESTART_BACKOFF_MS / 1000}s`);
@@ -552,10 +599,14 @@ async function runFleet(fleetPath: string): Promise<void> {
     console.log(`[supervisor] starting ${key} (port ${a.port}) — attempt ${restarts.get(key)}`);
     const child = spawnProc(key, args, process.env);
     managed.set(key, child.pid ?? -1);
+    childStreams.set(key, [child.stdout, child.stderr].filter((s): s is Readable => s !== null));
     child.on("exit", (code, signal) => {
       const pid = managed.get(key);
       managed.delete(key);
-      if (coordinator.isShuttingDown()) return;
+      if (coordinator.isShuttingDown()) {
+        coordinator.maybeExitEarly(); // the last child out is what may unblock early exit
+        return;
+      }
       sweepLeftovers(key, pid);
       console.error(`[supervisor] ${key} exited (${signal ?? `code ${code}`}) — restarting in ${RESTART_BACKOFF_MS / 1000}s`);
       scheduleRestart(startAdapter);

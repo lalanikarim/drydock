@@ -112,7 +112,15 @@ test("the supervisor's shutdown bound stays armed and a second signal is not swa
   assert.match(src, /createShutdownCoordinator\(/, "teardown must go through the shutdown coordinator");
   const coord = fsRead(new URL("../fleet/shutdown-coordinator.ts", import.meta.url), "utf8");
   assert.match(coord, /setTimer\(\(\) => exit\(exitCode\), graceMs\)(?!\.unref)/, "shutdown deadline must stay ref'd");
-  assert.doesNotMatch(coord, /\bclearTimeout\b/, "the teardown bound must never be cancelled once armed");
+  // #196 evolved the pin: the bound may now be CLEARED — but only inside maybeExitEarly, after settlement is
+  // proven and with exit on the very next line. A bare cancel anywhere else is the old bug (a bound that never
+  // fires while a child handle keeps the loop alive, #125). So: cleared exactly once, in early exit.
+  assert.equal(coord.match(/clearTimer\(deadlineTimer\)/g)?.length ?? 0, 1, "the bound is cleared exactly once — in early exit, nowhere else");
+  assert.match(
+    coord,
+    /function maybeExitEarly\(\)[\s\S]{0,400}clearTimer\(deadlineTimer\);\s*exit\(exitCode\)/,
+    "clearing the bound must be followed immediately by exit — never a bare cancel",
+  );
 
   // A second signal has to reach the coordinator. The old handler opened with `if (shuttingDown) return`,
   // which is why a repeated SIGTERM did nothing and the deploy finished as `kill -9`.

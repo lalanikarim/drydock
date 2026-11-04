@@ -28,13 +28,24 @@
 // its parent watchdog) — teardown ordering, not a leaked handle.
 //
 // The mechanism, found by running this probe twice with different stdio. Redirected to a FILE, the supervisor
-// exits 18–23 ms after SIGTERM. With stdout as a PIPE held by a live parent, it takes 3.2 s — exactly the
-// ref'd deadline — and the surviving resources are 2 PipeWrap + 1 Timeout. That is the answer #110 was
+// exits 18–23 ms after SIGTERM. With stdout as a PIPE held by a live parent, it took 3.2 s — exactly the
+// ref'd deadline — and the surviving resources were 2 PipeWrap + 1 Timeout. That is the answer #110 was
 // asking for: the handle that used to keep the loop alive is a **child's stdio pipe**, and the reason it can
 // stay open is classic — the child blocks writing a log line into a pipe nobody is draining, so it never gets
 // to its own SIGTERM handler. Pre-#108 (unref'd deadline) that combination hung forever; now the timer fires
 // and the supervisor leaves at 3 s regardless. Classification lives in `classifyTeardown`: pipes + a Timeout =
 // bounded by design; pipes with NO timer = the old hang condition; anything else = ours.
+//
+// Result recorded on 2026-11-04, AFTER #196 (same machine, isolated fleet, piped stdio):
+//   at-signal: total=10 {"PipeWrap":7,"ProcessWrap":3} — children + their pipes, nothing else
+//   exit latency: 152–221 ms at TERM points 1 s and 2 s (was the full 3.2 s deadline pre-#196)
+//   past-deadline sample: never emitted
+//   verdict: CLEAN at every TERM point
+// #196's measurement found the supervisor had in fact been draining all along — the pump listeners live for
+// the process lifetime, and children reached their SIGTERM handlers in ~200 ms. What was missing was an
+// early-exit path: the coordinator paid the full deadline even after every child group had settled. It now
+// exits on settlement and releases the read ends on every exit path, so a writer still blocked at the
+// deadline gets EPIPE instead of hanging on a pipe whose reader is gone.
 
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
