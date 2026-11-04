@@ -4,6 +4,26 @@ Refreshed against `main` after PRs #98–#111. The previous version of this file
 
 Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) · 🤖🧑 = I prepare, you execute the last step.
 
+---
+
+# Eleventh refresh — 2026-11-04 (evening)
+
+Verified state: drydock `main` = **`23a3e19`** (611 tests / 610 pass / 0 fail), fleet running that build, fixture `main` = `1378884`. No open drydock PRs. Rows below the tenth refresh are history; the live ordering is:
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **Measure the reviewer lever** — review `agent/issue-96` with one lesson in `lessonsFile`, plus both mandatory controls (empty lessons file; `agent/issue-93`). Full spec: [#168](https://github.com/lalanikarim/drydock/issues/168#issuecomment-6637803181). This closes or kills #168. | 🤖 |
+| 2 | Twin trap pair (same defect shape twice, different parameter names) **only if** rank 1 leaves the prompt question open — the last pair confounded style with location. | 🤖 |
+| 3 | **C4 partial-run recovery** — design anchored at rank 5 of the tenth refresh; largest remaining implementation, needs its own session. | 🤖 |
+| 4 | **#161 emit half** — raise the inference edge from an instance on `modelUnavailable`; naive gate-side alert rejected in writing (re-alerts forever). | 🤖 |
+| 5 | #147 passive (needs a live G4 T2 stall) · #172 upstream kernel owner · #42 design doc 🧑 | mixed |
+
+Closed today: **#204** (frozen settlement watermark — merged `bdf0a4c`, production drained, `engram/task` finally has a family mark), fixture **#87** (via fixture#88 after rebase + live verification). Closed unmerged on purpose: fixture **#89** (arm B's anti-pattern diff; merging it would land the thing G5 exists to detect).
+
+Ship notes for the two behavioral changes now on `main`: `rootFix` is location-aware (`boundaryTypedError` is neither signal), and standing lessons reach the reviewer — **prompt presence proven, behavior not yet**, which is exactly rank 1. Both repos' lessons files are empty today, so live reviews carry none until `note_lesson` records one.
+
+**[`research/handoff.md`](handoff.md)** carries the cold-start version of all this, including the operational gotchas discovered the expensive way (self-matching `pkill`, stacked-PR merge mechanics, draft PRs, CI runner queue stalls).
+
 > **Superseded on 2026-11-01 (evening) by [`production-readiness-2026-11-01.md`](production-readiness-2026-11-01.md)** —
 > current verified state, P0/P1/P2 tiers with effort estimates, the accepted definition of "production-ready", and
 > cold-start operating notes. Rows below marked ✅ have since merged; treat this file as history plus the items the
