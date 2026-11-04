@@ -320,7 +320,11 @@ Wiring `/factory` comments live produced an unrelated and more interesting findi
 
 **Deliberate non-action.** The 34 failures were reviewed and **not** re-driven: they belong to issues already resolved or closed by hand during the outage window, and bulk redelivery would have dispatched work for dead tickets. Recovery is surgical from here — that is why `--only` exists and why the default is a report.
 
-**Still open:** putting the sweep on a schedule (a cadence decision plus a cron/launchd unit), and explaining why a child handle keeps the loop alive at shutdown — today that is bounded to 3s by a ref'd deadline rather than understood.
+**Still open:** putting the sweep on a schedule (a cadence decision plus a cron/launchd unit), and ~~explaining why a child handle keeps the loop alive at shutdown — today that is bounded to 3s by a ref'd deadline rather than understood~~.
+
+> **Closed 2026-11-04 (#196/#198).** The premise was wrong: no handle was leaking and nothing kept the loop alive past
+> child settlement. The coordinator simply had no way to ask "is there anything left to wait for?", so the 3 s bound
+> was paid in full on every shutdown. See the 2026-11-04 entry below for the measurement.
 
 
 ---
@@ -366,6 +370,48 @@ incidents.
 gate whose claim starting to depend on protection existing (at which point the gate is lying and must be fixed
 or moved). Do not answer any of these by flipping `autoMerge:false` in place — that trades an integrity risk for
 a silent loss of coverage, which is the worse of the two.
+
+---
+
+## 2026-11-04 — #196: the shutdown defect was a missing early-exit edge, not undrained pipes
+
+**Context.** #110's hang had been bounded rather than understood since 2026-11-01: a ref'd 3 s deadline made shutdown
+*finish*, which is not the same as making it *fast*. The #195 probe identified the handle class (a child's stdio pipe)
+and #196 was written from that finding with a recipe — "drain-until-deadline instead of unhook-and-go" — on the theory
+that the supervisor stopped draining at its deadline and children died blocked on a full pipe.
+
+**What measurement said.** The recipe's mechanism is wrong, and it was wrong before anyone built anything. On an
+isolated repro fleet with piped stdio, factory children reached their `SIGTERM` handlers in ~189 ms and the adapter in
+~224 ms **with the parent's own pipe unread** — nobody was blocked on draining. The coordinator had no `settled()`
+question to ask, so the bound was paid unconditionally.
+
+**Decision.** Ship the diagnosis that measurement supports rather than the one the issue proposed: an early-exit edge
+in `fleet/shutdown-coordinator.ts` (`maybeExitEarly()`, gated on an injected `settled()` defaulting to `false` so every
+existing caller keeps the old behavior exactly), with the deadline left armed and ref'd as the backstop for a genuinely
+hung child (#108/#125 unchanged). The stream-release half of the original recipe still ships, because that failure mode
+*does* exist: a writer still blocked at the deadline must get `EPIPE` instead of hanging on a pipe whose reader is gone.
+Both edges go through one release seam so teardown happens exactly once.
+
+**Evidence, both sides on the real fleet (file-backed stdout, not the repro harness).**
+
+```console
+# old build bdf7e49 — TERM
+exit latency: 3248 ms          # matches the PR's pre-fix 3243 ms; nothing was ever leaking
+
+# new build 1c123d2 — TERM
+exit latency: 224 ms
+[supervisor] all child groups settled — exiting early (deadline was 3000 ms)
+factory/main.ts remaining: 0 · listeners on :9700: 0 · routes.json.lock: gone
+```
+
+14× faster, and the improvement is *larger* in production than the piped-stdio repro predicted, which is the tell that
+pipes were never the cause. Success criterion was met as written (probe reads `clean`, not `bounded`); the number just
+came from a different mechanism than the one filed.
+
+**The general rule.** An issue's recipe is a hypothesis written before the measurement. When the fix and the diagnosis
+disagree, the fix has to follow the measurement — and the issue text gets corrected rather than quietly satisfied, or
+the next person reads "undrained pipes" and goes looking for a drain. Third time this week the recorded diagnosis lost
+an argument to a running process (#164's abort placement, #157's phantom reservation, this).
 
 ---
 
