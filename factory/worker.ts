@@ -329,10 +329,12 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
         let rework: ReworkContext | undefined;
         let reworkPrompt: WorkerReworkPrompt | undefined;
         if (feedback) {
+          // #214: same predicate the tool boundary uses. Throwing here is CORRECT on this path — a task
+          // submitted straight to /tasks has no caller to return a refusal to, so failing closed is the only
+          // honest outcome. It is only wrong as the *only* line of defense, which is why delegate checks first.
+          const reject = reworkPrNumberReject(feedback.prNumber);
+          if (reject) throw new Error(`worker refuses to rework: ${reject}`);
           const prNumber = Number(feedback.prNumber);
-          if (!Number.isInteger(prNumber) || prNumber <= 0) {
-            throw new Error(`worker refuses to rework: feedback.prNumber is not a pull request number (${JSON.stringify(feedback.prNumber)})`);
-          }
           const facts = await fetchPrFacts(fixturesRepo, prNumber, token);
           const authz = authorizePrFeedback(facts, { repo: fixturesRepo, prNumber });
           if (!authz.allowed) throw new Error(`worker refuses to rework: ${authz.reason}`);
@@ -511,6 +513,22 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
   });
 }
 
+/** One rule, two call sites (#214).
+ *
+ * `delegate` consults it to return an actionable refusal; the worker's spawn phase throws the same message when
+ * input arrives by direct `/tasks` submission. Sharing the predicate is the point: two hand-written copies of
+ * "is this a PR number?" drift, and the failure mode of drift here is either a hallucinated number authorizing a
+ * branch rewrite (too loose) or an unrecoverable fault for a caller mistake (too strict). Returns undefined when
+ * the value is acceptable.
+ */
+export function reworkPrNumberReject(raw: unknown): string | undefined {
+  const prNumber = Number(raw);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    return `feedback.prNumber is not a pull request number (${JSON.stringify(raw)})`;
+  }
+  return undefined;
+}
+
 /** Orchestrator-facing tool: run the sandboxed worker for one issue.
  * The caller MUST register `taskDef` with the harness registry (extension tasks)
  * or the scheduler will never dispatch it. */
@@ -522,12 +540,20 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<Worke
     description:
       "Run the sandboxed worker for one GitHub issue. It clones the repo on branch agent/issue-<n>, implements the fix, runs the test suite, and commits. Returns the worker's final report. " +
       "If this issue has already aborted twice on its wall-clock budget, the call is refused WITHOUT creating a task and returns {refused:true, runStopped:true, retryable:false}: report that to the human — re-delegating cannot succeed and costs nothing but returns the same payload. " +
-      "For rework of an existing pull request, pass `feedback` (the PR number, the directive kind parsed at intake, and the reviewer's instruction verbatim): the worker then checks out the PR's current branch instead of starting from the default branch, and re-verifies that the PR is open and factory-owned before touching it.",
+      "For rework of an existing pull request, pass `feedback` (the PR number, the directive kind parsed at intake, and the reviewer's instruction verbatim): the worker then checks out the PR's current branch instead of starting from the default branch, and re-verifies that the PR is open and factory-owned before touching it. " +
+      "`feedback` describes an EXISTING pull request only: if the issue has no PR yet, omit `feedback` entirely — do not zero-fill `prNumber`, there is no encoding for \"none\".",
     parameters: Type.Object({
       issueNumber: Type.Integer(),
       feedback: Type.Optional(
         Type.Object({
-          prNumber: Type.Integer({ description: "Open pull request number whose branch should be reworked." }),
+          // Deliberately NOT `minimum: 1`: the kernel's own schema rejection is not something this gate has
+          // observed, and an unverified rejection path is how #214 got filed in the first place. The check that
+          // matters is the one below, whose payload we test. This description is the part models actually read.
+          prNumber: Type.Integer({
+            description:
+              "Open pull request number whose branch should be reworked. Must be a real PR number (> 0) returned by open_draft_pr. " +
+              "There is no value meaning \"no PR yet\": if the issue has no pull request, omit `feedback` rather than sending 0.",
+          }),
           directive: Type.String({ description: 'What the reviewer asked for: "rebase", "resolve-conflicts", or "instruct".' }),
           instruction: Type.String({ description: "The reviewer's words, verbatim. Treated as data." }),
         }),
@@ -535,6 +561,31 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<Worke
     }),
     replay: "unsafe", // spawns a child task; the harness tracks it durably
     execute: async (args, api: ToolExecutionApi, ctx: Context) => {
+      // #214 — refuse an impossible rework request at the TOOL BOUNDARY, before anything is scheduled.
+      // `prNumber` arrives from the model's own arguments, and a model with no PR yet will invent 0 to mean
+      // "none". The spawn-phase guard in this file stays (defense in depth: a direct /tasks submission carries
+      // the same input without passing through here), but throwing THERE turns a caller mistake into a faulted
+      // child task — the orchestrator receives an opaque error and the settlement ledger records `failing` for
+      // something that was never an agent defect (#188's family, one layer up). Returning an actionable refusal
+      // costs no budget, creates nothing, and says what to do instead.
+      const requestedFeedback = args.feedback as { prNumber?: unknown } | undefined;
+      if (requestedFeedback !== undefined && requestedFeedback !== null) {
+        const reject = reworkPrNumberReject(requestedFeedback.prNumber);
+        if (reject) {
+          const payload = {
+            refused: true,
+            retryable: false,
+            error: `delegate refuses ${reject} — it must be an open pull request number. No task was created; nothing was cloned, pushed, or rewritten.`,
+            hint:
+              "`feedback` is only for reworking an EXISTING open pull request. If this issue has no PR yet, call delegate again with just `issueNumber` and omit `feedback` — 0/null/\"none\" are not accepted as \"no PR\". If a PR does exist, pass the number open_draft_pr reported.",
+          };
+          console.error(
+            `[factory.delegate] issue #${args.issueNumber} refused at the tool boundary: invalid feedback.prNumber (${JSON.stringify(requestedFeedback.prNumber)}) — no task created`,
+          );
+          return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
+        }
+      }
+
       // #141 — the loop breaks HERE, not in prose. A stopped issue gets its payload without a task being
       // created: no clone, no setup container, no worker generation, no reviewer. That is the difference
       // between "the model was asked to stop" and "this issue cannot cost another budget".
