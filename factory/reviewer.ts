@@ -35,6 +35,7 @@ import { awaitIdleWithinBudget } from "./budgets.ts";
 import { cloneUrlWithAuth, createGitAuth, gitAuthEnv, type GitAuth } from "./github-auth.ts";
 import { wrapUntrusted } from "./untrusted.ts";
 import { abortedOutcome, isRestartAbort, type AbortFacts } from "./task-contract.ts";
+import { blockedOutcomeFor, findBlocksInTaskContext, type ApprovalBlockedFacts } from "./approval-state.ts";
 
 const pExecFile = promisify(execFile);
 async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -203,7 +204,12 @@ export type ReviewerInput = {
  * What a review leaves in the task record: the verdict, or the facts beside an abort (#173 — `abortedOutcome`
  * carries `result`, and TaskOutcome puts durable extras there, so R has to admit both shapes).
  */
-export type ReviewerResult = ReviewVerdict | AbortFacts;
+/**
+ * What a finished review stage carries: a verdict, abort facts, or the approval-block record (#188). The third member
+ * exists because `TaskOutcome.result` is typed by this union — without it, "a gate refused submit_verdict" could not be
+ * recorded at all and the store would keep saying the model failed.
+ */
+export type ReviewerResult = ReviewVerdict | AbortFacts | ApprovalBlockedFacts;
 
 /** Durable checkpoint: no conversation until spawn commits one. */
 export type ReviewerState =
@@ -300,6 +306,22 @@ export function factoryReviewerTask({ workDir, fixturesRepo, image = "factory-sa
           const verdict = verdictRegistry.get(convId);
           verdictRegistry.delete(convId);
           if (!verdict) {
+            // A missing verdict has two very different causes, and conflating them cost an hour of inference per
+            // occurrence (#188): the reviewer either declined to call `submit_verdict`, or it called it and a gate
+            // refused. In the second case the tool never ran, so no factory code executed at the block — but the
+            // kernel wrote an approval marker into the committed transcript, which is what this read finds.
+            //
+            // The outcome stays `failed` (the run genuinely did not complete) and the *result* carries the machine
+            // facts: `TaskOutcome` is a closed union of completed|failed|aborted, so "blocked" cannot be a kernel
+            // status. Downstream consumers — open_draft_pr's refusal, the refusal budget, the settlement window —
+            // branch on `result.blocked`, and each of them now distinguishes a policy wall from an agent defect.
+            const blocks = await findBlocksInTaskContext(() => runtime.context(convId, ctx) as never);
+            const outcome = blockedOutcomeFor(blocks, "submit_verdict", "review");
+            if (outcome) {
+              console.error(`[factory.reviewer] issue #${task.input.issueNumber}: ${outcome.error.message}`);
+              await runtime.commit(() => ({ status: "terminal", outcome }), ctx);
+              return;
+            }
             await runtime.commit(
               () => ({ status: "terminal", outcome: { status: "failed", error: { message: "reviewer never called submit_verdict" } } }),
               ctx,

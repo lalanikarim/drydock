@@ -135,3 +135,44 @@ test("the terminal payload tells the model to stop and the human what to change"
   assert.match(String(payload.hint), /Do not re-delegate/);
   assert.match(String(payload.hint), /pathAllowlist/, "the human route out of the stop is named in the payload");
 });
+
+// --------------------------------------------------------------------------- #188: approval blocks
+
+const blockSig = (key) => ({ class: "approval_blocked", reason: `review blocked pending approval ${key} (submit_verdict)`, approvalKey: key });
+
+test("#188 classification: an approval block is neither retryable nor counted", () => {
+  assert.equal(isRetryable({ class: "approval_blocked", approvalKey: "aabbccddeeff" }), false,
+    "the key is sha1(tool + exact args): a reworded retry asks a question nobody has answered");
+  const budget = new RefusalBudget();
+  const rec = budget.note(63, blockSig("aabbccddeeff"));
+  assert.equal(rec.count, 0, "not charged to the identical-signature budget");
+  assert.equal(rec.total, 0, "not charged to the per-issue total either — a policy wall must not consume a task's budget (#188)");
+  assert.equal(rec.retryable, false);
+  assert.equal(rec.terminal, false, "one block is information; the run stops by not being retryable, not by exhausting a budget");
+});
+
+test("#188 signature: identity is the approval key, so 'same wall again' is detectable", () => {
+  assert.equal(refusalSignature(blockSig("aabbccddeeff")), "approval_blocked:aabbccddeeff");
+  assert.notEqual(refusalSignature(blockSig("112233445566")), refusalSignature(blockSig("aabbccddeeff")),
+    "a different key is a genuinely different question being asked of the operator");
+  // Without a key there is no identity to claim — fall back, never invent one.
+  assert.equal(refusalSignature({ class: "approval_blocked", reason: "blocked" }), "approval_blocked:not-counted");
+});
+
+test("#188 budget isolation: a block does not stop a later, genuinely-retryable failure from getting its budget", () => {
+  const budget = new RefusalBudget();
+  budget.note(63, blockSig("aabbccddeeff"));
+  const first = budget.note(63, { class: "verification", reason: "exited 1" });
+  assert.equal(first.total, 1, "the block must not have consumed the issue's only allowance");
+  assert.equal(first.retryable, true);
+});
+
+test("regression guard: infrastructure refusals stay uncounted AND retryable after #188 split those axes", () => {
+  // #188 replaced a hardcoded `retryable: true` on the uncounted path with the computed value. Infrastructure must be
+  // unaffected by that refactor — if this goes red, transient faults have started suppressing retries.
+  const budget = new RefusalBudget();
+  const rec = budget.note(5, { class: "infrastructure", reason: "cannot compute merge base" });
+  assert.equal(rec.count, 0);
+  assert.equal(rec.total, 0);
+  assert.equal(rec.retryable, true);
+});

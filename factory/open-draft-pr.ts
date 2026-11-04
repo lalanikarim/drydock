@@ -90,6 +90,7 @@ async function workerReportFromTranscript(api: ToolExecutionApi, ctx: Context): 
 // optional evidence/concerns while reviewer.ts declared them required — two names for one wire shape, neither side
 // noticing the other change (#173).
 import type { ReviewerInput, ReviewerResult, ReviewerState, ReviewVerdict } from "./reviewer.ts";
+import { readBlockedFromOutcome } from "./approval-state.ts";
 export type { ReviewVerdict };
 
 /** G4 evidence packager: every non-obvious section of the PR body, assembled from
@@ -388,6 +389,30 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       const settled = await api.waitForTask(reviewId, ctx);
       const outcome = settled.state.outcome;
       const verdict = (outcome?.status === "completed" ? (outcome.result as ReviewVerdict) : null) ?? null;
+
+      // A review that produced no verdict is either an agent defect or a policy wall, and the two must not be charged
+      // to the same budget (#188). The reviewer records `outcome.result.blocked` when a gate refused `submit_verdict`,
+      // which is what distinguishes them here. Retrying a block is guaranteed waste: the approval key is
+      // sha1(tool + exact args), so every reworded attempt asks a question nobody has answered — that hour of inference
+      // was the incident this row exists for. Hence class `approval_blocked`: not counted, not retryable.
+      const reviewBlock = readBlockedFromOutcome(outcome);
+      if (reviewBlock) {
+        const why = `review blocked pending approval ${reviewBlock.key} (${reviewBlock.tool}${reviewBlock.tier ? `, ${reviewBlock.tier}` : ""})`;
+        const { text, rec } = charged(
+          { class: "approval_blocked", reason: why, approvalKey: reviewBlock.key },
+          { refused: true, blockedOnApproval: reviewBlock, review: { error: why } },
+        );
+        await report({
+          outcome: "refused",
+          previousHead: existingPr?.headRefOid ?? null,
+          newHead: null,
+          refusalReason: `${why} — approve it (POST /approvals/${reviewBlock.key}) and re-run; a retry without the approval cannot succeed`,
+          reviewVerdict: "blocked on approval",
+          runStopped: rec.terminal,
+        });
+        return { output: [{ type: "text" as const, text }] };
+      }
+
       if (!verdict || verdict.verdict !== "pass") {
         const reviewReason = verdict ? (verdict.concerns ?? []).join(" | ") || verdict.verdict : "review did not settle";
         const { text, rec } = charged({ class: "review", reason: reviewReason }, { refused: true, review: verdict ?? { error: "review did not settle" } });
