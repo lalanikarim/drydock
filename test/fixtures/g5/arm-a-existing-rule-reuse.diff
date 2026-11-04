@@ -1,0 +1,106 @@
+diff --git a/README.md b/README.md
+index bada10e..7fe98ed 100644
+--- a/README.md
++++ b/README.md
+@@ -20,7 +20,7 @@ Requires Node >= 22.19. No dependencies.
+ |---|---|---|
+ | `/health` | GET | Liveness check |
+ | `/invoices` | POST | Create invoice `{ customerId, amountCents, status? }` → `201` with the stored invoice; unknown body fields are rejected with `400` `{ "error": "unsupported field: <name>" }` naming the first offending key (same rule as `PATCH /invoices/:id`) |
+-| `/invoices/batch` | POST | Atomic bulk create `{ invoices: [ { customerId, amountCents }, … ] }` → `201` with `{ invoices: […] }` in request order; if any element is invalid nothing is created and the response is `400` naming the offending index (e.g. `"invoices[1]: amountCents must be a positive integer"`); empty array, non-array, or missing `invoices` → `400` |
++| `/invoices/batch` | POST | Atomic bulk create `{ invoices: [ { customerId, amountCents }, … ] }` → `201` with `{ invoices: […] }` in request order; if any element is invalid nothing is created and the response is `400` naming the offending index (e.g. `"invoices[1]: amountCents must be a positive integer"`); empty array, non-array, or missing `invoices` → `400`; unknown top-level fields other than `invoices` are rejected with `400` `{ "error": "unsupported field: <name>" }` naming the first offending key (same rule as `POST /invoices` and `PATCH /invoices/:id`) |
+ | `/invoices` | GET | List invoices as `{ invoices, totalCount }`; `totalCount` is the number of invoices matching the active `?status=`/`?customer=` filters before `?limit=N`/`?offset=N` pagination (non-positive/non-integer `limit` or negative/non-integer `offset` → 400). Optional `?sort=amountCents&dir=asc|desc` orders the filtered list by amount (`dir` defaults to `asc`; unknown `sort` field or `dir` value → 400); sorting happens before `limit`/`offset`. Without `sort`, invoices are listed in id-ascending order || `/invoices/:id` | GET | Fetch one invoice |
+ | `/invoices/:id/status` | PUT | Transition status `{ status }` |
+ | `/invoices/:id` | PATCH | Update `amountCents` on an open invoice (`200` with the updated invoice; `409` if paid/voided; `404` for unknown ids) |
+diff --git a/src/invoices.mjs b/src/invoices.mjs
+index 2247960..929efa5 100644
+--- a/src/invoices.mjs
++++ b/src/invoices.mjs
+@@ -51,6 +51,7 @@ class UnsupportedFieldError extends Error {
+ // allowed" lives in one place and cannot drift into two implementations.
+ const CREATE_FIELDS = new Set(["customerId", "amountCents", "status"]);
+ const UPDATE_FIELDS = new Set(["amountCents"]);
++const BATCH_FIELDS = new Set(["invoices"]);
+ 
+ // Rejects the first unknown body key (in JSON document order) with a 400
+ // naming it: { "error": "unsupported field: <name>" }. Known-field
+@@ -101,6 +102,10 @@ export async function createInvoicesBatch(store, req, res) {
+   if (body === null || typeof body !== "object" || Array.isArray(body)) {
+     throw Object.assign(new Error("request body must be a JSON object"), { statusCode: 400 });
+   }
++  // Same unknown-field rule as POST /invoices and PATCH, applied to the
++  // envelope around the invoices array so a typo'd top-level key is named
++  // instead of silently ignored.
++  rejectUnknownFields(body, BATCH_FIELDS);
+   if (!Array.isArray(body.invoices) || body.invoices.length === 0) {
+     throw Object.assign(new Error('body must include a non-empty "invoices" array'), { statusCode: 400 });
+   }
+diff --git a/test/api.test.mjs b/test/api.test.mjs
+index 1782c9e..a19eb63 100644
+--- a/test/api.test.mjs
++++ b/test/api.test.mjs
+@@ -1348,6 +1348,43 @@ test("batch create with non-array or missing invoices returns 400", async () =>
+   }
+ });
+ 
++// Issue #87: the batch envelope is checked with the same unknown-field rule
++// as POST /invoices and PATCH — a top-level field other than `invoices` is
++// rejected naming that key, and a rejected batch writes nothing.
++test("batch create rejects an unknown top-level field alongside a valid batch (issue #87)", async () => {
++  const before = await api("GET", "/invoices");
++  const res = await api("POST", "/invoices/batch", {
++    invoices: [{ customerId: "batch-env-1", amountCents: 50 }],
++    nope: 1,
++  });
++  assert.equal(res.status, 400);
++  assert.equal(res.body.error, "unsupported field: nope");
++  // A rejected batch leaves nothing behind.
++  const after = await api("GET", "/invoices");
++  assert.equal(after.body.totalCount, before.body.totalCount);
++  assert.ok(!after.body.invoices.some((i) => i.customerId === "batch-env-1"));
++});
++
++test("batch create names the first unknown top-level key in body order (issue #87)", async () => {
++  const res = await api("POST", "/invoices/batch", {
++    customorId: "c",
++    invoices: [{ customerId: "batch-env-2", amountCents: 50 }],
++  });
++  assert.equal(res.status, 400);
++  assert.equal(res.body.error, "unsupported field: customorId");
++});
++
++test("batch create well-formed batch still succeeds (issue #87)", async () => {
++  const before = await api("GET", "/invoices");
++  const res = await api("POST", "/invoices/batch", {
++    invoices: [{ customerId: "batch-ok-1", amountCents: 10 }],
++  });
++  assert.equal(res.status, 201);
++  assert.equal(res.body.invoices.length, 1);
++  const after = await api("GET", "/invoices");
++  assert.equal(after.body.totalCount, before.body.totalCount + 1);
++});
++
+ // Issue #72: a batch element that is valid JSON but not an object (null,
+ // string, array) must be rejected with the same shape-describing message and
+ // invoices[i]: prefix — never with engine-internal text like V8's
+@@ -1368,8 +1405,10 @@ test("batch create rejects every non-object element consistently (issue #72)", a
+   assert.ok(!after.body.invoices.some((i) => i.customerId === "shape-ok"));
+ });
+ 
+-// The guard lives in the shared LedgerStore.validate, so POST /invoices
+-// reports a non-object body the same way instead of leaking V8's wording.
++// POST /invoices rejects a null (non-object) body with a shape-describing
++// 400 instead of leaking V8's internal destructuring wording. createInvoice
++// guards non-object bodies up front, so the message is the shared
++// "request body must be a JSON object" (see issue #71).
+ test("POST /invoices rejects a null body without engine-internal text (issue #72)", async () => {
+   const res = await fetch(`http://127.0.0.1:${ctx.port}/invoices`, {
+     method: "POST",
+@@ -1378,7 +1417,7 @@ test("POST /invoices rejects a null body without engine-internal text (issue #72
+   });
+   assert.equal(res.status, 400);
+   const body = await res.json();
+-  assert.equal(body.error, "invoice must be an object");
++  assert.equal(body.error, "request body must be a JSON object");
+ });
+ 
+ test("requests with no body are treated as {} (not a size error)", async () => {

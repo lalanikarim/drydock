@@ -115,6 +115,42 @@ export function detectsDomainGuard(domainLines) {
   return false;
 }
 
+/**
+ * An existing shared rule, wired into the path that had none — the fourth shape, and the one the classifier could not
+ * see on 2026-11-04. Arm A (the *no-lesson* arm) fixed fixture #87 by adding `const BATCH_FIELDS = new Set(["invoices"])`
+ * and calling the module's existing `rejectUnknownFields(body, BATCH_FIELDS)` from the batch handler: one rule, now
+ * enforced on every path, with the contract updated in README. It read as neither root fix nor handler patch, because
+ * every previous root-fix signal requires something **new** to appear — a declared error class, a declared guard,
+ * a guard inside a domain file. Reuse is invisible by construction, and reuse is exactly what a codebase that already
+ * has the helper should produce.
+ *
+ * That blind spot is asymmetric in the worst direction: it under-credits the good shape, so G5 can only ever be
+ * disappointed by fixes it cannot see, and a lesson encouraging reuse looks like no improvement.
+ *
+ * Deliberately narrow, because "called some function that sounds validating" is how a rubber stamp is born. Requires
+ * BOTH, in the same diff:
+ *
+ *   - an added call to an identifier named like a rule (`reject…`/`validate…`/`assert…`/`check…`/`enforce…`) that this
+ *     diff does **not** declare — so it is pre-existing and shared, not a helper written for the occasion; and
+ *   - an added rule set the call consults (`new Set([...])`, or an added constant passed as an argument), which is what
+ *     distinguishes "the rule now covers this path" from "we called something validation-ish in a catch".
+ *
+ * It cannot tell, from a diff alone, whether the newly-covered path is the *right* path. G5 already requires a human to
+ * read both arms' diffs; this signal says "look here, this looks structural", not "no need to look".
+ */
+export function detectsExistingRuleReuse(lines) {
+  const text = lines.join("\n");
+  const declared = new Set([...text.matchAll(/^\+\s*(?:export\s+)?function\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]));
+  const addsRuleSet = /^\+\s*(?:export\s+)?const\s+[A-Z0-9_]+\s*=\s*new\s+Set\s*\(/m.test(text);
+  for (const m of text.matchAll(/^\+\s*.*?\b((?:reject|validate|assert|check|enforce)[A-Za-z0-9_$]*)\s*\(/gm)) {
+    const name = m[1];
+    if (declared.has(name)) continue; // defined by this diff — that is detectsSharedRule's case
+    const passedArgs = /,\s*[A-Z][A-Z0-9_]*\s*\)/.test(m[0]);
+    if (addsRuleSet || passedArgs) return { name, evidence: addsRuleSet ? "declared a rule set for it" : "passed an existing rule set" };
+  }
+  return null;
+}
+
 /** The anti-pattern: status attached where the error was caught, rather than carried by the error. */
 export function detectsHandlerPatch(lines) {
   const reasons = [];
@@ -156,10 +192,11 @@ export function classifyFixPattern(diff, contract = {}) {
   const sharedRule = detectsSharedRule(allLines);
   const domainGuard = domainChanged && detectsDomainGuard(domainLines);
   const handlerPatchReasons = detectsHandlerPatch(handlerLines);
+  const ruleReuse = detectsExistingRuleReuse(allLines);
 
   return {
     measured,
-    rootFix: typedError || Boolean(sharedRule) || domainGuard,
+    rootFix: typedError || Boolean(sharedRule) || domainGuard || Boolean(ruleReuse),
     handlerPatch: handlerPatchReasons.length > 0,
     // Why a verdict was reached — printed by the gate so a reviewer can disagree with the classification instead of
     // having to re-derive it from a diff.
@@ -168,6 +205,7 @@ export function classifyFixPattern(diff, contract = {}) {
         ...(typedError ? ["a typed error carrying its own status code was added"] : []),
         ...(sharedRule ? [`validation defined once (${sharedRule.name}) and called from ${sharedRule.callSites} places`] : []),
         ...(domainGuard ? ["a conditional guard was added where the rule lives (domain path)"] : []),
+        ...(ruleReuse ? [`an existing shared rule (${ruleReuse.name}) was wired into a path that had none — ${ruleReuse.evidence}`] : []),
       ],
       handlerPatch: handlerPatchReasons,
     },
@@ -177,6 +215,7 @@ export function classifyFixPattern(diff, contract = {}) {
       typedError,
       domainGuard,
       sharedRule: sharedRule ? sharedRule.name : null,
+      ruleReuse: ruleReuse ? ruleReuse.name : null,
       filesTouched: [...files.keys()],
     },
   };

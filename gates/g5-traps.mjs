@@ -23,14 +23,46 @@
 /**
  * The one thing arm B gets and arm A does not.
  *
- * Formatted the way `note_lesson` writes (`- [date] text`) because `readLessons` hands the content to the worker
- * prompt verbatim, inside a trusted section. It deliberately names no file, no symbol, and no issue number: a lesson
- * that says "in src/store.mjs add statusCode" is an instruction for one historical bug, and whether a worker follows
- * instructions is not the feedback loop. `test/g5-harness.test.mjs` asserts that property so the lesson cannot drift
- * into a per-bug hint without going red.
+ * **This text is a measurement result, not a choice of style.** Three G5 runs (#168, its re-run, #176) compared two
+ * forms against equivalent traps:
+ *
+ * | form | result |
+ * |---|---|
+ * | an abstract principle ("fix the rule where the error originates") | **no change** — arm B patched a handler exactly like arm A, with the lesson verified present in its prompt |
+ * | the same rule carrying an imitable code shape | **root fix**, twice, including once with a deliberately mismatched surface |
+ *
+ * So the default carries a structure to imitate. The earlier abstract sentence is kept at
+ * `test/fixtures/g5/lesson-abstract.md` as the negative control — re-measuring it is one `--lesson-file` away, and it
+ * should not be deleted just because it lost.
+ *
+ * **Why the surface here is value limits rather than request payloads.** The traps are about request payloads. Using a
+ * payload-shaped lesson would make a passing run ambiguous between "the rule transferred" and "the worker matched
+ * vocabulary from the lesson" — which is exactly what #176 existed to separate, and it separated them in favor of
+ * transfer (arm B copied none of the lesson's identifiers and still made the structural move). Keeping the mismatch in
+ * the default means a green canonical run keeps asserting transfer, not pattern-matching.
+ *
+ * Formatted the way `note_lesson` writes (`- [date] text`) because `readLessons` hands the content to the worker prompt
+ * verbatim, inside a trusted section. It names no file, no repository symbol, and no issue number: a lesson that says
+ * "in src/store.mjs add statusCode" is the answer to one bug, and whether a worker follows instructions is not the
+ * feedback loop. `validateLessonText` plus `test/g5-harness.test.mjs` enforce both halves — the prohibition *and* the
+ * presence of an imitable shape — so this cannot drift back into prose or into a per-bug hint without going red.
+ *
+ * What a green G5 does and does not claim is written in `fleet/factory-lessons.md`; n=1 per arm is still true and is
+ * the honest caveat on every one of those runs.
  */
 export const LESSON_TEXT =
-  "- [2026-11-03] When an API returns the wrong status or an internal error string for client input, fix the rule where the error originates — give the domain error a type that carries its own status, or enforce the check once in a place every path calls. Do not translate errors with instanceof/catch in one request handler: the other paths keep the bug.";
+  "- [2026-11-04] When a value breaks a rule about itself — beyond its limit, not a whole number, a transition that is " +
+  "not allowed — the check belongs beside the rule and raises an error that carries its own status: `class " +
+  "DomainLimitError extends Error { constructor(message, status = 422) { super(message); this.statusCode = status; } }`. " +
+  "Define one guard and call it wherever the rule is known:\n\n" +
+  "      function assertWithinRange(value, max, what) {\n" +
+  "        if (typeof value !== \"number\" || !Number.isInteger(value) || value > max) {\n" +
+  "          throw new DomainLimitError(`${what} must be a whole number no greater than ${max}`);\n" +
+  "        }\n" +
+  "        return value;\n" +
+  "      }\n\n" +
+  "  Every caller then reports what the rule already says. Reformatting an error where it happens to be caught fixes " +
+  "only the path that caught it, and the next caller repeats the mistake.";
 
 /**
  * Identifiers belonging to the current traps. A lesson that contains one has stopped being a lesson and become the

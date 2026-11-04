@@ -1,0 +1,69 @@
+diff --git a/src/invoices.mjs b/src/invoices.mjs
+index 2247960..7d75995 100644
+--- a/src/invoices.mjs
++++ b/src/invoices.mjs
+@@ -186,6 +186,13 @@ export async function getInvoice(store, req, res, id) {
+ 
+ export async function setInvoiceStatus(store, req, res, id) {
+   const body = await readJsonBody(req);
++  // A body that is valid JSON but not an object (null, a string, an array,
++  // ...) is rejected with one shape-describing message, matching the other
++  // invoice endpoints, instead of leaking engine-internal wording from the
++  // property access below.
++  if (body === null || typeof body !== "object" || Array.isArray(body)) {
++    throw Object.assign(new Error("request body must be a JSON object"), { statusCode: 400 });
++  }
+   if (typeof body.status !== "string") {
+     throw Object.assign(new Error('body must include a string "status"'), { statusCode: 400 });
+   }
+diff --git a/test/api.test.mjs b/test/api.test.mjs
+index 1782c9e..808d622 100644
+--- a/test/api.test.mjs
++++ b/test/api.test.mjs
+@@ -1368,8 +1368,9 @@ test("batch create rejects every non-object element consistently (issue #72)", a
+   assert.ok(!after.body.invoices.some((i) => i.customerId === "shape-ok"));
+ });
+ 
+-// The guard lives in the shared LedgerStore.validate, so POST /invoices
+-// reports a non-object body the same way instead of leaking V8's wording.
++// The top-level shape guard in createInvoice reports a non-object body with
++// the same message as the other invoice endpoints (issue #71) instead of
++// leaking V8's wording.
+ test("POST /invoices rejects a null body without engine-internal text (issue #72)", async () => {
+   const res = await fetch(`http://127.0.0.1:${ctx.port}/invoices`, {
+     method: "POST",
+@@ -1378,7 +1379,33 @@ test("POST /invoices rejects a null body without engine-internal text (issue #72
+   });
+   assert.equal(res.status, 400);
+   const body = await res.json();
+-  assert.equal(body.error, "invoice must be an object");
++  assert.equal(body.error, "request body must be a JSON object");
++});
++
++// Issue #86: PUT /invoices/:id/status must reject a body that is valid JSON
++// but not an object (null, string, number, boolean, array) with the same
++// shape-describing 400 as POST /invoices, POST /invoices/batch and PATCH
++// /invoices/:id — never engine-internal wording, never a 5xx — and must leave
++// the invoice unchanged.
++test("PUT status rejects every non-object JSON body with one shape message (issue #86)", async () => {
++  const created = await api("POST", "/invoices", { customerId: "shape-put-c1", amountCents: 100 });
++  for (const raw of ["null", '"nope"', "42", "true", "[1,2]"]) {
++    const res = await fetch(`http://127.0.0.1:${ctx.port}/invoices/${created.body.id}/status`, {
++      method: "PUT",
++      headers: { "content-type": "application/json" },
++      body: raw,
++    });
++    assert.equal(res.status, 400);
++    const body = await res.json();
++    assert.equal(body.error, "request body must be a JSON object");
++    // No engine-internal wording reaches the client.
++    assert.ok(!/cannot read properties/i.test(body.error));
++  }
++  // Rejected requests leave the invoice and its history unchanged.
++  const after = await api("GET", `/invoices/${created.body.id}`);
++  assert.equal(after.status, 200);
++  assert.equal(after.body.status, "open");
++  assert.deepEqual(after.body.history, [{ from: null, to: "open" }]);
+ });
+ 
+ test("requests with no body are treated as {} (not a size error)", async () => {

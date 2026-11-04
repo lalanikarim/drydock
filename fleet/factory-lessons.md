@@ -28,6 +28,13 @@ Prose around it is fine. Prose *instead* of it is what failed.
 | fixture #62 / #63 | `handlerPatch` | **`handlerPatch`** — no change (#168) | — |
 | fixture #71 / #72 | `handlerPatch` | — | **`rootFix`** (PR #74) |
 | fixture #71 / #72 (re-run) | `handlerPatch` | — | **`rootFix`** with a *mismatched-surface* recipe (PR #83, #176) |
+| fixture #87 / #86 (2026-11-04) | **neither** — and it was the best diff of the run (see below) | — | `handlerPatch`, lesson verified in the prompt. **Run void: base suite red 1/126** |
+
+The last row is kept although it proves nothing, because the two reasons it proved nothing are the operational content:
+fixture `main` was failing before either arm started (so "make the suite green" became an unstated task for both arms),
+and arm A's fix — wiring the module's *existing* shared rule into the path that lacked one — was invisible to a classifier
+whose signals all require new code. Reuse is now a root-fix signal (`detectsExistingRuleReuse`, with both diffs captured as
+fixtures); a lesson encouraging reuse in a repo that already has the helper was structurally unable to be credited.
 
 The third row is the one that matters for how to write lessons. The lesson described limits on a value
 (`assertWithinRange`, `DomainLimitError`, 422s) while the trap was about request payloads. The worker copied **zero** of
@@ -35,6 +42,23 @@ those identifiers and made the structurally same move: it put one conditional gu
 function every call path already goes through, which closed *both* traps with a single change — verified against a
 running server (`POST /invoices` and `POST /invoices/batch` both answering with shape wording, suite 125/125). So the
 transfer is real at n=1: **structure carries, surface does not need to match.**
+
+## The default follows this rule (#168)
+
+`LESSON_TEXT` in `gates/g5-traps.mjs` — the text arm B gets when no `--lesson-file` is passed — used to be the abstract
+principle that the second row of the table above shows changing nothing. It now carries the shape: a typed error with its
+own status plus one guard to define once, written on **value limits**, not request payloads.
+
+The mismatched surface is deliberate and is asserted by test. If the default spoke the traps' language, a green run would
+be ambiguous between "the rule transferred" and "the worker matched vocabulary from the lesson" — row three exists to
+keep that ambiguity out of the default. Re-measuring either form is one flag away:
+
+- abstract negative control: `test/fixtures/g5/lesson-abstract.md` (kept, with its own note; it lost, it is not deleted)
+- imitable payload-surface variant: `test/fixtures/g5/lesson-imitable.md`
+
+What a green canonical G5 now claims: the feedback loop delivers a lesson, and that lesson changes what the worker does.
+What it never claims: that the factory learns on its own, or anything at n>1. Three data points, one model, one
+repository — and every one of them cost a pair of issues.
 
 ## What still must not be in a lesson
 
@@ -57,6 +81,15 @@ lessons" and adds no section at all.
 
 `npx tsx gates/g5-feedback.mjs --repo lalanikarim/factory-fixture --issue-a <trap> --issue-b <equivalent-trap>
 --lesson-file <path> --keep`. Traps are consumables (each arm's PR moves fixture `main`), arms must be different issues,
-and a variant lesson goes through the same validator as the default. Verdict semantics: an arm whose diff reads as
+and a variant lesson goes through the same validator as the default. Before spending a run, confirm the traps still exist
+by **running the service**, and confirm the suite is **green** on that commit: issue titles outlive their fixes (both
+historical pairs are closed because merged arms removed the defect from `main`), and a red base silently adds "make the
+tests pass" to every arm's task list. Neither failure looks like a measurement problem from the output — they look like
+results.
+
+Which issue goes to which arm is a measurement choice, not a free variable. `classifyFixPattern` sees a root fix that
+adds a guard in a domain file or declares a shared helper, and is blind to a correct fix that calls an *existing* helper
+from one new site. Put the lesson on the trap whose honest fix the instrument can see, say so in the writeup, and read
+both diffs by hand instead of accepting the printed verdict. Verdict semantics: an arm whose diff reads as
 neither root fix nor handler patch is **inconclusive and fails the run** — since 2026-11-03 the gate can say it does not
 know, because it once reported PASSED for exactly that (#176).
