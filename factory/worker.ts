@@ -52,6 +52,7 @@ import {
 } from "./pr-feedback.ts";
 import { sanitizeUntrusted, wrapUntrusted } from "./untrusted.ts";
 import { abortedOutcome, isRestartAbort } from "./task-contract.ts";
+import { anyBlockedOutcome, findBlocksInTaskContext, type ApprovalBlockedFacts } from "./approval-state.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -292,7 +293,8 @@ export type WorkerState =
  * which persisted but was never promised by anything.
  */
 export type WorkerAbortFacts = { reclaimedAtBoot?: boolean; budgetAborted?: boolean; attempts?: number; retryable?: boolean };
-export type WorkerResult = { answer: string } | WorkerAbortFacts;
+/** A finished worker stage: an answer, abort facts, or the approval-block record (#188). */
+export type WorkerResult = { answer: string } | WorkerAbortFacts | ApprovalBlockedFacts;
 
 export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sandbox:latest", testCommand = "node --test", setupCommand = null, wallSecsPerIssue = 1800, lessonsFile = join(workDir, "..", "lessons.md"), sandboxPolicy = null, gitAuth, pathScope, notify }: WorkerTaskOptions) {
   const auth: GitAuth = gitAuth ?? createGitAuth();
@@ -468,6 +470,17 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           }
           // Container teardown is owned by the core (run_end → dispose).
           if (answer === "") {
+            // Same distinction as reviewer.ts (#188): a worker that ends with nothing to say may have been refused by
+            // a gate rather than failing to reason. Production evidence for this exact shape is conversation 312 — a
+            // worker blocked editing the gate pattern table (`edit:8ce583c1e1c9`), which the store recorded as an
+            // ordinary failure and the orchestrator then re-delegated.
+            const blocks = await findBlocksInTaskContext(() => runtime.context(convId, ctx) as never);
+            const blocked = anyBlockedOutcome(blocks, "worker");
+            if (blocked) {
+              console.error(`[factory.worker] issue #${task.input.issueNumber}: ${blocked.error.message}`);
+              await runtime.commit(() => ({ status: "terminal", outcome: blocked }), ctx);
+              return;
+            }
             await runtime.commit(
               () => ({ status: "terminal", outcome: { status: "failed", error: { message: "worker produced no final answer" } } }),
               ctx,

@@ -41,7 +41,17 @@ export type SettlementClass =
   | "restarted"   // reclaimed by a restart (abortReason "restart"); churn, not an incident
   | "unanswered"  // accepted work that no model answered — the #133 shape, alarms unless aborted
   | "unsettled"   // queued/placed: still open, or wedged forever
-  | "inFlight";   // task row whose kernel state is not terminal yet — no outcome exists to judge (#186)
+  | "inFlight"   // task row whose kernel state is not terminal yet — no outcome exists to judge (#186)
+  | "waiting";   // terminal run a gate stopped for a human approval (#188) — reported, never alarmed
+
+/**
+ * `waiting` (#188): the run stopped because a gate asked a human for an approval.
+ *
+ * Why it is not `failing`: an approval block is neither an agent defect nor an infrastructure incident, and counting
+ * it as failing trains people to ignore the settlement window — the exact dead-endpoint failure mode (#133) this
+ * ledger exists to avoid. Why it is not `inFlight` either: the task really did settle, so unlike an open row it will
+ * never change state, and the watermark may advance past it. The remedy lives in `detail`, which carries the key.
+ */
 
 export type SettlementRow = {
   store: string;
@@ -106,11 +116,17 @@ function truncate(s: string): string {
  */
 const OPEN_KERNEL_STATUSES: ReadonlySet<string> = new Set(["pending", "running", "waiting", "completing"]);
 
-export function classifyTask(kernelStatus: string, outcomeStatus: string, abortReason: string): SettlementClass {
+/**
+ * `blockedKey` (#188) is `outcome.result.blocked.key`, present when a gate refused a critical tool. It outranks the
+ * outcome status on purpose: the row IS a failure in kernel terms (the run did not complete) and reporting it as one
+ * would bury the only actionable fact in the row — that a human is being asked, with which key.
+ */
+export function classifyTask(kernelStatus: string, outcomeStatus: string, abortReason: string, blockedKey = ""): SettlementClass {
   // An open task has no outcome by definition. Reading only `$.state.outcome.status` made every in-flight run
   // classify as an unknown outcome — i.e. alarming — so the window was red whenever anything was actually
   // running, which is when an operator most needs it to be readable (#186).
   if (OPEN_KERNEL_STATUSES.has(clean(kernelStatus).toLowerCase())) return "inFlight";
+  if (clean(blockedKey).length > 0) return "waiting";
   const s = clean(outcomeStatus).toLowerCase();
   if (s === "completed") return "completed";
   if (s === "failed" || s === "faulted") return "failing";
@@ -158,7 +174,9 @@ select id,
        coalesce(json_extract(record, '$.state.outcome.status'), '') as status,
        coalesce(json_extract(record, '$.abortReason'), '')          as abort_reason,
        json_extract(record, '$.endedAt')                            as ended_at,
-       coalesce(json_extract(record, '$.state.outcome.error.message'), '') as error_message
+       coalesce(json_extract(record, '$.state.outcome.error.message'), '')          as error_message,
+       coalesce(json_extract(record, '$.state.outcome.result.blocked.key'), '')     as blocked_key,
+       coalesce(json_extract(record, '$.state.outcome.result.blocked.tool'), '')    as blocked_tool
   from tasks
  order by id;
 `;
@@ -197,9 +215,12 @@ export function readStore(
       // because "no outcome" means two completely different things depending on it.
       status: clean(t.status) || "unknown",
       kernelStatus: clean(t.kernel_status) || null,
-      cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? "")),
+      cls: classifyTask(String(t.kernel_status ?? ""), String(t.status ?? ""), String(t.abort_reason ?? ""), String(t.blocked_key ?? "")),
       whenMs: typeof t.ended_at === "number" ? t.ended_at : null,
-      detail: truncate(clean(t.error_message ?? "")),
+      // For a blocked row the key is the whole point of the row, so it leads the detail even if the message is long.
+      detail: clean(t.blocked_key ?? "")
+        ? truncate(`approval ${clean(t.blocked_key)}${clean(t.blocked_tool) ? ` (${clean(t.blocked_tool)})` : ""} — ${clean(t.error_message ?? "")}`)
+        : truncate(clean(t.error_message ?? "")),
     });
   }
 
@@ -224,7 +245,7 @@ export function readStore(
 }
 
 function emptyCounts(): Record<SettlementClass, number> {
-  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0, inFlight: 0 };
+  return { completed: 0, failing: 0, aborted: 0, restarted: 0, unanswered: 0, unsettled: 0, inFlight: 0, waiting: 0 };
 }
 
 export function summarize(rows: SettlementRow[], storesScanned: number): SettlementSummary {
@@ -338,7 +359,7 @@ export function writeWatermark(file: string, wm: Watermark): void {
 export function formatSummary(s: SettlementSummary): string {
   const c = s.counts;
   const line = (label: string, x: Record<SettlementClass, number>) =>
-    `${label}: completed=${x.completed} failing=${x.failing} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled} inFlight=${x.inFlight}`;
+    `${label}: completed=${x.completed} failing=${x.failing} unanswered=${x.unanswered} aborted=${x.aborted} restarted=${x.restarted} unsettled=${x.unsettled} inFlight=${x.inFlight} waiting=${x.waiting}`;
   const out = [
     line("all", c),
     line("  factory", s.byFamily.factory),

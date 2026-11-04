@@ -954,14 +954,47 @@ excludes them by design. If a repo's own policy keeps producing destructive-tier
 tool arguments, so a PR titled "Fix rm -rf regression" is classified destructive), that is an upstream semantics
 bug, not something to work around by approving faster.
 
-### What is NOT claimed yet
+### What the run now records (shipped after #198, closing the store side of this issue)
 
-Detection is deliberately adapter-side and read-only: the pipeline itself still cannot see its own block (a gated
-tool never executes; the reviewer's conversation handle exposes no transcript read; `GET /approvals` is the only
-public surface for it). So the run outcome still reads `reviewer never called submit_verdict`, the refusal budget
-still counts it, and #165's settlement window still classifies it as failing. Those need a producer that writes a
-structured `blocked_on_approval` outcome — tracked on #188. The alert is what stops the hour-long silent stall;
-the store-side vocabulary is still open.
+The earlier claim in this section — that the pipeline could not see its own block — was **wrong about the read**.
+A gated tool never executes, true, but the kernel writes the refusal into the conversation's committed transcript, and
+`TaskRuntime.context()` is an in-task read of exactly that (the worker already used it to find its final answer). So
+`factory/approval-state.ts` scans `view.entries` + `view.messages` with `parseApprovalMarker`, which engram re-exports
+from `app/src/core.ts`. Verified against real stores, not fixtures — `gates/approval-block-probe.mjs` runs the shipped
+detection over every instance store and found all five historically blocked conversations, including the two reviewer
+runs whose only recorded reason was `reviewer never called submit_verdict` (2 of 6 stage tasks in the engram store).
+
+| what you look at | before | now |
+|---|---|---|
+| task outcome message | `reviewer never called submit_verdict` | `review blocked pending approval 74944fe45911 (submit_verdict, destructive) … this is not an agent defect` |
+| machine facts | none | `outcome.result.blocked = {key, tool, tier}`, `blockedKind: "approval"` |
+| refusal budget | counted as a `review` refusal; **retryable** → burned a full cycle | class `approval_blocked`: **not counted**, **not retryable** |
+| settlement window (#165) | `failing` — alarmed forever | `waiting` — reported, never alarmed, and its detail names the key |
+| worker with no answer | `worker produced no final answer` | names whichever tool was refused (`edit:8ce583c1e1c9` in production) |
+
+Why there is no `blocked` **status**: `TaskOutcome` is a closed union of `completed | failed | aborted`. The run did not
+complete, so `failed` is honest — what was dishonest was the message. Everything downstream branches on
+`result.blocked`, which is why adding that field to `ReviewerResult`/`WorkerResult` was required rather than cosmetic:
+without it the honest outcome was not representable.
+
+### Probe it after changing anything in this path
+
+```bash
+node --experimental-strip-types gates/approval-block-probe.mjs      # every fleet instance store, read-only copies
+```
+
+Exit 2 means **drift**: the kernel records a machine-readable `code: "blocked"` diagnostic next to the human marker, so
+if the marker wording ever changes, detection degrades loudly instead of silently putting the blaming message back.
+
+### What is still NOT claimed
+
+- Detection reports that a request existed and its guarded effect never landed. It does **not** claim the key is still
+  pending right now — approval decisions live in a kernel doc we do not read, and approvals expire. The live "waiting
+  on you now" claim belongs to the adapter watcher above, which polls.
+- A block recorded before a context compaction is outside the visible entry window and will not be attributed. Callers
+  only ask at the moment the result turns out missing, when the block is by construction recent.
+- The upstream cause of most blocks (`engram#69`, prose matching in the destructive floor) is unfixed and remains the
+  reason this path gets exercised at all.
 
 ---
 

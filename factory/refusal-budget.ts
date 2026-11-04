@@ -13,6 +13,17 @@
 //      are genuinely fixable, so they stay retryable. Infrastructure refusals (a diff basis that
 //      could not be computed) are neither: they are retried freely and never counted, because
 //      counting them would let a transient fault consume the budget of a real task.
+//
+// Two classes deliberately do NOT consume budget, for opposite reasons:
+//
+//   - `infrastructure` — transient, so charging it would punish an unrelated later failure. Retryable.
+//   - `approval_blocked` (#188) — not the run's fault and not fixable by the run either, so charging it
+//     would let a policy wall consume the budget of the task it blocked. **Not retryable**: an approval
+//     key is `sha1(tool + exact args)`, so a reworded retry produces a *different* key nobody has
+//     approved. Retrying is guaranteed waste — one full worker cycle to arrive back at the same wall.
+//     That is why `counted` and `retryable` are independent axes here; conflating them (as the first
+//     draft did, by hardcoding `retryable: true` for every uncounted class) would have made an approval
+//     block look like a transient fault to the orchestrator.
 //   2. **Should this run try again at all?** Even a retryable refusal stops being worth its cost once
 //      it repeats identically — an identical red test run means nothing changed between attempts. And
 //      because a flailing worker can vary its offender set to dodge an identical-signature cap, there
@@ -23,7 +34,7 @@
 // state would outlive the operator's intent. Cross-restart dispatch dedupe is a separate mechanism
 // (intake's `requestId`), not this.
 
-export type RefusalClass = "path_scope" | "verification" | "review" | "infrastructure";
+export type RefusalClass = "path_scope" | "verification" | "review" | "infrastructure" | "approval_blocked";
 
 export interface RefusalSignal {
   class: RefusalClass;
@@ -31,6 +42,12 @@ export interface RefusalSignal {
   offenders?: readonly { file: string; why?: string }[];
   /** Short reason; normalized into the signature for the non-path classes. */
   reason?: string;
+  /**
+   * Pending approval key, for an `approval_blocked` refusal (#188). It is the identity of the wall — the key is
+   * `sha1(tool + exact args)`, so the same blocked call always produces the same signature while any reworded retry
+   * produces a different one. Carrying it makes "the same block again" detectable instead of assumed.
+   */
+  approvalKey?: string;
 }
 
 export interface RefusalRecord {
@@ -63,12 +80,25 @@ export function refusalSignature(signal: RefusalSignal): string {
     return `path_scope:${files.join(",")}`;
   }
   if (signal.class === "infrastructure") return "infrastructure:not-counted";
+  // Identity for an approval block is the pending key when we have one: same key ⇒ same wall.
+  if (signal.class === "approval_blocked") {
+    const key = signal.approvalKey;
+    return typeof key === "string" && key ? `approval_blocked:${key}` : "approval_blocked:not-counted";
+  }
   return `${signal.class}:${normalizeReason(signal.reason)}`;
 }
 
-/** Is a retry plausibly informative? Path scope is policy, and policy does not move mid-run. */
+/** Is a retry plausibly informative? Path scope is policy, and policy does not move mid-run; an
+ *  approval block moves only when a human POSTs a decision, which no retry can do (#188). */
 export function isRetryable(signal: RefusalSignal): boolean {
-  return signal.class !== "path_scope";
+  return signal.class !== "path_scope" && signal.class !== "approval_blocked";
+}
+
+/** Refusals that must not consume an issue's budget: `infrastructure` because they are transient,
+ *  `approval_blocked` because the run cannot resolve them and charging them would stop a healthy
+ *  later attempt (#188). Both stay in the ledger — an operator should see every refusal. */
+export function isCounted(signal: RefusalSignal): boolean {
+  return signal.class !== "infrastructure" && signal.class !== "approval_blocked";
 }
 
 export interface RefusalBudgetOptions {
@@ -128,10 +158,12 @@ export class RefusalBudget {
   note(issueNumber: number, signal: RefusalSignal): RefusalRecord {
     const signature = refusalSignature(signal);
     const retryable = isRetryable(signal);
-    const counted = signal.class !== "infrastructure";
+    const counted = isCounted(signal);
 
     if (!counted) {
-      const record: RefusalRecord = { issueNumber, class: signal.class, signature, count: 0, total: this.totals.get(issueNumber) ?? 0, retryable: true, terminal: false, reason: normalizeReason(signal.reason) };
+      // `retryable` comes from the signal class, not from `counted`: an approval block is uncounted
+      // *and* non-retryable, which is exactly the combination the run needs to be told (#188).
+      const record: RefusalRecord = { issueNumber, class: signal.class, signature, count: 0, total: this.totals.get(issueNumber) ?? 0, retryable, terminal: false, reason: normalizeReason(signal.reason) };
       this.entries.push(record);
       return record;
     }
