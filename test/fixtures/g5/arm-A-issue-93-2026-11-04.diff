@@ -1,0 +1,50 @@
+diff --git a/src/server.mjs b/src/server.mjs
+index 07fe860..388b72b 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -51,6 +51,16 @@ export function startServer({ port = 0, store = new LedgerStore() } = {}) {
+         }
+       }
+       if (req.method === "GET" && url.pathname === "/reports/aging") {
++        const bucketDaysParam = url.searchParams.get("bucketDays");
++        // A supplied bucketDays must be a positive integer; anything else is
++        // rejected with a client-facing 400 instead of leaking the engine's
++        // RangeError ("Invalid array length") as a 500.
++        if (bucketDaysParam !== null) {
++          const bucketDays = Number(bucketDaysParam);
++          if (!Number.isInteger(bucketDays) || bucketDays <= 0) {
++            throw Object.assign(new Error(`bucketDays must be a positive integer, got: ${bucketDaysParam}`), { statusCode: 400 });
++          }
++        }
+         return sendJson(res, 200, agingBuckets(store.list(), { bucketDays: url.searchParams.get("bucketDays") }));
+       }
+       if (req.method === "GET" && url.pathname === "/exports/invoices") {
+diff --git a/test/api.test.mjs b/test/api.test.mjs
+index 7423538..c7cb2b6 100644
+--- a/test/api.test.mjs
++++ b/test/api.test.mjs
+@@ -1395,3 +1395,24 @@ test("requests with no body are treated as {} (not a size error)", async () => {
+   assert.equal(putEmpty.status, 400);
+   assert.ok((await putEmpty.json()).error);
+ });
++
++test("reports aging with invalid bucketDays returns 400 naming the value, not a 500 (issue #93)", async () => {
++  for (const bad of ["abc", "0", "-3", "1.5", ""]) {
++    const res = await api("GET", `/reports/aging?bucketDays=${bad}`);
++    assert.equal(res.status, 400);
++    assert.ok(res.body.error, `expected error body for bucketDays=${JSON.stringify(bad)}`);
++    assert.match(res.body.error, /bucketDays/);
++    // No engine-internal wording leaks into the response.
++    assert.ok(!res.body.error.includes("Invalid array length"));
++    assert.strictEqual(res.body.buckets, undefined);
++  }
++});
++
++test("reports aging with a valid bucketDays returns buckets of that width", async () => {
++  const res = await api("GET", "/reports/aging?bucketDays=3");
++  assert.equal(res.status, 200);
++  assert.equal(res.body.bucketDays, 3);
++  assert.ok(Array.isArray(res.body.buckets));
++  assert.equal(res.body.buckets.length, 3);
++  assert.ok(Number.isInteger(res.body.count));
++});

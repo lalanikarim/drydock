@@ -1,0 +1,133 @@
+diff --git a/README.md b/README.md
+index bada10e..3917445 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,7 @@ Requires Node >= 22.19. No dependencies.
+ | `/invoices/:id/status` | PUT | Transition status `{ status }` |
+ | `/invoices/:id` | PATCH | Update `amountCents` on an open invoice (`200` with the updated invoice; `409` if paid/voided; `404` for unknown ids) |
+ | `/invoices/:id` | DELETE | Void an open invoice (`200` with the updated `voided` invoice; `409` if already paid/voided; `404` for unknown ids) |
++| `/exports/invoices` | GET | CSV projection of invoices as `{ csv }`; required `?columns=` is a comma-separated list of column names (missing parameter or an empty entry → 400) |
+ | `/summary` | GET | Totals (optional `?customer=` and `?status=open|paid|voided` filters, combinable, to scope totals): `{ invoiceCount, totalCents, openCents, paidCents, openCount, paidCount, voidedCount }`; unknown `?status=` → 400 |
+ 
+ ## Behavior spec
+diff --git a/src/server.mjs b/src/server.mjs
+index 07fe860..ac78f3b 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -19,6 +19,30 @@ import { agingBuckets } from "./reporting.mjs";
+ import { toCsv } from "./exports.mjs";
+ import { createInvoice, createInvoicesBatch, listInvoices, getInvoice, setInvoiceStatus, updateInvoiceAmount, deleteInvoice, summary, sendJson } from "./invoices.mjs";
+ 
++// GET /exports/invoices?columns=a,b — `columns` must be a non-empty
++// comma-separated list of column names. A missing or malformed value is a
++// client error (400) describing the caller's input, not an engine failure.
++class InvalidColumnsError extends Error {
++  constructor(message) {
++    super(message);
++    this.name = "InvalidColumnsError";
++    this.statusCode = 400;
++  }
++}
++
++// Single guard for the `columns` query parameter: rejects a missing value and
++// any list containing an empty entry, and returns the parsed column array.
++function parseColumnsParam(param) {
++  if (param === null) {
++    throw new InvalidColumnsError('missing required query parameter: "columns"');
++  }
++  const columns = param.split(",");
++  if (columns.some((column) => column.trim() === "")) {
++    throw new InvalidColumnsError(`columns must be a comma-separated list of column names, got: ${param}`);
++  }
++  return columns;
++}
++
+ export function startServer({ port = 0, store = new LedgerStore() } = {}) {
+   const server = http.createServer(async (req, res) => {
+     try {
+@@ -54,7 +78,8 @@ export function startServer({ port = 0, store = new LedgerStore() } = {}) {
+         return sendJson(res, 200, agingBuckets(store.list(), { bucketDays: url.searchParams.get("bucketDays") }));
+       }
+       if (req.method === "GET" && url.pathname === "/exports/invoices") {
+-        return sendJson(res, 200, { csv: toCsv(store.list(), { columns: url.searchParams.get("columns") }) });
++        const columns = parseColumnsParam(url.searchParams.get("columns"));
++        return sendJson(res, 200, { csv: toCsv(store.list(), { columns }) });
+       }
+       if (req.method === "GET" && url.pathname === "/summary") {
+         return await summary(store, req, res);
+diff --git a/test/exports.test.mjs b/test/exports.test.mjs
+index 9ac04af..f3896ae 100644
+--- a/test/exports.test.mjs
++++ b/test/exports.test.mjs
+@@ -1,10 +1,8 @@
+ import assert from "node:assert/strict";
+ import test from "node:test";
+ import { toCsv } from "../src/exports.mjs";
++import { startServer } from "../src/server.mjs";
+ 
+-// Happy path only. The parameter-shape behavior of these endpoints is tracked as its
+-// own issue; nothing here pins current behavior for malformed input, so a fix is free
+-// to choose the response shape.
+ test("toCsv projects and orders the requested columns", () => {
+   const csv = toCsv(
+     [{ id: 1, customerId: "acme", amountCents: 500 }, { id: 2, customerId: "globex", amountCents: 700 }],
+@@ -16,3 +14,59 @@ test("toCsv projects and orders the requested columns", () => {
+ test("toCsv renders a missing field as empty", () => {
+   assert.equal(toCsv([{ id: 1 }], { columns: ["id", "customerId"] }), "id,customerId\n1,");
+ });
++
++// HTTP-level behavior of GET /exports/invoices (issue #94): a valid `columns`
++// list returns the CSV, and a missing or malformed value is rejected with a
++// 4xx naming the caller's problem — never a 500 from inside the engine.
++let ctx;
++
++test.before(async () => {
++  ctx = await startServer({});
++});
++
++test.after(() => {
++  ctx.server.close();
++});
++
++async function api(method, path, body) {
++  const res = await fetch(`http://127.0.0.1:${ctx.port}${path}`, {
++    method,
++    headers: body ? { "content-type": "application/json" } : {},
++    body: body ? JSON.stringify(body) : undefined,
++  });
++  return { status: res.status, body: await res.json() };
++}
++
++test("exports invoices returns 200 with a csv projection for valid columns", async () => {
++  const created = await api("POST", "/invoices", { customerId: "export-c1", amountCents: 500 });
++  const res = await api("GET", "/exports/invoices?columns=id,customerId,amountCents");
++  assert.equal(res.status, 200);
++  assert.ok(typeof res.body.csv === "string");
++  const lines = res.body.csv.split("\n");
++  assert.equal(lines[0], "id,customerId,amountCents");
++  assert.ok(lines.some((line) => line === `${created.body.id},export-c1,500`));
++});
++
++test("exports invoices with a single column works", async () => {
++  await api("POST", "/invoices", { customerId: "export-single", amountCents: 75 });
++  const res = await api("GET", "/exports/invoices?columns=customerId");
++  assert.equal(res.status, 200);
++  assert.ok(res.body.csv.split("\n").some((line) => line === "export-single"));
++});
++
++test("exports invoices without columns returns 400 naming the missing value", async () => {
++  const res = await api("GET", "/exports/invoices");
++  assert.equal(res.status, 400);
++  assert.ok(res.body.error);
++  assert.match(res.body.error, /columns/);
++});
++
++test("exports invoices with malformed columns returns 400 (not 500) describing the value", async () => {
++  for (const bad of ["", ",", "id,,name", "id,", ",id", " , "]) {
++    const res = await api("GET", `/exports/invoices?columns=${encodeURIComponent(bad)}`);
++    assert.equal(res.status, 400, `expected 400 for columns=${JSON.stringify(bad)}, got ${res.status}: ${res.body.error}`);
++    assert.ok(res.body.error);
++    // The error describes the caller's value, not engine internals.
++    assert.doesNotMatch(res.body.error, /join|properties of null/);
++  }
++});

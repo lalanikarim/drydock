@@ -543,3 +543,19 @@ blamed on the approval; it exists because production paid for it, not because it
 **The general rules.** (a) A prediction about historical data is a claim about data you have not read — run the read
 before writing down what the fix will accomplish. (b) Suppressing an alarm is acceptable exactly when it keeps counting
 and still fires on anything unseen; prove the second half by manufacturing one, not by arguing it.
+
+---
+
+## 2026-11-04 — G5 printed PASSED on a signal that measured style, not structure
+
+**Decision.** Make `rootFix` location-aware rather than accept the pass: a typed error carrying its own status counts as a root fix only when it is added on a **domain path**. A typed error added at the transport boundary becomes its own reported signal, `boundaryTypedError`, and deliberately counts as neither root fix nor handler patch.
+
+**What triggered it.** The first clean G5 run — green fixture base, symptoms verified against a running server, no shared rule available to wire — finished with arm A reproducing the anti-pattern and arm B producing `class InvalidColumnsError extends Error { this.statusCode = 400 }` plus one reusable guard. The gate printed `EXPERIMENT PASSED`. Reading the diff found the class in `src/server.mjs`, next to the route, with the domain function still throwing `columns.join is not a function` for every other caller. The lesson's claim is that the check belongs *beside the rule*; nothing had moved beside anything.
+
+**Why the detector could not see it.** `rootFix = typedError || sharedRule || domainGuard || ruleReuse`, and `detectsTypedError` scanned all added lines with no notion of file. It answered a style question — "does this diff contain a status-carrying error class?" — under a name that promises structure. Same family as counting "the arm produced a diff" and calling it "the lesson worked".
+
+**The test that keeps the fix from being a lie.** Alongside the two captured diffs (arm A reads `handlerPatch`; arm B reads neither signal), a third asserts **the same class rewritten into the domain path DOES read as a root fix**. Without it, both earlier assertions could be satisfied by a detector that simply ignores typed errors — a green suite proving nothing, which is the failure this repository has now been caught in four times.
+
+**What the run still buys.** The trap design is fixed: baseline reproduced the anti-pattern rather than wiring an existing rule and invalidating the comparison. And a real open question, stated without inflation: arm B's *style* differed from arm A's (typed error + one guard vs inline `Object.assign`), but arms differed in trap as well as lesson — #93 was a value passed through, #94 a list needing parsing — so at n=1 that difference is not attributable. Next clean test needs a twin pair, same shape twice, different parameter names; or the reviewer-side lever, which is the only one downstream code enforces today.
+
+**The rule.** A verdict you have not read belongs to your classifier, not to your experiment. Every signal in this gate now names the file set it read.

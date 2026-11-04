@@ -188,7 +188,14 @@ export function classifyFixPattern(diff, contract = {}) {
   const domainChanged = domainLines.length > 0;
   const handlerChanged = handlerLines.length > 0;
 
+  // Path-aware on purpose (#168). A class carrying its own status is only a root fix if it lands where the rule lives.
+  // The run of 2026-11-04 produced `class InvalidColumnsError extends Error { this.statusCode = 400 }` **inside
+  // server.mjs**, next to the route, while `toCsv` in the domain module still threw engine errors for every other caller.
+  // That is better hygiene at the boundary and it is NOT the lesson's claim — "the check belongs beside the rule" — so it
+  // must not be counted as one. A pass resting on a location-blind signal is a pass about a diff nobody read.
   const typedError = detectsTypedError(allLines);
+  const typedErrorInDomain = domainChanged && detectsTypedError(domainLines);
+  const boundaryTypedError = typedError && !typedErrorInDomain;
   const sharedRule = detectsSharedRule(allLines);
   const domainGuard = domainChanged && detectsDomainGuard(domainLines);
   const handlerPatchReasons = detectsHandlerPatch(handlerLines);
@@ -196,13 +203,13 @@ export function classifyFixPattern(diff, contract = {}) {
 
   return {
     measured,
-    rootFix: typedError || Boolean(sharedRule) || domainGuard || Boolean(ruleReuse),
+    rootFix: typedErrorInDomain || Boolean(sharedRule) || domainGuard || Boolean(ruleReuse),
     handlerPatch: handlerPatchReasons.length > 0,
     // Why a verdict was reached — printed by the gate so a reviewer can disagree with the classification instead of
     // having to re-derive it from a diff.
     reasons: {
       rootFix: [
-        ...(typedError ? ["a typed error carrying its own status code was added"] : []),
+        ...(typedErrorInDomain ? ["a typed error carrying its own status code was added where the rule lives (domain path)"] : []),
         ...(sharedRule ? [`validation defined once (${sharedRule.name}) and called from ${sharedRule.callSites} places`] : []),
         ...(domainGuard ? ["a conditional guard was added where the rule lives (domain path)"] : []),
         ...(ruleReuse ? [`an existing shared rule (${ruleReuse.name}) was wired into a path that had none — ${ruleReuse.evidence}`] : []),
@@ -213,6 +220,8 @@ export function classifyFixPattern(diff, contract = {}) {
       domainChanged,
       handlerChanged,
       typedError,
+      typedErrorInDomain,
+      boundaryTypedError,
       domainGuard,
       sharedRule: sharedRule ? sharedRule.name : null,
       ruleReuse: ruleReuse ? ruleReuse.name : null,

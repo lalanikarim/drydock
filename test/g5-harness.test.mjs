@@ -458,3 +458,43 @@ test("the reuse signal is not a rubber stamp", () => {
   );
   assert.equal(bare.rootFix, false, "calling a validation-ish name with no rule set proves nothing");
 });
+
+// ── #168, run of 2026-11-04: a typed error is only a root fix where the rule lives ───────────────
+//
+// Captured from fixture PRs #95 (arm A, no lesson) and #96 (arm B, one lesson) on traps #93/#94 — both verified against
+// a running server with a green suite before any agent ran. Arm B defined `InvalidColumnsError extends Error` carrying
+// `statusCode = 400`, plus a single reusable `parseColumnsParam` guard — and put both in `src/server.mjs`, next to the
+// route, while `toCsv` in `src/exports.mjs` still threw engine errors for every other caller. The classifier then
+// reported `rootFix=true` off a location-blind signal and the gate printed EXPERIMENT PASSED over a diff that had not
+// moved the rule anywhere. These tests are why `rootFix` now requires the domain path.
+
+const RUN_2026_11_04 = {
+  a: { diff: diff("arm-A-issue-93-2026-11-04.diff"), contract: { domainPaths: ["src/reporting.mjs"], handlerPaths: ["src/server.mjs"] } },
+  b: { diff: diff("arm-B-issue-94-2026-11-04.diff"), contract: { domainPaths: ["src/exports.mjs"], handlerPaths: ["src/server.mjs"] } },
+};
+
+test("arm A of the 2026-11-04 run reproduces the anti-pattern (baseline signal intact)", () => {
+  const c = classifyFixPattern(RUN_2026_11_04.a.diff, RUN_2026_11_04.a.contract);
+  assert.equal(c.measured, true);
+  assert.equal(c.handlerPatch, true, "Object.assign(new Error(...), { statusCode: 400 }) at the call site is the anti-pattern");
+  assert.equal(c.rootFix, false);
+});
+
+test("arm B's typed error at the transport boundary is NOT a root fix", () => {
+  const c = classifyFixPattern(RUN_2026_11_04.b.diff, RUN_2026_11_04.b.contract);
+  assert.equal(c.measured, true);
+  assert.equal(c.signals.typedError, true, "the class exists and carries its status — that part of the read is correct");
+  assert.equal(c.signals.boundaryTypedError, true, "…but it landed in the handler path, beside the route");
+  assert.equal(c.rootFix, false, "a pass here would claim the rule moved when the domain module still throws engine errors");
+  assert.equal(c.handlerPatch, false, "and it is not a translation either — it is a third behavior, reported as such");
+});
+
+test("the same class moved into the domain path DOES read as a root fix (so the rule is location, not typed errors)", () => {
+  // Without this, the test above could be satisfied by a detector that ignores typed errors entirely. Same evidence,
+  // different file — the only variable is where the knowledge landed.
+  // Rewrite the path headers only — `changedFiles` keys off `+++ b/<path>`, so both lines have to move together.
+  const moved = RUN_2026_11_04.b.diff.split("b/src/server.mjs").join("b/src/exports.mjs");
+  const c = classifyFixPattern(moved, RUN_2026_11_04.b.contract);
+  assert.equal(c.signals.typedErrorInDomain, true);
+  assert.equal(c.rootFix, true);
+});
