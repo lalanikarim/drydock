@@ -475,3 +475,33 @@ the reading it was chasing: **check the base is green before spending an agent r
 only see novel code under-credits exactly the fixes a lesson is trying to cause**. Fourth time this week a running
 process beat a recorded assumption — the assumption here was mine, written two hours earlier, that the traps I seeded were
 sound.
+
+---
+
+## 2026-11-04 — #188: an issue's recorded blocker is a hypothesis, not a fact
+
+**Decision.** Ship approval-block classification by reading the transcript in-task (`TaskRuntime.context()`), rather than
+waiting on the upstream surface this issue had been parked behind (`api.pendingApprovals(conversationId)`, which does not
+exist and was never needed). The kernel writes the refusal and its key into committed entries; that is how engram's own
+`GET /approvals` finds pending approvals. `parseApprovalMarker` is re-exported from `app/src/core.ts`, so nothing crossed a
+module boundary to do it.
+
+**Why the wrong blocker survived.** One true sentence — "the reviewer's conversation handle exposes no transcript read", in
+`factory/approval-watch.ts` — described `ConversationHandle`, and also described the task-phase handle returned by
+`runtime.conversation()`. Nobody checked the third surface. A correct claim about one type hardened into a reason not to
+look at another, and the row sat for weeks behind an "upstream" that was really a reading gap on our side.
+
+**What it cost to be sure.** Not the tests — 23 of them pass against entries whose shape I captured from the store, which
+proves my assumption about the kernel and nothing else. What proved it was `gates/approval-block-probe.mjs` running the
+shipped detection over every real instance store: 5/5 blocked conversations explained, 0 drift, and the two engram tasks
+whose only recorded reason was `reviewer never called submit_verdict` (conversations 269, 476) named by key. The probe
+exits 2 when the kernel records `code:"blocked"` with no parseable marker — because this module's only dangerous failure is
+silently answering "no block" and putting the blaming message back.
+
+**The general rule.** Before accepting "blocked upstream", check whether the data is already in a surface you are allowed
+to read. Then, when you ship it: leave a probe that fails loudly if the contract drifts, because a detection that quietly
+returns nothing is indistinguishable from a world where nothing is blocked.
+
+**Deviation recorded.** #188 proposed "new outcome status **or** `outcome.result.blocked`". There is no new status:
+`TaskOutcome` is a closed union (`completed | failed | aborted`), so the kernel decided, and `failed` is honest — the run
+did not complete. What had been dishonest was the message, not the status.
