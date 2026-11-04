@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  drydock durable-state backup + restore drill (#204-era gap; P0-4) — source of truth for the installed unit.
+
+  WHAT IT COVERS. The factory's entire durable state is four sqlite stores plus the instance config directory:
+  approvals, submissions, lessons, refusal budgets, task graphs. `gates/backup-drill.mjs` snapshots each store with
+  the sqlite backup API (NOT `cp` — WAL mode means a bare copy can miss the newest transactions), verifies each copy
+  opens AND passes integrity_check, then restores into a scratch tree and compares observable effects: row counts per
+  table, document-kind counts, and a write test inside a rolled-back transaction. Exit 0 means the restore was proven,
+  not that a copy command returned cleanly.
+
+  WHAT IT DOES NOT COVER — read this before trusting it. The default destination is `~/drydock-backups/<timestamp>/`
+  on the SAME PHYSICAL DISK as the stores. This survives operator error, a bad migration, and store corruption. It does
+  not survive the machine dying. Off-host encrypted copies remain an open gap (see the issue filed alongside this file);
+  until then "we have backups" means "we can recover from our own mistakes".
+
+  SECRET MATERIAL. Each backup includes `fleet.local.json` and `routes.json`, which carry webhook secrets and instance
+  tokens. The drill writes the tree mode 0700. Never commit it, never sync it unencrypted, never paste a manifest into
+  an issue (runbook + AGENTS.md "Secrets and operator identifiers in git").
+
+  --keep prunes older backups so a daily job cannot fill the disk; it never deletes the run it just wrote. `--boot`
+  additionally boots an instance against the restored store — deliberately NOT scheduled here, because it needs live
+  inference and would let an endpoint outage look like a backup failure. Run `--boot` by hand after a restore you
+  actually intend to use (runbook §11).
+
+  Exit code: 0 = every store backed up, verified, and restored with matching observable effects; non-zero = the drill
+  did not complete. A drill that examined zero stores must be treated as failure (§R6b/R10: "not collected" and
+  "passing" are the same color).
+
+  Install / verify:
+    cp fleet/launchd/com.drydock.backup.plist.example ~/Library/LaunchAgents/com.drydock.backup.plist
+    plutil -lint ~/Library/LaunchAgents/com.drydock.backup.plist
+    launchctl bootout gui/$(id -u)/com.drydock.backup 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drydock.backup.plist
+    launchctl kickstart -k gui/$(id -u)/com.drydock.backup
+    tail -40 ~/Library/Logs/drydock-backup.log      # must name EVERY deployed store, then "BACKUP DRILL PASSED"
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.drydock.backup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/karim/.hermes/node/bin/node</string>
+    <string>--experimental-strip-types</string>
+    <string>/Users/karim/Projects/drydock/gates/backup-drill.mjs</string>
+    <string>--keep</string>
+    <string>7</string>
+  </array>
+
+  <!-- Daily. The interval is "how much history can I afford to lose", not a default: every run costs one sqlite
+       snapshot per store plus a full restore verification, which is seconds at current store sizes (~655 tasks). -->
+  <key>StartInterval</key>
+  <integer>86400</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/karim/Projects/drydock</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/karim/Library/Logs/drydock-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/karim/Library/Logs/drydock-backup.log</string>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
