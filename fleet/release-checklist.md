@@ -91,6 +91,10 @@ A second `SIGTERM` exits immediately and `SIGKILL`s what is left — that is the
 `kill -9` is what produced the orphans in #125. If you must inspect after a crash, `factory-instances/*/orphan-events.log`
 records deaths the dead stdout pipe could not (§10).
 
+**Stopping one run instead of the fleet:** `POST /factory/runs/abort` has two shapes and they are not equivalent —
+`taskId` settles a task while the orchestration conversation keeps delegating, `conversationId` stops the loop.
+See [`runbook-aborts.md`](runbook-aborts.md) before reaching for either (#222, learned at 2× budget).
+
 ## Step 5 — prove the running thing is the thing you released
 
 ```bash
@@ -135,6 +139,8 @@ drifts from the system is worse than no runbook.
 the one direction nobody tests by default.
 
 ## What this checklist does not cover
+
+Stopping an individual run or an orchestration loop is [`runbook-aborts.md`](runbook-aborts.md), not this file.
 
 Per-task token annotation (E4) is deferred P2 — spend is still reconstructible from durable records via
 `gates/m5-token-report.mjs`, just not per task row. Fixture `main` has no branch protection at all (R14, accepted): a

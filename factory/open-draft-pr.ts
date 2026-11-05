@@ -25,6 +25,7 @@ import {
   WORKER_REPORT_HEADING,
 } from "./pr-evidence.ts";
 import { RefusalBudget, terminalRefusalPayload, type RefusalSignal } from "./refusal-budget.ts";
+import { BudgetLedgerDoc, notePrOpened } from "./budget-ledger.ts";
 import { buildPrReport, classifyPush, type PrReportFacts } from "./pr-report.ts";
 import type { Notifier } from "./notify-telegram.ts";
 
@@ -206,6 +207,16 @@ export interface OpenDraftPrOptions {
    * to change the tool's outcome. Undefined means no channel is configured.
    */
   notify?: Notifier;
+}
+
+/**
+ * Pull the PR number out of the URL `gh pr create` prints (`https://github.com/o/r/pull/123`). Exported so a
+ * test pins the shape instead of trusting a regex by inspection — the value feeds the #222 retry guard, where a
+ * silently-undefined number would mean "no PR" and demand an unnecessary replan.
+ */
+export function prNumberFromPrUrl(url: string): number | undefined {
+  const m = /\/pull\/(\d+)(?:[/?#]|$)/.exec(String(url ?? "").trim());
+  return m ? Number(m[1]) : undefined;
 }
 
 export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m), notify }: OpenDraftPrOptions) {
@@ -448,6 +459,22 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
           "--head", branch, "--title", title, "--body", body,
         ], { env });
         prUrl = out.split("\n").pop()!.trim();
+      }
+
+      // #222 — record the PR in the durable ledger. This is what lets `delegate` distinguish "aborted and
+      // produced nothing" (needs a stated replan) from "aborted, then a PR landed and a human reviewed it"
+      // (legitimate rework, no replan needed). Best-effort on purpose: the push already happened, so a ledger
+      // write failure must not surface as a failed tool call — the cost of losing this record is one unnecessary
+      // `replan` request, never a lost pull request.
+      const prNumberForLedger = prJson?.number ?? prNumberFromPrUrl(prUrl);
+      if (prNumberForLedger) {
+        try {
+          await api.commit(async (tx) => notePrOpened(await tx.doc(BudgetLedgerDoc), issueNumber, prNumberForLedger), ctx);
+        } catch (err) {
+          reportLog(
+            `[open_draft_pr] could not record PR #${prNumberForLedger} for issue #${issueNumber} in the budget ledger: ${String(err)} — a later re-delegation may ask for a replan unnecessarily`,
+          );
+        }
       }
 
       // The rework report (#96): a human who asked for something on the PR gets exactly one answer,

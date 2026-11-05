@@ -32,11 +32,17 @@ import { runSetupInContainer, type SetupPolicy } from "./setup-sandbox.ts";
 import { readLessons } from "./lessons.ts";
 import { awaitIdleWithinBudget } from "./budgets.ts";
 import {
+  alreadyRunningPayload,
   BudgetLedgerDoc,
   budgetEntry,
   budgetShortCircuitPayload,
+  claimIssue,
+  claimTtlMs,
   isBudgetStopped,
   noteBudgetAbort,
+  releaseClaim,
+  replanRequiredPayload,
+  requiresReplan,
 } from "./budget-ledger.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
@@ -534,16 +540,34 @@ export function reworkPrNumberReject(raw: unknown): string | undefined {
  * or the scheduler will never dispatch it. */
 // `TaskDefinition`, not `ToolTask` (the kernel's model-tool-call class) — a defineTask() result is the former,
 // and nothing checked this annotation before #173.
-export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<WorkerInput, WorkerState, WorkerResult, object>; modelRef: { provider: string; modelId: string } }) {
+export function factoryDelegateTool({
+  taskDef,
+  modelRef,
+  wallSecsPerIssue,
+}: {
+  taskDef: Task<WorkerInput, WorkerState, WorkerResult, object>;
+  modelRef: { provider: string; modelId: string };
+  /** Configured worker budget, used only to size the concurrency claim's TTL (#222). */
+  wallSecsPerIssue?: number;
+}) {
   return defineTool({
     name: "delegate",
     description:
       "Run the sandboxed worker for one GitHub issue. It clones the repo on branch agent/issue-<n>, implements the fix, runs the test suite, and commits. Returns the worker's final report. " +
       "If this issue has already aborted twice on its wall-clock budget, the call is refused WITHOUT creating a task and returns {refused:true, runStopped:true, retryable:false}: report that to the human — re-delegating cannot succeed and costs nothing but returns the same payload. " +
+      "After ONE budget abort with no pull request produced, this tool refuses unless you pass `replan` saying what is different now ({refused:true, requires:\"replan\"}); an unchanged retry of work that already failed to fit the clock is not a plan. " +
+      "While another delegate call for the same issue is still in flight, this refuses with {refused:true, alreadyRunning:true, owningTaskId} instead of starting a second worker on one branch. " +
       "For rework of an existing pull request, pass `feedback` (the PR number, the directive kind parsed at intake, and the reviewer's instruction verbatim): the worker then checks out the PR's current branch instead of starting from the default branch, and re-verifies that the PR is open and factory-owned before touching it. " +
       "`feedback` describes an EXISTING pull request only: if the issue has no PR yet, omit `feedback` entirely — do not zero-fill `prNumber`, there is no encoding for \"none\".",
     parameters: Type.Object({
       issueNumber: Type.Integer(),
+      replan: Type.Optional(
+        Type.String({
+          description:
+            "Required after this issue has aborted on its wall-clock budget without producing a pull request: one sentence on what changed since that abort — the issue was split, wallSecsPerIssue was raised, setup is now cached. " +
+            'It is an explanation, not a magic word: if nothing changed, do not re-delegate; tell the human, because splitting the issue or raising the budget is their decision. Omit it on a first attempt.',
+        }),
+      ),
       feedback: Type.Optional(
         Type.Object({
           // Deliberately NOT `minimum: 1`: the kernel's own schema rejection is not something this gate has
@@ -596,13 +620,65 @@ export function factoryDelegateTool({ taskDef, modelRef }: { taskDef: Task<Worke
         return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
       }
 
-      const id = await api.createTask(
-        taskDef,
-        { issueNumber: args.issueNumber, ...(args.feedback ? { feedback: args.feedback } : {}), ...modelRef },
-        { ownership: { kind: "task", taskId: api.taskId } },
+      // #222 — one budget abort with nothing to show for it is a fact about the task's size, not evidence that
+      // trying again harder helps. Observed live (drydock#220, build c993bdd): after the first abort the payload
+      // here said `retryable:false` + "do not re-delegate", and the orchestrator re-delegated twice anyway,
+      // because the structural stop only trips on the SECOND abort. Requiring a non-empty `replan` converts "the
+      // model was told to stop" into "someone stated what changed" — and states it durably, so an audit can see
+      // who authorized the second full-budget attempt.
+      const replanText = typeof args.replan === "string" ? args.replan.trim() : "";
+      if (requiresReplan(ledger, args.issueNumber) && replanText === "") {
+        const payload = replanRequiredPayload(args.issueNumber, budgetEntry(ledger, args.issueNumber)!);
+        console.error(
+          `[factory.delegate] issue #${args.issueNumber} refused without work: ${payload.attempts} prior budget abort(s), no PR recorded — a non-empty \`replan\` is required (#222)`,
+        );
+        return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
+      }
+
+      // #222 concurrency guard: one issue, one worker. Two workers share branch agent/issue-<n> and a single
+      // inference endpoint, so the second cannot contribute anything except conflict. Claimed BEFORE createTask
+      // (under the caller's own task id) so a refusal never creates the thing it is refusing.
+      const ttlMs = claimTtlMs(wallSecsPerIssue);
+      const claim = await api.commit(
+        async (tx) => claimIssue(await tx.doc(BudgetLedgerDoc), args.issueNumber, api.taskId, { ttlMs }),
         ctx,
       );
-      const settled = await api.waitForTask(id, ctx);
+      if (!claim.ok) {
+        const payload = alreadyRunningPayload(args.issueNumber, claim.entry.claim!, claim.liveForMs);
+        console.error(
+          `[factory.delegate] issue #${args.issueNumber} refused without work: owned by task ${JSON.stringify(payload.owningTaskId)} for ${Math.round(claim.liveForMs / 1000)}s (#222)`,
+        );
+        return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
+      }
+      if (replanText !== "") {
+        await api.commit(async (tx) => {
+          const e = (await tx.doc(BudgetLedgerDoc)).issues[String(args.issueNumber)];
+          if (e) e.replan = replanText;
+        }, ctx);
+        console.error(`[factory.delegate] issue #${args.issueNumber} re-delegated after a budget abort with replan: ${replanText.slice(0, 200)}`);
+      }
+
+      let settled: Awaited<ReturnType<typeof api.waitForTask>>;
+      try {
+        const id = await api.createTask(
+          taskDef,
+          { issueNumber: args.issueNumber, ...(args.feedback ? { feedback: args.feedback } : {}), ...modelRef },
+          { ownership: { kind: "task", taskId: api.taskId } },
+          ctx,
+        );
+        settled = await api.waitForTask(id, ctx);
+      } finally {
+        // Ownership is released on every path — completed, faulted, budget-aborted, or thrown. If this commit
+        // itself cannot happen (the call was interrupted), the claim expires on its TTL rather than stranding
+        // the issue forever, which is why the guard is a claim and not a lock.
+        try {
+          await api.commit(async (tx) => releaseClaim(await tx.doc(BudgetLedgerDoc), args.issueNumber), ctx);
+        } catch (err) {
+          console.error(
+            `[factory.delegate] issue #${args.issueNumber} could not release its claim (${String(err)}); the ${Math.round(ttlMs / 1000)}s TTL bounds the damage (#222)`,
+          );
+        }
+      }
       const outcome = settled.state.outcome;
       if (outcome.status === "completed") {
         return {

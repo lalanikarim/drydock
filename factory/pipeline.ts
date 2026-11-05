@@ -211,7 +211,7 @@ export function factoryPipeline(opts: PipelineOptions) {
   return defineExtension({
     name: "factory",
     tools: [
-      factoryDelegateTool({ taskDef: workerTaskDef, modelRef: opts.modelRef }),
+      factoryDelegateTool({ taskDef: workerTaskDef, modelRef: opts.modelRef, wallSecsPerIssue: opts.wallSecsPerIssue }),
       openDraftPrTool({
         workDir: opts.workDir,
         fixturesRepo: opts.fixturesRepo,
