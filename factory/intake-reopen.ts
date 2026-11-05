@@ -19,12 +19,24 @@
 // Why this must never clear the wall-budget ledger. `budgetAborts` is what makes #141 and #222 real: two
 // budget aborts stop an issue so a third cannot silently spend another full budget. A "retry" button that also
 // reset that counter would be one call away from undoing both, and it would be tempting precisely when the
-// operator is annoyed. So this route reads the ledger and reports it, and writes nothing to it — asserted in
-// tests by a fake that records every document any commit touches.
+// operator is annoyed. So this route never touches `budgetAborts`, `operatorAborts`, or `stopped` — asserted in
+// tests by a fake that records every document any commit touches, plus a byte-for-byte comparison afterward.
+//
+// #230 refined that invariant rather than weakening it. The original test forbade *any* write to the budget
+// document, which was a proxy for the real rule and became wrong the moment an operator authorization needed
+// to live somewhere durable: this route now appends a one-use grant (`grantReopenAttempt`) while leaving every
+// counter exactly as it found it. A test that forbids the wrong thing gets deleted the first time it is
+// inconvenient; a test that forbids the right thing gets refined.
 
 import { readJsonBody, type AppRoute, type RouteContext } from "../vendor/engram/app/src/server.ts";
 import { dispatchIntake, intakeKey, IntakeLedgerDoc, type IntakeRouteOptions } from "./intake-router.ts";
-import { budgetEntry, BudgetLedgerDoc } from "./budget-ledger.ts";
+import {
+  budgetEntry,
+  BudgetLedgerDoc,
+  grantReopenAttempt,
+  pendingReopenGrant,
+  requiresReplan,
+} from "./budget-ledger.ts";
 
 const MAX_REASON = 2_000;
 
@@ -76,7 +88,7 @@ export function buildReopenContent(issueNumber: number, reason: string, attempt:
     `Issue #${issueNumber} is being dispatched again because its previous orchestration conversation ended (aborted by the operator, or it ran out of budget). Re-applying the label cannot do this: an issue has one constant intake requestId per instance store (#226), which is why this verb exists.`,
     `This is a NEW conversation on purpose. A transcript that already contains an abort or a refusal treats that history as evidence about what is possible (#122), so resuming the old one would start the retry at a disadvantage nobody agreed to.${priorConversationId ? ` The superseded conversation was ${priorConversationId}.` : ""}`,
     `Reason given by the operator: ${JSON.stringify(reason)}`,
-    `What did NOT change: the wall-budget ledger. If this issue already aborted on its budget, \`delegate\` will refuse until a \`replan\` states what is different (#222), and after two aborts it refuses outright (#141). Do not work around that — if the guard fires, report it to the operator instead of retrying.`,
+    `What did NOT change: the wall-budget ledger. Reopening restores dispatchability, not budget. If this issue had already aborted on its budget, this reopen carries an operator grant worth exactly ONE attempt (#230) — \`delegate\` will spend it and record \`replanSource=operator\`. A further attempt after that needs a stated \`replan\` (#222), and two aborts still stop the issue outright (#141). Do not work around any of that: if a guard fires, report it to the operator instead of retrying.`,
   ].join("\n\n");
 }
 
@@ -134,6 +146,29 @@ export function createReopenRoute(opts: ReopenRouteOptions): AppRoute {
       // Read the budget ledger back and put it in the response. This is the difference between an operator
       // verb that says "ok" and one that says "ok, and note that delegate will refuse this until …".
       const budgets = await harness.snapshot(BudgetLedgerDoc, ctx);
+
+      // #230 — a reopen of an issue that is in the "needs authorization" state IS the authorization. Granting it
+      // here means the human's decision is durable and attributable instead of being paraphrased by the model
+      // into a `replan` string, which is what actually happened in production on 2026-11-05.
+      //
+      // Two deliberate limits: an issue with no prior budget abort gets no grant (nothing to authorize, and a
+      // latent grant would silently buy an attempt later that nobody intended), and a STOPPED issue gets none
+      // either — #141's stop is not liftable by this or any other dispatch verb.
+      const stoppedBefore = budgetEntry(budgets, v.issueNumber)?.stopped === true;
+      if (result.status < 400 && !stoppedBefore && requiresReplan(budgets, v.issueNumber)) {
+        await harness.commit(
+          async (tx) => {
+            grantReopenAttempt(await tx.doc(BudgetLedgerDoc), v.issueNumber, { requestId, reason: v.reason });
+          },
+          ctx,
+        );
+      }
+
+      // Read back from the durable store rather than returning what the writer function produced: the response
+      // should report observed state, and the fake harness (like the real one) makes no promise about commit's
+      // return value.
+      const afterGrant = await harness.snapshot(BudgetLedgerDoc, ctx);
+      const grant = pendingReopenGrant(afterGrant, v.issueNumber);
       const entry = budgetEntry(budgets, v.issueNumber);
       const budget = {
         budgetAborts: entry?.budgetAborts ?? 0,
@@ -143,12 +178,23 @@ export function createReopenRoute(opts: ReopenRouteOptions): AppRoute {
         claim: entry?.claim ?? null,
       };
       const warning = budget.stopped
-        ? "budget ledger says this issue is STOPPED after exhausting its wall budget: delegate will refuse without doing work (#141). Reopening restores dispatchability, not budget — the levers (raise wallSecsPerIssue, split the issue) are operator decisions."
-        : budget.budgetAborts > 0
-          ? `budget ledger shows ${budget.budgetAborts} prior abort(s): delegate will require a non-empty \`replan\` (#222). The reason recorded here is for audit; the orchestrator must still state what changed.`
-          : undefined;
+        ? "budget ledger says this issue is STOPPED after exhausting its wall budget: delegate will refuse without doing work (#141). No attempt was granted — reopening restores dispatchability, not budget, and does not lift a stop. The levers (raise wallSecsPerIssue, split the issue) are operator decisions."
+        : grant
+          ? `this reopen grants exactly ONE operator-authorized attempt (#230): delegate will spend ${JSON.stringify(grant.requestId)} instead of requiring a model-authored \`replan\`, and records \`replanSource=operator\`. After it is spent, #222 applies again and two aborts still stop the issue (#141).`
+          : budget.budgetAborts > 0
+            ? `budget ledger shows ${budget.budgetAborts} prior abort(s) but no grant was issued (a live PR already satisfies #222, or the dispatch was not accepted): delegate proceeds only with a non-empty \`replan\`.`
+            : undefined;
 
-      rctx.json(res, result.status, { reopened: result.status === 202, requestId, attempt, ...result.body, ...(warning ? { warning } : {}), budget });
+      rctx.json(res, result.status, {
+        reopened: result.status === 202,
+        requestId,
+        attempt,
+        ...result.body,
+        ...(warning ? { warning } : {}),
+        budget,
+        // Durable proof of what this call authorized (null when nothing needed authorizing).
+        grant: grant ?? null,
+      });
     },
   };
 }

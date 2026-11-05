@@ -25,65 +25,9 @@ import {
 import { prNumberFromPrUrl } from "../factory/open-draft-pr.ts";
 
 const MODEL = { provider: "aurora", modelId: "some/served-model" };
-const NOW = () => Date.now();
 
-/** Ledger state carrying one wall-clock abort and no PR — the exact state dispatch #1 was left in. */
-function ledgerAfterOneBudgetAbort(extra = {}) {
-  return {
-    issues: {
-      220: {
-        budgetAborts: 1,
-        operatorAborts: 0,
-        lastAt: NOW() - 60_000,
-        lastReason: "wall-clock budget exceeded (2400s)",
-        stopped: false,
-        ...extra,
-      },
-    },
-  };
-}
-
-const textOf = (result) => result?.output?.[0]?.text ?? "";
-
-/** An api stub where everything past the boundary explodes. A test passes only if delegate touches nothing. */
-function beyondBoundaryThrows(calls, { commit = true } = {}) {
-  const boom = (name) => {
-    calls.push(name);
-    throw new Error(`delegate must not ${name} — a refused call creates nothing and commits nothing`);
-  };
-  return {
-    taskId: "task-caller",
-    snapshot: async (doc) => {
-      calls.push("snapshot");
-      throw new Error("snapshot must have been read before this point in the test setup");
-    },
-    ...(commit ? { commit: async () => boom("commit") } : {}),
-    createTask: async () => boom("createTask"),
-    waitForTask: async () => boom("waitForTask"),
-  };
-}
-
-/** A cooperating api over a live ledger object, so assertions can read what the tool actually recorded. */
-function ledgerApi(ledger, { outcome, captureAtCreate, refuseToSpawn = false } = {}) {
-  const created = [];
-  const settledOutcome = outcome ?? { status: "completed", result: { answer: "done" } };
-  return {
-    created,
-    api: {
-      taskId: "task-caller",
-      snapshot: async () => ledger,
-      commit: async (fn) => fn({ doc: async () => ledger }),
-      createTask: async (_def, input) => {
-        if (refuseToSpawn) throw new Error("delegate must not spawn a second worker for an issue that is busy");
-        created.push(input);
-        // Observe the claim while the child exists — the guard is worthless if it is written after the spawn.
-        captureAtCreate?.(ledger);
-        return "task-child";
-      },
-      waitForTask: async () => ({ state: { outcome: settledOutcome } }),
-    },
-  };
-}
+// Stubs shared with test/replan-provenance.test.mjs — see test/helpers/delegate-fake-api.mjs for why they moved.
+import { beyondBoundaryThrows, ledgerAfterOneBudgetAbort, ledgerApi, NOW, textOf } from "./helpers/delegate-fake-api.mjs";
 
 test("one budget abort with no PR refuses a plain re-delegate and touches nothing past the ledger", async () => {
   const calls = [];

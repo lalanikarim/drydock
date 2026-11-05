@@ -44,8 +44,43 @@ export type BudgetEntry = {
   prNumber?: number;
   /** The `delegate` call currently owning this issue, if any (#222 concurrency guard). */
   claim?: BudgetClaim;
-  /** Verbatim reason the operator/orchestrator gave for retrying after a budget abort (#222), for audit. */
+  /**
+   * Verbatim reason the operator/orchestrator gave for retrying after a budget abort (#222), for audit.
+   * With #230 this is the text that authorized the attempt — and `replanSource` says who supplied it.
+   */
   replan?: string;
+  /**
+   * **Who** authorized a retry the wall-budget ledger would otherwise refuse (#230).
+   *
+   * `"operator"` — a human reopened the issue (`POST /factory/intake/reopen`) and that grant is being spent.
+   * `"model"`    — no human authorized anything; the orchestrator supplied a non-empty string, which is all
+   *                #222's rule ever required.
+   *
+   * This field exists because those are not the same event and an audit could not previously tell them apart.
+   * Observed live 2026-11-05 (build `6ce582e`): a reopen reason I had written came back as the model's own
+   * claim that "the issue has since been sliced down to assertion 4 only" — false, and accepted, because the
+   * guard tests a string for emptiness. Provenance is the minimum honest fix; the prose itself stays unjudged
+   * (#230's non-goals), but it can no longer be mistaken for permission.
+   */
+  replanSource?: "operator" | "model";
+  /** Operator grants issued by `POST /factory/intake/reopen`, one attempt each (#230). */
+  grants?: ReopenGrant[];
+}
+
+/**
+ * A single operator-authorized retry, granted at reopen time and spent by the next eligible `delegate` call.
+ * One grant buys one attempt: replaying it would turn a deliberate second chance into a permanent license,
+ * which is precisely what #222 exists to prevent.
+ */
+export type ReopenGrant = {
+  /** The intake requestId that carried the reopen (e.g. `issue-220#reopen-1`) — traceable to a log line. */
+  requestId: string;
+  /** The operator's stated reason, verbatim. Used as the authorization text; never rewritten. */
+  reason: string;
+  grantedAt: number;
+  /** Set when a `delegate` call spent it. Consumed grants are kept, not deleted — history is append-only. */
+  consumedAt?: number;
+  consumedBy?: string | number;
 }
 
 /**
@@ -145,6 +180,74 @@ export function isBudgetStopped(state: BudgetLedgerState | undefined, issueNumbe
 
 export function budgetEntry(state: BudgetLedgerState | undefined, issueNumber: number): BudgetEntry | undefined {
   return state?.issues[key(issueNumber)];
+}
+
+// ------------------------------------------------------------------------------------------- #230 — authorization vs assertion
+//
+// #222 made a retry after a wall-budget abort require *something*. It could not make that something mean
+// anything: any non-empty string satisfied it. Within 90 seconds of the reopen verb shipping, production showed
+// the failure mode — my own reopen reason was injected into a fresh conversation as authoritative operator
+// context and returned as the model's assertion that the issue "has since been sliced down to assertion 4
+// only". Nothing had been sliced. `delegate` logged one indistinguishable line for that event and for a human
+// authorization, and the ledger could not tell them apart either.
+//
+// So an operator reopen now grants exactly one attempt, durably, and every retry records which kind of
+// authorization bought it. The prose path stays open — blocking legitimately re-scoped work was an explicit
+// acceptance failure in #222 — but it is labelled for what it is.
+
+/** Grant one operator-authorized retry attempt for an issue. Called by the reopen route; never by a model. */
+export function grantReopenAttempt(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  opts: { requestId: string; reason: string; at?: number },
+): { entry: BudgetEntry; grant: ReopenGrant } {
+  const requestId = opts.requestId?.trim();
+  const reason = opts.reason?.trim();
+  if (!requestId) throw new Error("grantReopenAttempt requires a non-empty requestId — an untraceable authorization is worse than none");
+  if (!reason) throw new Error("grantReopenAttempt requires the operator's stated reason (#222's rule applies upward: say what changed)");
+  const e = entry(state, issueNumber);
+  const grant: ReopenGrant = { requestId, reason, grantedAt: opts.at ?? Date.now() };
+  e.grants = [...(e.grants ?? []), grant];
+  return { entry: e, grant };
+}
+
+/** The next unspent grant for this issue, if any. Read-only — peeking must not consume (#230). */
+export function pendingReopenGrant(state: BudgetLedgerState | undefined, issueNumber: number): ReopenGrant | undefined {
+  return state?.issues[key(issueNumber)]?.grants?.find((g) => g.consumedAt === undefined);
+}
+
+/**
+ * Spend the next unspent grant, or return `undefined` so the caller falls back to the model-authored path.
+ * Called only after the concurrency claim succeeds: a call refused because another worker owns the issue must
+ * not burn an authorization it never used.
+ */
+export function consumeReopenGrant(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  opts: { consumedBy: string | number; at?: number } = { consumedBy: "unknown" },
+): ReopenGrant | undefined {
+  const e = state.issues[key(issueNumber)];
+  const grant = e?.grants?.find((g) => g.consumedAt === undefined);
+  if (!e || !grant) return undefined;
+  grant.consumedAt = opts.at ?? Date.now();
+  grant.consumedBy = opts.consumedBy;
+  return grant;
+}
+
+/**
+ * Record what authorized a retry, and of what kind. One place, so the two paths cannot drift back into looking
+ * identical in the ledger after being distinguished in the logs.
+ */
+export function noteRetryAuthorization(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  opts: { source: "operator" | "model"; text: string; at?: number },
+): BudgetEntry {
+  const e = entry(state, issueNumber);
+  e.replan = opts.text;
+  e.replanSource = opts.source;
+  if (opts.at !== undefined) e.lastAt = opts.at;
+  return e;
 }
 
 // ------------------------------------------------------------------------------------------- #222 — retry guards
@@ -249,7 +352,10 @@ export function replanRequiredPayload(issueNumber: number, e: BudgetEntry): Reco
     hint:
       'Call delegate again with `replan: "<what is different now>"` — e.g. "issue split to only the drift check", "wallSecsPerIssue raised to 5400", ' +
       '"setup is cached so npm ci no longer dominates". No task was created and nothing was cloned; if nothing has changed, the honest answer is to tell the human, ' +
-      "because the levers (raise wallSecsPerIssue, split the issue) belong to them.",
+      "because the levers (raise wallSecsPerIssue, split the issue) belong to them. " +
+      "Note on provenance (#230): a `replan` you write here is recorded as model-authored and is not an authorization — " +
+      "if a human is intended to approve another full-budget attempt, they reopen the issue with POST /factory/intake/reopen, " +
+      "which grants exactly one attempt and is recorded as operator-authorized.",
   };
 }
 
