@@ -35,6 +35,32 @@ export type BudgetEntry = {
   /** True once this issue's runs are refused without doing work. */
   stopped: boolean;
   stopReason?: string;
+  /**
+   * Draft PR recorded for this issue by `open_draft_pr` (#222). This is what makes "does a PR exist?" a
+   * durable local fact instead of a GitHub query inside `delegate`: the question the retry guard has to
+   * answer is "has this factory produced anything since the abort", and answering it with a network call
+   * would make the guard's correctness depend on the thing most likely to be flaky at that moment.
+   */
+  prNumber?: number;
+  /** The `delegate` call currently owning this issue, if any (#222 concurrency guard). */
+  claim?: BudgetClaim;
+  /** Verbatim reason the operator/orchestrator gave for retrying after a budget abort (#222), for audit. */
+  replan?: string;
+}
+
+/**
+ * A live `delegate` claim on an issue. Not a lock — nothing here can prevent a determined caller — it is a
+ * durable record of "a worker for this issue was scheduled by call X at time Y", which is enough to refuse a
+ * second one and enough for a human to see who owns the run.
+ */
+export type BudgetClaim = {
+  /**
+   * The `delegate` call that owns the issue (the caller's own task id, known BEFORE the child is created —
+   * claiming with the child's id would require creating the thing the claim exists to prevent).
+   */
+  taskId: string | number;
+  /** Epoch ms when the claim was taken. */
+  at: number;
 }
 
 export type BudgetLedgerState = {
@@ -119,6 +145,130 @@ export function isBudgetStopped(state: BudgetLedgerState | undefined, issueNumbe
 
 export function budgetEntry(state: BudgetLedgerState | undefined, issueNumber: number): BudgetEntry | undefined {
   return state?.issues[key(issueNumber)];
+}
+
+// ------------------------------------------------------------------------------------------- #222 — retry guards
+//
+// Observed live on the first throughput-batch dispatch (drydock#220, build c993bdd): a worker aborted at the
+// 2400 s wall budget, `delegate` returned `{budgetAborted:true, retryable:false, hint:"Do not re-delegate"}`,
+// and the orchestrator re-delegated anyway — twice, ~40 min of inference each. The structural stop existed
+// but trips at DEFAULT_MAX_BUDGET_ABORTS = 2, so after the FIRST abort the only defense left was a sentence.
+// These guards close that gap without touching the cap's semantics (operator aborts stay uncharged).
+
+/** Slack past one wall budget after which a claim is treated as abandoned rather than running (#222). A run
+ *  cannot legitimately outlive its own budget by more than this much: the worker enforces the same clock. */
+export const CLAIM_TTL_SLACK_MS = 120_000;
+
+/** Minimum sensible claim TTL when the caller does not know the configured wall budget (worker's own default
+ *  is 1800 s, so this matches the shipped configuration rather than inventing a tighter one). */
+export const DEFAULT_CLAIM_TTL_MS = 1_800_000 + CLAIM_TTL_SLACK_MS;
+
+/** Claim TTL for a configured `wallSecsPerIssue`, with slack. Guards against a zero/negative config turning
+ *  every claim instantly stale, which would make the concurrency check decorative. */
+export function claimTtlMs(wallSecsPerIssue: number | undefined): number {
+  const secs = typeof wallSecsPerIssue === "number" && wallSecsPerIssue > 0 ? wallSecsPerIssue : 1_800;
+  return secs * 1_000 + CLAIM_TTL_SLACK_MS;
+}
+
+/** A claim is live while it is younger than the TTL. `at` in the future (clock skew) counts as live, since a
+ *  stale-looking claim is the one that lets a duplicate worker start. */
+export function claimIsLive(e: BudgetEntry | undefined, nowMs: number, ttlMs: number): boolean {
+  if (!e?.claim) return false;
+  const age = nowMs - e.claim.at;
+  return !(age > ttlMs);
+}
+
+/**
+ * Take exclusive ownership of an issue for one delegated run. Returns `{ ok: false }` with the live claim
+ * instead of throwing, so `delegate` can answer with an actionable tool result rather than a faulted call.
+ */
+export function claimIssue(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  taskId: string | number,
+  opts: { now?: number; ttlMs?: number } = {},
+): { ok: true; entry: BudgetEntry } | { ok: false; entry: BudgetEntry; liveForMs: number; ttlMs: number } {
+  const now = opts.now ?? Date.now();
+  const ttlMs = opts.ttlMs ?? DEFAULT_CLAIM_TTL_MS;
+  const e = entry(state, issueNumber);
+  if (claimIsLive(e, now, ttlMs)) {
+    return { ok: false, entry: e, liveForMs: Math.max(0, now - e.claim!.at), ttlMs };
+  }
+  e.claim = { taskId, at: now };
+  return { ok: true, entry: e };
+}
+
+/** Release ownership. Tolerates a missing entry/claim — release runs in a `finally` and must not be able to
+ *  turn a settled run into a thrown error. */
+export function releaseClaim(state: BudgetLedgerState, issueNumber: number): void {
+  const e = state.issues[key(issueNumber)];
+  if (!e) return;
+  delete e.claim;
+}
+
+/** Record the PR this factory opened, so "did anything come of it?" survives a restart (#222). */
+export function notePrOpened(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  prNumber: number,
+  opts: { at?: number } = {},
+): BudgetEntry {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`prNumber must be a positive integer, got ${JSON.stringify(prNumber)}`);
+  const e = entry(state, issueNumber);
+  e.prNumber = prNumber;
+  e.lastAt = opts.at ?? Date.now();
+  return e;
+}
+
+/**
+ * Does this call need a `replan`? True when the issue has already burned a wall budget and produced no PR:
+ * retrying identical work at an identical budget is what doubled the cost of dispatch #1, so the caller must
+ * state what changed. A recorded PR clears the requirement — rework after a review comment is legitimate and
+ * must not be stranded (acceptance: the fix may not block legitimately re-scoped work).
+ */
+export function requiresReplan(state: BudgetLedgerState | undefined, issueNumber: number): boolean {
+  const e = state?.issues[key(issueNumber)];
+  if (!e) return false;
+  if (e.prNumber) return false;
+  return e.budgetAborts >= 1;
+}
+
+/** Payload for "you may re-delegate, but only by saying what changed". Same vocabulary as the other refusals:
+ *  `refused` + `retryable`, plus the exact argument name that unlocks it. */
+export function replanRequiredPayload(issueNumber: number, e: BudgetEntry): Record<string, unknown> {
+  return {
+    refused: true,
+    retryable: false,
+    requires: "replan",
+    issueNumber,
+    attempts: e.budgetAborts,
+    operatorAborts: e.operatorAborts,
+    reason:
+      `issue #${issueNumber} already aborted ${e.budgetAborts} time(s) on the wall-clock budget and produced no pull request. ` +
+      "Re-delegating unchanged work at an unchanged budget cannot produce a different result.",
+    hint:
+      'Call delegate again with `replan: "<what is different now>"` — e.g. "issue split to only the drift check", "wallSecsPerIssue raised to 5400", ' +
+      '"setup is cached so npm ci no longer dominates". No task was created and nothing was cloned; if nothing has changed, the honest answer is to tell the human, ' +
+      "because the levers (raise wallSecsPerIssue, split the issue) belong to them.",
+  };
+}
+
+/** Payload for "an earlier worker for this issue still owns it". Names the owning task so a human can abort it 
+ *  deliberately instead of racing it. */
+export function alreadyRunningPayload(issueNumber: number, claim: BudgetClaim, liveForMs: number): Record<string, unknown> {
+  return {
+    refused: true,
+    retryable: false,
+    alreadyRunning: true,
+    issueNumber,
+    owningTaskId: claim.taskId,
+    runningForMs: liveForMs,
+    reason:
+      `a delegate call for issue #${issueNumber} is already in flight (owning task ${JSON.stringify(claim.taskId)}, started ${Math.round(liveForMs / 1000)}s ago). ` +
+      "Two workers on one issue share a branch and one inference endpoint; the second would only fight the first.",
+    hint:
+      "Do not re-delegate and do not poll in a loop. Either wait for the run in flight, or stop it deliberately with POST /factory/runs/abort. Note for the operator: aborting by taskId settles that task but does NOT stop an orchestration conversation from delegating again — use {\"conversationId\":…} to stop the loop (fleet/README.md, #222).",
+  };
 }
 
 /**

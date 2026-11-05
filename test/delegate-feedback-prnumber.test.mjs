@@ -91,6 +91,10 @@ test("a real PR number still delegates, with feedback forwarded intact", async (
   const api = {
     taskId: "task-caller",
     snapshot: async () => emptyBudgetLedger(),
+    // #222 added a durable claim on the budget ledger before spawning, so the cooperating stub needs `commit`.
+    // It is a real transaction over a real state object, not a no-op: a stub that swallowed commits would let
+    // the claim guard pass while recording nothing.
+    commit: async (fn) => fn({ doc: async () => emptyBudgetLedger() }),
     createTask: async (_def, input) => {
       created.push(input);
       return "task-1";
@@ -117,6 +121,7 @@ test("delegate without feedback is unaffected (the ordinary path cannot depend o
   const api = {
     taskId: "task-caller",
     snapshot: async () => emptyBudgetLedger(),
+    commit: async (fn) => fn({ doc: async () => emptyBudgetLedger() }), // #222 claim; see the note above
     createTask: async (_def, input) => {
       created.push(input);
       return "task-2";
