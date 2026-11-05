@@ -97,6 +97,17 @@ See [`runbook-aborts.md`](runbook-aborts.md) before reaching for either (#222, l
 
 ## Step 5 — prove the running thing is the thing you released
 
+**Run the command, not your memory of it:**
+
+```bash
+node --experimental-strip-types fleet/verify-deploy-posture.mjs   # seven rows, observed values, PASS/FAIL (#220)
+```
+
+It asserts build identity, process parenting, quarantine, gate-posture drift, the kernel's startup posture line, and the
+approval/settlement probes — printing what each one *collected*, so a check over an empty set cannot read as green. Exit 1
+means a row failed; exit 2 means it could not run (no lock file), which is deliberately not the same as failing. The manual
+commands below stay as the fallback and as what to read when a row is red.
+
 ```bash
 curl -s http://127.0.0.1:9700/health    # build.sha MUST equal the merge commit you deployed
 ps -eo pid,ppid,command | grep -E "factory/main[.]ts|adapter[.]ts"   # every child's ppid = supervisor
