@@ -22,9 +22,29 @@ npm run verify        # typecheck + pipeline/intake tests + unit suite; expect "
 npm run test:boot     # real kernel + live inference: core spike, pipeline boot, intake boot
 ```
 
-`test:boot` skips cleanly when the inference endpoint is unreachable. **A skip is not a pass** — if it skipped, say so
-in the PR rather than reporting green. Both commands were last run against production data at `603553f`: 592 tests /
-591 pass / 0 fail (one pre-existing skip).
+`test:boot` is **host-tier** (#241): it needs live inference, GitHub runners cannot reach the endpoint, and CI therefore
+never runs it — which is exactly how all three of its suites sat red with a green pipeline above them. Two things make
+that blind spot structural now rather than a reminder:
+
+- `test/test-collection.test.mjs` (part of `npm test`, so CI enforces it) fails if any suite is neither collected from
+  CI's own commands nor declared host-tier with a `// manual-only:` header naming the script that runs it. Deleting the
+  marker, or letting a suite become an orphan, is red.
+- The suites no longer choose their own model. They resolve `DEFAULT_MODEL`, else production's pin at
+  `$DRYDOCK_CONFIG_DIR/lalanikarim_drydock.json`, verify it is served, and skip with a reason rather than falling back
+  to whatever `/models` returns first. Taking `data[0].id` is what broke: the list reordered, the chosen model accepted
+  submissions and never generated, and the printed diagnosis ("provider unreachable") was false.
+
+Because a skip exits 0, count results instead of trusting the exit code — and never take an exit code through a pipe:
+
+```bash
+set -o pipefail
+npm run test:boot 2>&1 | tee /tmp/boot.log
+grep -c "all checks passed" /tmp/boot.log   # must be 3 — one per suite, same shape in all three (#241)
+grep -c "SKIP" /tmp/boot.log                # must be 0; a skip is not a pass (#241)
+```
+
+Last run on the host at `a3a2c03`: `npm run verify` → 695 tests, 0 fail (one pre-existing skip); `test:boot` → 3/3
+"all checks passed", 0 skips, model resolved from `drydock-config`.
 
 ## Step 2 — infrastructure truth, before your code is blamed for it
 

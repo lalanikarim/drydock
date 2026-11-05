@@ -1,3 +1,5 @@
+// manual-only: needs live inference at OPENAI_BASE_URL, which GitHub runners cannot reach; run with npm run test:boot
+//   A CI job running this would print green over an empty skip (#241). The release checklist runs it on the host.
 // Phase 0 spike (issue #30): prove the engram core seam from a pinned drydock
 // checkout — before any factory pipeline code moves onto it.
 //
@@ -158,4 +160,9 @@ test("engram core seam spike (issue #30 phase 0)", { timeout: 120_000 }, async (
     if (!closed) console.error("  NOTE: instance not closed — test failed mid-flight");
     rmSync(spikeBase, { recursive: true, force: true });
   }
+
+  // One summary line per boot suite, so `npm run test:boot` can be verified by counting lines instead of reading
+  // three different output shapes. Under node:test a failure aborts before this, so printing it here means "every
+  // assertion above held" — the release checklist counts these (#241).
+  console.log("core spike (engram seam): all checks passed");
 });
