@@ -1,10 +1,14 @@
 # Production readiness assessment + session handoff — 2026-11-01
 
+> **Updated 2026-11-05 — §1 re-verdicted: the blockers changed shape, and one of last week's two reasons is measured fixed.** Verified state: drydock `main` = **`d647c3c`**, suite **643 tests / 0 fail** (one pre-existing skip), typecheck clean; fleet on **`6ce582e`** (delta to main is docs-only — no restart owed), `/health` ok, inference reachable, 0 quarantine, gate-posture and approval-block probes exit 0. engram vendored at **v0.2.4** (`2072958`); its `main` is two *docs* commits past the tag, which under the version-truth rule now written into its README is correct rather than drift. Shipped since the previous update: engram **v0.2.2 / v0.2.3 / v0.2.4**, drydock **#218** (tool-boundary refusal), **#222/#225** (one worker per issue; no silent retry after a wall-budget abort), **#226/#229** (`POST /factory/intake/reopen`), `fleet/runbook-aborts.md`, and the **throughput batch run then cancelled at n=2** (`research/factory-throughput-baseline.md` §6–§7).
+>
+> Two claims in this document were falsified by that work, both in the favorable direction: **per-file approvals no longer make ordinary runs attended** (engram v0.2.3 narrowed the floor to effect-bearing args; `engram#76 → PR #77` touched 3 files with **zero approval taps**), and engram is no longer "a repo where nothing has been dispatched". One new gap was found and is open as **#230**: `delegate` cannot distinguish an operator's authorization from the model's assertion about one — my own reopen reason came back as a false claim of scope reduction and #222's guard accepted it, in production, within 90 seconds of deploy. Also discovered while verifying: **eng#78**, nine engram test files (incl. `hardening`, `sandbox`, `core-instance`) executed by no CI job — which weakens "CI green" exactly where the trust story leans on it.
+>
 > **Updated 2026-11-04 (late) — §1 verdict rewritten; the old one cited P0s that had all shipped.** Verified state: drydock `main` = **`723161b`**, suite **615 tests / 614 pass / 0 fail** (one pre-existing skip), typecheck clean, boot tests genuinely executed (live model answered; no skips). Fleet restarted onto `723161b`: `/health` → `{status: ok, build.sha: 723161b, inference: reachable}`, lock held by the supervisor pid, 0 quarantine lines, approval probe 5/5 explained, settlement window clean (exit 0).
 >
 > Four things changed the picture materially. **(1) A shipped defect was killing every review.** #209 (`dfd13f4`, deployed as `23a3e19`) spliced an import statement into a jq string literal in `factory/reviewer.ts`; `gh --jq` could not parse it, so **every review died at SPAWN** — 611 tests and strict CI green, latent only because no review had run since the deploy. Found by running the real thing (#211). **(2) The second repo did real work for the first time.** `engram#65` was labeled `build` at 19:33 UTC; at ~20:00 **engram PR #74** existed — draft, `+159/-5`, `app/src/core.ts` + a new 150-line test wired into `test:unit`, `unit-suite` pass. It needed **two destructive-write approvals** (one per new file) and delivered the first production `pr_opened` notification (`message_id=183`), which is the observation #64 was waiting on. **(3) #168 closed on its own pre-registered criterion**: reviewer-side lessons produced no discrimination across two matched pairs → enforce in gates (#212). The queued twin trap pair is **retired**. **(4) Backups are now scheduled and restore-proven** (`com.drydock.backup`, daily, `--keep 7`, proven via `launchctl kickstart`), with the off-host gap filed as #213.
 >
-> Two defects came out of the dispatch and are open: **#214** (model-supplied `feedback.prNumber = 0` faults a worker at SPAWN instead of refusing at the tool boundary) and **engram#69**, which now carries production evidence that per-file destructive approvals make engram runs *attended*.
+> Two defects came out of the dispatch and are open: **#214** (model-supplied `feedback.prNumber = 0` faults a worker at SPAWN instead of refusing at the tool boundary) and **engram#69** (both since closed: #218 and v0.2.3 respectively — the latter is what changed the Bar B reasoning below).
 >
 > **Updated 2026-11-03.** Since the 2026-11-02 update: **#141 shipped and live** (durable per-issue wall-budget cap + `POST /factory/runs/abort`, #153, proven against a real running task), **#120 shipped** (runbook §7c containment, commands executed against production, #158), **#143 closed** (supervisor survives a bad config read in its own recovery path, #150), **#133 closed for items 1–2** with two alert-swallowing defects found and fixed on the way (#160: a catch-all dedupe key plus a time window that deleted the all-clear), and **#64 closed** — production made its first auditable Telegram send (`message_id=121`). Battery final tally recorded as **8 of 9**. New issue **#161**: settlements that produced no work are counted nowhere. Suite **448 pass / 0 fail**; fleet on `e4d89e1`.
 >
@@ -30,20 +34,34 @@ Related documents: `research/multi-repo-factory-plan.md` (design record, §5.1�
 
 ---
 
-## 1. Verdict (refreshed 2026-11-04; the pre-history verdict is preserved below it)
+## 1. Verdict (refreshed 2026-11-05; earlier verdicts preserved below)
 
-**Bar A: met and demonstrated in two repositories. Bar B: no, and the blockers are infrastructure and human-in-the-loop policy, not code.**
+**Bar A: met, and demonstrated repeatedly across two repositories rather than once. Bar B: no — but it is now four named blockers instead of a general condition, two of them under an hour each, and one of last week's two reasons has been measured fixed.**
 
 | bar | distance |
 |---|---|
-| Single-operator, single-host fleet: labeled issue → reviewed draft PR, cannot merge what it wasn't allowed to, announces when it stops | **Met.** All four P0s shipped (P0-4 now scheduled *and* restore-proven). Proven in drydock (`agent/issue-80`, `agent/issue-105` merged) and — first time as of 2026-11-04 — in a second repo: `engram#65` → **engram PR #74**, draft, CI green. The safety property held throughout: `autoMerge: false` everywhere, so nothing landed without a human |
-| Trustworthy without a human watching | **No.** Two independent reasons, both newly measured rather than assumed: **(a)** engram runs block on one destructive approval *per file written* (2 files → 2 gates → 2 Telegram alerts; see engram#69), so "unattended" is false in practice while the real controls (draft PR, required CI, human merge) remain intact; **(b)** one laptop, one inference endpoint, one public funnel, and backups on the same disk as the stores. **#213 parked by operator decision 2026-11-05: single-disk risk explicitly accepted**, so it is a stated risk rather than pending work (see §"Off-host recovery"). Infrastructure, not code quality |
+| Single-operator, single-host fleet: labeled issue → reviewed draft PR, cannot merge what it wasn't allowed to, announces when it stops | **Met.** All four P0s shipped (P0-4 scheduled *and* restore-proven). Proven in drydock (`agent/issue-80`, `agent/issue-105` merged) and repeatedly in a second repo: `engram#65` → **#74** (merged), plus `engram#76` → **#77** and **#79** — multi-file, unattended, `unit-suite` green. The safety property held throughout: `autoMerge: false` everywhere, protected mains in both repos, and `merge_pr` deliberately keeps **both** the prompt tier and the full destructive floor, so nothing lands without a human |
+| Trustworthy without a human watching | **No.** Last week's reason **(a) — one destructive approval per file written — is fixed and measured**: the floor judges effect-bearing args only (engram v0.2.3), and `#76 → PR #77` touched 3 files with **zero approval taps**. What remains is four specific things, table below. Infrastructure and verification depth, not code quality |
+
+**The four blockers on Bar B, ranked by cost to close:**
+
+| | gap | why it blocks the claim | cost |
+|---|---|---|---|
+| 1 | **#217 — nothing supervises the supervisor**: no launchd unit, no `KeepAlive`, no liveness alert | a reboot leaves the factory down **silently**. Every alert that exists is event-driven (`pr_opened`, run failures), so absence of alerts ≠ presence of service. This is also why #226's reopen gap mattered so much: recovery was manual in two ways at once | ~30 min, one plist + one install |
+| 2 | **eng#78 — nine engram suites executed by no CI job** (`hardening`, `sandbox`, `core-instance`, …) | "CI green" is load-bearing for the entire trust story, and for gate/containment changes it is currently weaker than assumed. Third instance of this class in one repo: R10 (an enumerated `npm test` that skipped a suite), the checklist's library-"gates", eng#76's own artifact | ~45 min + fixing what fails |
+| 3 | **#230 — the retry guard is soft by design**: any non-empty model-authored `replan` authorizes another ~40-min spend; the hard stop is only the cap at two aborts (#141) | cost containment without a human *is* the definition of unattended. Demonstrated in production, not argued: a false scope claim derived from my own reopen wording passed the guard in 90 seconds | hours; spec written in the issue |
+| 4 | **#213 — one disk holds stores and backups (operator-accepted)** | restore-proven ≠ recoverable; nobody has rebuilt on a clean host. Parked deliberately on 2026-11-05, so this is a stated risk, not pending work — but it stays a Bar B fact until someone else's hardware holds a copy | needs a destination + key custody decision 🧑 |
 
 **What the old verdict got wrong.** It said "Not production-ready — P0 items 1–4: ~3–4 days". All four shipped; a reader taking that line at face value would have queued work that was already done. The lesson is the same one this repo keeps learning: **a status document is a claim with an expiry date**, and the honest failure mode is not "wrong" but "stale in a way that misroutes effort".
 
+Against the definition of "production-ready" argued at the bottom of this document — *"the state survives host
+loss and a restore has been performed, not designed"* — we now fail exactly one clause, and fail it on purpose
+(#213). Everything else in that sentence is either satisfied or listed above.
+
 **What is still unproven, stated without spin:**
 
-- **Throughput.** Two merged factory-authored PRs in drydock's entire history and one draft in engram — n=3. There is no reliability distribution behind the word "unattended", and #147 (one 900 s stall, passed in 48 s on re-run) is the only latency variance ever measured.
+- **Throughput.** Still no distribution behind the word "unattended". The batch that was supposed to produce one was **cancelled at n=2** (`factory-throughput-baseline.md` §7): dispatch 3+ would have needed tasks invented to fit the wall budget, and measuring tasks invented to be measurable measures the invention. What two runs did establish: a drydock-sized task does not fit 2400 s (setup alone is ~4 min), an over-large task costs ~2× without #222; engram#76 completed in **3.3 min**. Latency variance is still only #147 (one 900 s stall, 48 s on re-run).
+- **"CI green" as a proxy for safe.** True for the suites that run; **eng#78** shows containment/gate suites can exist and run nowhere. Until that is wired or declared manual with a check that fails when an unrun file appears, "required status passed" understates the risk of a gate regression.
 - **Off-host recovery — ACCEPTED RISK (2026-11-05).** Restore is proven on the same disk as the data. Nobody has rebuilt the factory from backups on a clean host. The operator chose to park #213 rather than choose a destination and key custody, so disk loss or host loss means losing the stores; restore-proven does **not** mean recoverable. Revisit if the store ever holds something worth more than re-creating it by hand.
 - **Reach discipline.** `gates/github-app-check.mjs` still reports `modelarena` and `collective` as reachable-but-unmanaged; intake refuses them, so this is leaked-key blast radius, not ordinary operation.
 - **The feedback loop as a lever.** Both prompt channels (worker-side #168 hypothesis 1 at n=1, reviewer-side hypothesis 2 across two matched pairs) produced no reliable discrimination. Enforcement of rule placement moves to gates (#212).
@@ -210,10 +228,12 @@ are not).
 
 ## 4. P1 — before "multi-repo production"
 
-- **Second real repo wired; still nothing dispatched there.** M1/M2/M4 passed on purpose-built fixtures
-  (`factory-fixture`, `factory-fixture-2`), and drydock remains the only repo that has done real self-work.
-  Fixtures prove mechanics, not usefulness. engram is now managed (below) — what is missing is one labeled issue
-  taken end to end there, with its own verification run.
+- **Second real repo wired, used, and shipping.** M1/M2/M4 passed on purpose-built fixtures
+  (`factory-fixture`, `factory-fixture-2`), and the "fixtures prove mechanics, not usefulness" gap closed: engram
+  has taken labeled issues end to end four times — `#65 → PR #74` (merged as v0.2.2), `#76 → #77`, `#79`, plus
+  `#69`'s gate fix released as v0.2.3/v0.2.4 — with the factory's own pin discipline holding (`vendor/engram` at
+  tags, drydock bumping per release). What is left of this P1 is not "does it work there" but **eng#78**: nine
+  engram suites run in no CI job, so green there means less than it should.
 - **engram is a managed repo (#78 narrowed, 2026-11-01).** The registry carries `lalanikarim/engram`
   (`enabled:true`, `autoMerge:false`, eligibility label `build`, `poc/lib/` protected because drydock vendors the
   kernel and a run must not break the pin discipline), with a fleet entry, a per-repo webhook secret in `.env`,
@@ -256,6 +276,14 @@ refusal budget stopping runs structurally; single-instance lock with crash recla
 delivery sweep + acknowledge workflow under launchd with exit-code propagation; capability assert-and-read-back
 at boot; App credential with hourly installation tokens, PEM outside the tree, placeholder secrets refused at
 boot; hermetic CI (no model endpoint, no containers, no fixture mutation).
+
+Added 2026-11-05, each with production evidence rather than intent: the destructive floor judging **effect-bearing
+args only for known tools while unknown tools stay strict** (deployed-config replay: 7/7 recorded false positives →
+0/7, 8/8 genuinely dangerous calls still trip); a **boot-time posture line naming every narrowed tool**, checked by
+a gate rather than remembered; an **operator abort ladder** where `conversationId` demonstrably stops the
+orchestration loop and interventions are attributed in the durable ledger (`document_revisions` delta observed);
+and a **reopen verb that appends history instead of deleting it**, with a test that fails if the budget ledger is
+touched at all.
 
 **Standing risk that stays accepted:** R13/#95 — untrusted text is fenced (`<untrusted>`), not sandboxed. A
 hostile issue can waste a run or fail one cleanly; it cannot widen what a run may touch. AGENTS.md is
