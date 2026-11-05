@@ -6,6 +6,26 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Seventeenth refresh — 2026-11-05 (late evening)
+
+Verified state: drydock `main` = **`a3a2c03`**, suite **695 tests / 0 fail** (one pre-existing skip), typecheck clean, and for the first time `npm run test:boot` → **3/3 "all checks passed", 0 skips**. Fleet running `a3a2c03`, `fleet/verify-deploy-posture.mjs` → `PASS`. Local and remote branches pruned to `main` alone (7 merged locals deleted after ancestry checks; the one non-ancestor carried only a commit already contained in an open PR branch).
+
+**#241 root-caused, and it was not what the error message said.** The boot suites chose their model with `data[0].id` from `/models`. That is not a decision, it is the order Unsloth Studio returned that day; when the list reordered, `intake-boot` picked a model that was listed, accepted submissions, wrote two user entries, and never produced an assistant turn — while the same endpoint answered a raw completion for that model in 5.9 s. The suite printed "provider whose host is unreachable", which was false twice over: nothing was unreachable, and no CI job runs the suite. Fix in three parts: `factory/boot-model.ts` resolves `DEFAULT_MODEL` → production's own pin (`$DRYDOCK_CONFIG_DIR/lalanikarim_drydock.json`), verifies it is served, and **skips with a reason instead of falling back**; the failure message now names the model, the source, and the two silent causes; and `test/test-collection.test.mjs` — in `npm test`, so CI enforces it — fails when any suite is neither reachable from CI's own commands nor declared host-tier with `// manual-only: …; run with npm run <script>`.
+
+Why these three are *declared* rather than wired into CI: GitHub runners cannot reach `aurora.infinidigm`, and the suites skip cleanly when inference is absent. Adding them to CI would print green over an empty run — R6b/R10 arriving through the front door. So CI stays hermetic, the boot tier is host-tier by declaration, and the release checklist counts lines (`grep -c "all checks passed"` = 3, `grep -c SKIP` = 0) because a skip exits 0.
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **#238 — hash the issue body at abort, compare on retry.** Unchanged: the mechanical half of #230 that provenance cannot do. | 🤖 |
+| 2 | **eng#81 — nightly live tiers.** Now has a second reason to exist: the host-tier boot suites are declared and checked, but nothing *schedules* them, so they still only run when a human remembers. Deferred with launchd. | 🧑 deferred |
+| 3 | **#217 fleet supervision** — deferred. A reboot still leaves the factory down silently. | 🧑 deferred |
+| 4 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture. | 🤖🧑 |
+| 5 | #147 passive · #172 upstream-only (`pi-durable`) · #42 design doc | mixed 🧑 |
+
+**The finding to carry, sharpened.** #241 was not a missing test; it was a test whose *input choice* was an environment accident and whose *failure message* misdiagnosed itself. Two questions for any green check: can the state it asserts occur in production, and would anything notice if it stopped running? A third now belongs with them: **does it pick its own inputs by position in a list that someone else reorders?**
+
+---
+
 # Sixteenth refresh — 2026-11-05 (evening)
 
 Verified state: drydock `main` = **`0a0455b`**, suite **686 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`0a0455b`** — `fleet/verify-deploy-posture.mjs` → `PASS`, seven rows, exit 0. engram unchanged at `d48aee1` / vendored tag `v0.2.4`. No open PRs.

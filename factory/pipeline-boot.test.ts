@@ -1,3 +1,5 @@
+// manual-only: needs live inference at OPENAI_BASE_URL, which GitHub runners cannot reach; run with npm run test:boot
+//   A CI job running this would print green over an empty skip (#241). The release checklist runs it on the host.
 // Phase 1 boot test: the full factory pipeline composed on createCoreInstance.
 // Hermetic — temp dirs under os.tmpdir(), ephemeral port, no podman (no
 // sandboxed conversations are started), no GitHub calls. Skips cleanly when
@@ -11,24 +13,27 @@ import { fileURLToPath } from "node:url";
 // Kernel's declared public surface (app/src/core.ts), not internal modules.
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
 import { instanceGatesConfig } from "./gate-policy.ts";
-import { parseProviderCatalog, providerForBaseUrl } from "./model-catalog.ts";
+import { chooseBootModel, listServedModels } from "./boot-model.ts";
 
-// Provider resolution is not a detail (#171): a ref naming a provider the kernel never registered is accepted and
-// never runs, so this asked for `openai-completions` while production names a provider declared in
-// <agentDir>/models.json. Same catalog, same precedence as the kernel.
-async function firstModelRef(base: string): Promise<{ provider: string; modelId: string }> {
-  const r = await fetch(`${base.replace(/\/$/, "")}/models`, {
-    headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY ?? ""}` },
-    signal: AbortSignal.timeout(5000),
-  });
-  const j = (await r.json()) as { data?: Array<{ id: string }> };
-  const id = j.data?.[0]?.id;
-  if (!id) throw new Error("no models reported by /models");
+// Model selection is a policy, not a coincidence (#241). This used to take `data[0].id` from /models — which is not
+// a choice but a dependency on the order an inference server happens to return today. `factory/boot-model.ts` now
+// resolves DEFAULT_MODEL or production's own pin, verifies it is served, and skips loudly otherwise; provider
+// resolution lives there too (#171: a ref naming a provider the kernel never registered is accepted and never runs),
+// so the two boot suites cannot drift into measuring different systems.
+async function bootModelRef(base: string): Promise<{ provider: string; modelId: string }> {
+  const served = await listServedModels(base);
   const agentDir = process.env.PI_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
   const catalogPath = join(agentDir, "models.json");
-  const declared = providerForBaseUrl(parseProviderCatalog(existsSync(catalogPath) ? readFileSync(catalogPath, "utf8") : null), base);
-  return { provider: declared ?? "openai-completions", modelId: id };
+  const catalogRaw = existsSync(catalogPath) ? readFileSync(catalogPath, "utf8") : null;
+  const chosen = chooseBootModel({ served, baseUrl: base, catalogRaw });
+  if (!chosen.ok) {
+    console.log(`core boot (factory pipeline): SKIP — ${chosen.reason}`);
+    process.exit(0);
+  }
+  console.log(`check: model ${chosen.ref.provider}:${chosen.ref.modelId} resolved from ${chosen.source}, served by ${base}`);
+  return chosen.ref;
 }
+
 import { factoryPipeline, ORCHESTRATOR_INSTRUCTIONS } from "./pipeline.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -91,7 +96,7 @@ const config = loadConfig({
 
 const auth = { authorization: `Bearer ${process.env.API_TOKEN ?? ""}` };
 
-const modelRef = await firstModelRef(baseUrl);
+const modelRef = await bootModelRef(baseUrl);
 
 const ext = factoryPipeline({
   workDir: workRoot,

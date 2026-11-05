@@ -1,3 +1,5 @@
+// manual-only: needs live inference at OPENAI_BASE_URL, which GitHub runners cannot reach; run with npm run test:boot
+//   A CI job running this would print green over an empty skip (#241). The release checklist runs it on the host.
 // Real-kernel verification of intake conversation scoping (#122).
 //   node --experimental-strip-types factory/intake-boot.test.ts
 //
@@ -23,7 +25,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { AgentDoc, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts";
 import { instanceGatesConfig } from "./gate-policy.ts";
-import { parseProviderCatalog, providerForBaseUrl } from "./model-catalog.ts";
+import { chooseBootModel, listServedModels } from "./boot-model.ts";
 import { createIntakeRoute } from "./intake-router.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -84,29 +86,24 @@ const probeTool = defineTool({
 
 const probeExtension = defineExtension({ name: "intake-probe", tools: [probeTool] });
 
-const modelsRes = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
-  headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY ?? ""}` },
-});
-const modelsBody = (await modelsRes.json()) as { data?: Array<{ id: string }> };
-const modelId = modelsBody.data?.[0]?.id;
-if (!modelId) throw new Error("no models reported by the inference endpoint");
-// Provider resolution matters more than it looks. A ref naming a provider the kernel never registered does NOT fail
-// loudly: the submission is accepted, no task is created, and no assistant turn ever appears. That silence is what
-// made this test red for reasons that looked like a model outage (#171) — it defaulted to "openai-completions"
-// while production runs on a provider *declared* in <agentDir>/models.json (`aurora`), and a declared provider wins
-// over the env-driven registration. So: DEFAULT_MODEL wins, otherwise ask the same catalog the kernel was handed
-// which provider serves OPENAI_BASE_URL, and skip loudly rather than guess if nothing declares it.
+// Model selection is a policy, not a coincidence (#241). The line this replaces was
+// `const modelId = modelsBody.data?.[0]?.id` — a dependency on the order Unsloth Studio returned its list today.
+// When that order changed, this suite picked `unsloth/gemma-4-E4B-it-GGUF`, submissions were accepted, two user
+// entries appeared, waitForIdle returned, and no assistant turn was ever produced; the endpoint answered a raw
+// completion for that same model in 5.9 s, so "provider unreachable" (the message this suite printed) was false
+// twice over. Resolution now lives in factory/boot-model.ts: DEFAULT_MODEL, else production's own pin, verified as
+// served, and a loud skip rather than a fallback — because a boot suite against some other model proves nothing
+// about production.
 const agentDir = process.env.PI_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
 const catalogPath = join(agentDir, "models.json");
 const catalogRaw = existsSync(catalogPath) ? readFileSync(catalogPath, "utf8") : null;
-const declaredProvider = providerForBaseUrl(parseProviderCatalog(catalogRaw), baseUrl);
-if (!process.env.DEFAULT_MODEL?.includes(":") && !declaredProvider) {
-  console.log(`intake boot (#122): SKIP — no provider in ${catalogPath} serves ${baseUrl}; a ref naming an unregistered provider is accepted and never runs (#171)`);
+const served = await listServedModels(baseUrl);
+const chosen = chooseBootModel({ served, baseUrl, catalogRaw });
+if (!chosen.ok) {
+  console.log(`intake boot (#122): SKIP — ${chosen.reason}`);
   process.exit(0);
 }
-const modelRef = process.env.DEFAULT_MODEL?.includes(":")
-  ? { provider: process.env.DEFAULT_MODEL.split(":")[0]!, modelId: process.env.DEFAULT_MODEL.split(":").slice(1).join(":") }
-  : { provider: declaredProvider!, modelId };
+const modelRef = chosen.ref;
 console.log(`probe conversation model: ${modelRef.provider}:${modelRef.modelId}`);
 
 const logLines: string[] = [];
@@ -235,7 +232,13 @@ try {
   const assistantTurns = await entryKinds(convA);
   assert.ok(
     assistantTurns.some((k) => String(k).includes("assistant")),
-    `non-vacuity: the first submission must produce an assistant turn (entry kinds: ${assistantTurns.join(",") || "none"}) — a conversation that only ever holds the user entry means generation never ran, usually a provider whose host is unreachable`,
+    `non-vacuity: the first submission produced no assistant turn (entry kinds: ${assistantTurns.join(",") || "none"}). ` +
+      `Model: ${modelRef.provider}:${modelRef.modelId} (from ${chosen.source}); endpoint served ${served.length} model(s), ` +
+      `including this one: ${served.includes(modelRef.modelId)}. Intake is not the suspect — the route and envelope checks ` +
+      "above passed. Two silent causes have made this red before (#241): a ref naming an unregistered provider, which is " +
+      "accepted and never runs (#171, guarded in factory/boot-model.ts), and a model that is listed but does not generate " +
+      "here — a raw /v1/chat/completions call settles that in seconds. Do not conclude 'provider unreachable' from this " +
+      "line alone; that diagnosis was wrong once already.",
   );
   assert.ok(echoCalls >= 1, `non-vacuity: probe_echo must have executed for the first submission (got ${echoCalls}) — without this, the duplicate check below is vacuous`);
   const before = echoCalls;
