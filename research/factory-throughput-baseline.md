@@ -1,7 +1,7 @@
 # Factory throughput — baseline and pre-registered metrics
 
 **Compiled 2026-11-04, before the batch it describes.** The definitions below are fixed in advance so the
-batch cannot be scored generously afterwards. Results go in §5; if a metric turns out to be unmeasurable, that
+batch cannot be scored generously afterwards. Results go in §6 (§5 was the design); if a metric turns out to be unmeasurable, that
 is recorded as a defect of the metric, not quietly dropped.
 
 ## 1. Why pre-register
@@ -136,3 +136,31 @@ Checking that led to [engram#78](https://github.com/lalanikarim/engram/issues/78
 2. **Size tasks against measured setup cost**, not optimism: drydock-side work pays `npm ci` + a 619-test suite inside the run, so "small" issues there are not small. Docs/test-shaped tasks in engram completed in single-digit minutes.
 3. **Never forbid a worker from touching test wiring.** If a task may add a test, its spec must permit registering it, or the artifact is decoration.
 4. The success/failure definitions in §1–2 held up; no post-hoc redefinition was needed to describe these two outcomes.
+
+## 7. Closed at n=2 — the operator's decision, 2026-11-05
+
+The batch was cancelled rather than resumed. The reasoning is worth keeping because it is an argument about
+measurement, not about time or cost:
+
+**A throughput batch needs work that would have been done anyway.** To run dispatches 3–4 I would have had to
+invent tasks sized to fit the wall budget — and a task invented to be measurable measures the invention. The
+number would have been real arithmetic over fabricated inputs, which is exactly the failure this document was
+written to avoid (§1: "the factory works unattended" has been implied by three landed changes). n=2 with two
+genuine pieces of work is more honest evidence than n=5 of mine.
+
+**What n=2 actually established**, and what it did not:
+
+| claim | status after n=2 |
+|---|---|
+| A drydock-sized task does not fit `wallSecsPerIssue=2400s` | **established** — dispatch 1 hit the cap; setup (`npm ci`) plus a 600-test suite is paid inside every run, so "small" issues in this repo are not small |
+| Over-large tasks cost ~2× budget without #222's guards | **established once, by measurement** (~80 min for one 40-minute task) — and now fixed in `f8b5c11` |
+| Docs/test-shaped work in engram completes in single-digit minutes with zero approvals | **one observation**, not a rate. n=1 |
+| "The factory runs unattended" | **not established.** Two runs, one of which needed two operator aborts to stop. Unattended-ness is a property of the guardrails (#226's reopen gap, #217's absent supervision), not of this sample |
+
+**What would justify rerunning it:** real backlog (work you would otherwise do by hand), ≥5 items, at least one in
+each repo, with `wallSecsPerIssue` sized from §4's measured setup cost rather than optimism — and #226 landed, so a
+failed dispatch can be retried without filing a replacement issue.
+
+**Consequential fixes this produced anyway**, which is where the value actually was: #222 (re-delegation guard,
+shipped), #226 (one-dispatch-per-issue-ever trap, found while trying to re-run a failed dispatch), engram#78 (nine
+test files executed by no CI job, found while reviewing the one successful dispatch), and `fleet/runbook-aborts.md`.
