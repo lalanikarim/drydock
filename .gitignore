@@ -9,3 +9,7 @@ fleet/fleet.local.json
 
 # Gate/experiment run artifacts written into the checkout (gates/g5-feedback.mjs)
 g5-results.json
+
+# pi project settings: per-operator local defaults (model, thinking level, theme).
+# Shared project config would be a deliberate commit; personal model choices are not.
+.pi/settings.json
