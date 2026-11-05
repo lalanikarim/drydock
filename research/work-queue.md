@@ -6,6 +6,25 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Fourteenth refresh — 2026-11-05 (morning)
+
+Verified state: drydock `main` = **`d647c3c`**, suite **643 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`6ce582e`** — the delta since is docs + `.gitignore`, so no restart is owed. engram `main` = **`43b1350`**, vendored at tag **`v0.2.4`**; main is two docs commits past the tag, which per the version-truth rule needs no release. Health ok, inference reachable, 0 quarantine, nothing running, both probes exit 0. **No open PRs in either repo.**
+
+**What changed since the thirteenth refresh:** #226 shipped and closed (**#229**, `POST /factory/intake/reopen`), the throughput batch is cancelled (§7 of the baseline doc), **#213 is parked as an accepted risk**, engram's version truth is documented (#80), and operating the new verb surfaced **#230** — see below. Merges happened again today, but only under explicit per-round instruction ("merge what needs to be merged"); the standing default remains **drafts for your review**.
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **eng#78 — nine test files executed by no CI job**, including `hardening`, `sandbox`, `core-instance`. Triage: wire what belongs in `test:unit`, declare the rest manual, and add the check that fails when an unrun test file appears. Highest-known-risk item on the board: a containment regression lands green today, and this repo has now produced three separate "green while collecting nothing" defects (R10, #231-class gates, eng#76's own artifact). | 🤖 |
+| 2 | **#230 — `delegate` cannot tell an operator's authorization from the model's assertion about one.** Found live within 90 s of #226 deploying: my reopen reason ("slice reduced to assertion 4 only") came back as the model's false claim of completed scope reduction, and #222's guard accepted it because the rule is "non-empty string". Fix is small and already specified in the issue: host-issued grants (consumed on use), `replanSource` provenance in ledger + log, and the one mechanical check that exists — did the issue body change since the abort. | 🤖 |
+| 3 | **#220 — deploy-posture verifier, sliced to assertion 4 only** (policy vs on-disk `gates.json` drift, which is a hole in #219's own claim). Now dispatchable two ways: edit #220's body down to the slice and **reopen** it (also produces real `reopen-2` evidence), or file a fresh issue. Two rules from hard experience: the spec must **permit registering its own test**, and setup is ~4 min of any budget, so one assertion per dispatch. | 🤖 |
+| 4 | **#217 fleet supervision** — deferred by you, still true: a reboot leaves the factory down silently, no `KeepAlive`, no alert. ~30 min, one plist + one install command. | 🧑 |
+| 5 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture; treat as fixture work, not code work. | 🤖🧑 |
+| 6 | #147 passive (needs a live T2 stall) · #172 upstream-only (`pi-durable`; local `assertAbortable` already refuses boot without the fix) · #42 design doc | mixed 🧑 |
+
+**The one finding worth carrying into every future change:** #230 is not only about replans. A string that a model supplies and a guard merely checks for non-emptiness is a formality — and the operator's own words, injected as authoritative context, become the raw material for that claim. The same shape appeared as prompts-inert (#168), a gate collecting nothing (R10), and a test file no job ran (eng#78). Ask of any new control: *what observable thing does this make harder?*
+
+---
+
 # Thirteenth refresh — 2026-11-05 (overnight)
 
 Verified state: drydock `main` = **`e1dce67`**, fleet running **`f8b5c11`** (delta is docs-only; no restart owed). engram `main` = `2072958`, released as **v0.2.4**, vendored at that tag. Suite 633 tests / 0 fail. Fleet health `build.sha: f8b5c11`, inference reachable, 0 quarantine, approval-block probe exit 0, settlement window clean.
