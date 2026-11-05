@@ -49,11 +49,29 @@ exclusive — sending both is rejected with 400 rather than guessed.
 The wall-budget ledger (`factory/budget-ledger.ts`) counts **budget** aborts toward the cap that stops an issue;
 operator aborts are recorded separately and never charged:
 
-```console
-$ python3 - <<'PY'   # read-only peek at a live instance's ledger
-... 220: {budgetAborts: 1, operatorAborts: 1, stopped: false}
-PY
+Two operational facts about that ledger, both learned by getting them wrong first:
+
+**1. Attribution requires `issueNumber` in the abort body.** `noteOperatorAbort` runs only when the caller names
+the issue — the code refuses to infer it from conversation names rather than invent data. My first two aborts
+tonight omitted it, so they cost the issue nothing *and* left no trace of ever having happened:
+
+```bash
+curl -sS -X POST "$BASE/factory/runs/abort" -H "authorization: Bearer $TOKEN" \
+  -d '{"conversationId":2059,"issueNumber":220,"reason":"operator: over-scoped, stopping before another 40 min"}'
 ```
+
+**2. Read the newest revision, not a base snapshot.** The current state of a document lives in `document_revisions`
+as a delta chain; querying for the last *base* snapshot shows an older value. I concluded from one that attribution
+had failed, when it had worked:
+
+```console
+$ sqlite3 -excluded-names . "select seq, content from document_revisions where document_id=1779 order by seq desc limit 1"
+25610|[["s",["issues","220","operatorAborts"],1],["s",["issues","220","lastReason"],
+        "operator: reopen reason described a reduced slice that the issue body does not contain; …"]]
+```
+
+(The base snapshot at seq 20758 still said `operatorAborts: 0`. Both are correct for their point in time; only one
+is current. A read-only connection — `file:…?mode=ro` — is the right way to poke at a live store.)
 
 Rationale (#141): if pressing the stop button locked an issue, the button would go unused and runaway runs would
 burn budgets while a human decided whether they were allowed to intervene. The consequence, which #222 fixed, is
@@ -128,6 +146,34 @@ what changed, and the string goes into the new conversation verbatim (quoted) pl
 
 So the retry chain is: **reopen** (restores dispatchability) → **`delegate` refuses without `replan`** (#222)
 → **stop at two aborts** (#141). Each layer keeps its own job.
+
+### Write the reason as a fact, not an intention — your words become the model's justification
+
+The reopen reason is injected into the fresh conversation as authoritative operator context. Ninety seconds after
+#226 shipped, that produced this in production (build `6ce582e`):
+
+```console
+reopen — reopened issue #220 as issue-220#reopen-1 … : slice reduced to assertion 4 only (policy vs on-disk gates.json drift)
+[factory.delegate] issue #220 re-delegated after a budget abort with replan: … the issue has since been sliced down
+  to assertion 4 only …
+```
+
+The second line is #222's guard accepting a retry — and **the claim was false**. Issue #220's body still asked for
+six assertions; nothing had been sliced. I had written "slice reduced to…" as an intention, the model restated it
+as a completed fact, and `delegate` passed its "non-empty string" test. That is #222's own caveat ("prose with a
+receipt, not a wall") reproduced live, plus a mechanism nobody had named: the operator authorizes, the model claims
+the authorization, the guard sees a claim.
+
+So, until [#230](https://github.com/lalanikarim/drydock/issues/230) separates host-issued authorization from
+model-authored assertion:
+
+- Write reasons as things that are **already true** — "issue body now covers only assertion 4" (after editing the
+  body), not "slice reduced to assertion 4".
+- Or write them as explicit operator intent, which is honest and still sufficient: "I am authorizing a second
+  attempt at unchanged scope; accept the budget risk."
+- Expect `delegate` to proceed on any non-empty reason. It is an audit trail, not a wall — and if you want the
+  refusal path observed rather than assumed, that requires a delegate call *without* a replan, which a model that
+  wants to continue will not produce.
 
 ## Partial branches
 
