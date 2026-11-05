@@ -96,14 +96,38 @@ is swallowed at the door. Verified live 2026-11-05, not inferred:
 [factory:lalanikarim/drydock] [factory] lalanikarim/drydock: intake — requestId issue-220 already handled — no new submission
 ```
 
-The dedupe is correct for webhook redelivery; the side effect is that an issue gets **one dispatch per instance
-store, ever**. Current workarounds are all bad in a different way: file a replacement issue (what I did — history
-gets split), hand-edit `IntakeLedgerDoc` in a live sqlite store (do not), or wipe the store (loses lessons and
-ledger). [#226](https://github.com/lalanikarim/drydock/issues/226) proposes a supported reopen verb that records
-a new requestId instead of deleting history, and explicitly does **not** clear the wall-budget ledger as a side
-effect — clearing `budgetAborts` on re-dispatch would undo #141 and #222 in one convenient call.
+The dedupe is correct for webhook redelivery; the side effect was that an issue got **one dispatch per instance
+store, ever**. The workarounds were all bad in a different way: file a replacement issue (what I did — history gets
+split), hand-edit `IntakeLedgerDoc` in a live sqlite store (do not), or wipe the store (loses lessons and ledger).
 
-Until then: to retry an aborted issue deliberately, open a new issue that links the old one and says what changed.
+### The supported verb (#226)
+
+```bash
+curl -sS -X POST "$BASE/factory/intake/reopen" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"issueNumber":220,"reason":"issue split to the drift check only; prior attempt spent 40 min on setup"}'
+```
+
+What it does, and what it pointedly does not:
+
+| | |
+|---|---|
+| **Appends** a new requestId (`issue-220#reopen-1`, then `-2`) | never deletes the original record — attempt count stays readable from history |
+| Opens a **fresh conversation** | never submits into the superseded one: a transcript containing an abort or a refusal treats that as evidence (#122) |
+| Leaves `BudgetLedgerDoc` **untouched** | a reopen that reset `budgetAborts` would undo #141 and #222 in one convenient call; a test asserts no commit touches that document |
+| Returns `budget` + a `warning` when the issue is stopped or has prior aborts | you learn immediately that `delegate` will refuse, instead of finding out from a worker log 40 minutes later |
+
+`reason` is required and non-empty. That is #222's rule applied upward: an authorized second attempt should say
+what changed, and the string goes into the new conversation verbatim (quoted) plus the log line.
+
+```console
+{"reopened":true,"requestId":"issue-220#reopen-1","conversationId":1560,"supersededConversationId":1545,
+ "budget":{"budgetAborts":1,"operatorAborts":1,"stopped":false,"prNumber":null},
+ "warning":"budget ledger shows 1 prior abort(s): delegate will require a non-empty `replan` (#222) …"}
+```
+
+So the retry chain is: **reopen** (restores dispatchability) → **`delegate` refuses without `replan`** (#222)
+→ **stop at two aborts** (#141). Each layer keeps its own job.
 
 ## Partial branches
 
