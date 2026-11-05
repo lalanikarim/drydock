@@ -102,8 +102,18 @@ curl -s http://127.0.0.1:9700/health    # build.sha MUST equal the merge commit 
 ps -eo pid,ppid,command | grep -E "factory/main[.]ts|adapter[.]ts"   # every child's ppid = supervisor
 grep -ci quarantin /tmp/fleet-*.log     # 0 unless a repo genuinely failed to boot (#185)
 node --experimental-strip-types gates/approval-block-probe.mjs       # detection still explains real stores (#188)
+node --experimental-strip-types gates/deploy-posture.mjs             # on-disk gates.json == gate-policy.ts, per instance (#220)
 node --experimental-strip-types gates/settlement-window.mjs          # exits 0 only when every alarming row is examined
 ```
+
+**Why `deploy-posture.mjs` is on this list (#220, 2026-11-05).** Each instance's `config/gates.json` is written at boot by
+whichever build was running, so the file describes *that* build — if main narrows or widens the destructive floor and nobody
+restarts, disk and code disagree and nothing says so. I had been "verifying posture" with `gates/gate-posture.mjs`, a command
+that has never existed in this repository, piped into `tail -2` — which reports `tail`'s exit status, so Node's
+`MODULE_NOT_FOUND` traceback exited **0** and the step looked green. Two lessons, both already written down elsewhere and both
+reproduced anyway: a verification step must name a file that exists, and never take an exit code through a pipe (`cmd; echo $?`
+or `set -o pipefail`, not `cmd | tail`). The gate prints `inspected N of M declared instance(s)` on every run and refuses to
+exit 0 when `M` is zero, because "not collected" and "passing" are the same color.
 
 **Reading it (#204).** The window alarms only for rows nobody has examined, and "examined" is now a recorded state:
 
