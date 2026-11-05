@@ -6,6 +6,28 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Session paused — 2026-11-05 (end of day) **⏸ PENDING OPERATOR**
+
+Nothing is in flight. `main` = **`c0e23c7`**, fleet running it, `fleet/verify-deploy-posture.mjs` → **PASS**, suite **711 / 0 fail**, `npm run test:boot` → **3/3, 0 skips**, branches pruned to `main` alone locally and remotely. Closed today: **#241** (boot tier red because it chose its model by `/models` list position) and **#238** (issue-text hash at abort vs retry), plus #235/#230/#222/#220 earlier in the day.
+
+Two candidates were offered and **deliberately not started** — the operator's decision to stop here, recorded so nobody reads it as an oversight or resumes it unbidden:
+
+| item | state | what unblocks it | roughly |
+|---|---|---|---|
+| **#217 — supervisor supervision** | ⏸ pending, deferred with all launchd work | a yes on installing a launchd unit with `KeepAlive` for the supervisor itself. Until then a reboot leaves the factory down silently and every alert we have is event-driven | ~30 min |
+| **#213 — off-host backups** | ⏸ parked, risk accepted by the operator | a destination + key-custody decision (recommendation on file: cloud object store with client-side `age`). No code decides this | design, then small |
+
+Still open and unchanged in status: **#212** blocked on authoring a two-caller fixture specimen in drydock-fixture · **eng#81** nightly live tiers (deferred with launchd) · #147 passive · #172 upstream-only (`pi-durable`) · #42 design doc.
+
+Zero-cost watch item, worth running before picking anything up:
+
+```bash
+grep -n "byte-identical to the one at abort" /tmp/fleet-*.log    # first #238 contradiction, if any has occurred
+node --experimental-strip-types fleet/verify-deploy-posture.mjs  # is the fleet still what we think it is
+```
+
+---
+
 # Seventeenth refresh — 2026-11-05 (late evening)
 
 Verified state: drydock `main` = **`a3a2c03`**, suite **695 tests / 0 fail** (one pre-existing skip), typecheck clean, and for the first time `npm run test:boot` → **3/3 "all checks passed", 0 skips**. Fleet running `a3a2c03`, `fleet/verify-deploy-posture.mjs` → `PASS`. Local and remote branches pruned to `main` alone (7 merged locals deleted after ancestry checks; the one non-ancestor carried only a commit already contained in an open PR branch).
