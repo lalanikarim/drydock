@@ -98,3 +98,41 @@ about production use.
 ### Results
 
 _Filled in after the runs — see §6._
+
+---
+
+## 6. Results — partial (n=2), recorded 2026-11-05 as the batch ran
+
+| # | repo / issue | class of task | outcome | wall | approvals |
+|---|---|---|---|---|---|
+| 1 | drydock#220 — deploy-posture verifier (script + test + checklist) | multi-file feature | **failure: `budget`** — no PR, nothing pushed | >40 min (wall cap), **~80 min of inference** including re-delegations | 0 |
+| 2 | engram#76 — `docs/gates.md` ops page for `destructiveArgs` | docs + test | **success** — draft PR [engram#77](https://github.com/lalanikarim/engram/pull/77), allowlisted diff, `unit-suite` green | 3.3 min worker | 0 |
+
+Two of four dispatches were planned; the batch is **paused at n=2** for the reason below. Metrics are not computed on n=2 — §1 requires enough runs to classify failures, and one failure here is double-billed by a pipeline defect, which would bias any rate derived from it.
+
+### Dispatch 1, in full (the informative one)
+
+Labeled 23:36:22 UTC. Setup (`npm ci` in the networked container) succeeded; the worker then exceeded `wallSecsPerIssue=2400s`. The abort itself behaved correctly — this is the post-`ce2ed10` path, and it settled cleanly with `partial branch preserved`, attempt 1 recorded. Then:
+
+- the orchestrator **re-delegated the same issue twice**, despite `delegate` returning `retryable:false` + `budgetAborted:true` + a "do not re-delegate" hint;
+- a task-scoped operator abort (`POST /factory/runs/abort {"taskId":1788}` → `settled:true`) did **not** stop the loop — a worker for #220 was running again 0.8 min later;
+- the conversation-scoped abort (`{"conversationId":1545}`) did stop it. Ledger afterwards: `budgetAborts=1`, `operatorAborts≥1`, not stopped — correct per design, since operator aborts are deliberately never charged to the cap.
+
+Root cause of the cost: the structural short-circuit trips at `DEFAULT_MAX_BUDGET_ABORTS = 2`, so after the first abort the only thing standing between the fleet and another full-budget attempt is a sentence in a tool result. It did not hold. Filed as [drydock#222](https://github.com/lalanikarim/drydock/issues/222), which also notes the runbook gap (use `conversationId`, not `taskId`, to stop an orchestration loop).
+
+Scope was my error too: six assertions + tests + a checklist rewrite is not a 40-minute task on this repo. #220 is unlabeled and kept as the parent; the re-dispatch slice is assertion 4 alone (policy-vs-`gates.json` drift) plus its test.
+
+### Dispatch 2, and the defect it exposed
+
+3.3 minutes, three files, zero approvals — the first multi-file task executed end-to-end under the v0.2.3 narrowed floor with no human interaction, which is the in-vivo condition #69/`c993bdd` were shipped for. Verified rather than trusted: the PR's own 11-check verification file passes when run directly; its docs claims match `gates.ts` (posture line verbatim, `[]` semantics, `PATH_DESTRUCTIVE_PATTERNS` list).
+
+The defect: that verification file was **collected by no CI job** — added correctly by the worker, green suite, zero of its checks executed. Cause was my issue text ("Do not touch `package.json` scripts or CI"), which left a compliant worker no way to make its own test run. Wired in `02f535c`; collection is now observable (the file's summary line appears in `npm run test:unit` output). Third instance of the same lesson in this repo: a green run says nothing about what was collected.
+
+Checking that led to [engram#78](https://github.com/lalanikarim/engram/issues/78): nine files in `app/test/` are referenced by **no** script, including `hardening.test.ts`, `sandbox.test.ts` and `core-instance.test.ts` — the suites most likely to catch a containment regression. CI runs only `npm run build` and `npm run test:unit`.
+
+### What this changes about the batch
+
+1. **Fix #222 before dispatching anything else.** Every over-large task currently costs two budgets and needs a human to stop it, which destroys both the wall-time metric and the unattended claim.
+2. **Size tasks against measured setup cost**, not optimism: drydock-side work pays `npm ci` + a 619-test suite inside the run, so "small" issues there are not small. Docs/test-shaped tasks in engram completed in single-digit minutes.
+3. **Never forbid a worker from touching test wiring.** If a task may add a test, its spec must permit registering it, or the artifact is decoration.
+4. The success/failure definitions in §1–2 held up; no post-hoc redefinition was needed to describe these two outcomes.
