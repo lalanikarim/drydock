@@ -86,6 +86,25 @@ Expected lines, all seen live:
 [factory.delegate] issue #220 refused without work: owned by task "task-caller" for 412s (#222)
 ```
 
+## "Just label it again" does not work (#226)
+
+After an orchestration conversation is aborted, re-applying the `build` label **does nothing**. Intake dedupes on
+`requestId`, which for an issue is a constant (`issue-<n>`), and that ledger is a durable document — so the event
+is swallowed at the door. Verified live 2026-11-05, not inferred:
+
+```console
+[factory:lalanikarim/drydock] [factory] lalanikarim/drydock: intake — requestId issue-220 already handled — no new submission
+```
+
+The dedupe is correct for webhook redelivery; the side effect is that an issue gets **one dispatch per instance
+store, ever**. Current workarounds are all bad in a different way: file a replacement issue (what I did — history
+gets split), hand-edit `IntakeLedgerDoc` in a live sqlite store (do not), or wipe the store (loses lessons and
+ledger). [#226](https://github.com/lalanikarim/drydock/issues/226) proposes a supported reopen verb that records
+a new requestId instead of deleting history, and explicitly does **not** clear the wall-budget ledger as a side
+effect — clearing `budgetAborts` on re-dispatch would undo #141 and #222 in one convenient call.
+
+Until then: to retry an aborted issue deliberately, open a new issue that links the old one and says what changed.
+
 ## Partial branches
 
 A budget abort preserves the partial branch **locally** in `factory-instances/<instance>/work/issue-<n>/`. It is
