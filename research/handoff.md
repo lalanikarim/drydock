@@ -29,7 +29,7 @@ Pick this up cold. Everything below was verified on the date above by running it
 
 ## Next action, in order
 
-1. **Nothing in `factory/` is waiting on me.** The queue's remaining rows are scheduling (#217 supervisor supervision, eng#81 nightly live tiers) and one blocked item (#212 needs a two-caller fixture specimen authored in drydock-fixture). Both scheduling items are deferred with launchd by your call, so the honest description of the current gap is *unscheduled checks*, not missing ones.
+0. **⏸ The session ended 2026-11-05 with nothing in flight — PENDING OPERATOR.** #217 (supervisor supervision) and #213 (off-host backups) were offered and consciously not started; both wait on an explicit go-ahead, not on analysis. Restart by reading the "Session paused" block at the top of `research/work-queue.md`. The honest description of the remaining gap: *unscheduled checks* (#217, eng#81 — deferred with launchd) and one blocker whose fix is a custody decision, not code (#213).
 2. **Watch for the first `contradicted` line (#238).** `grep -n "byte-identical to the one at abort" /tmp/fleet-<sha>.log`. When it appears, an operator has a mechanical contradiction beside a `replanSource=model` line — and no gate that acts on it. Deciding whether it ever should is a `research/decision-log.md` entry, not a code change.
 3. **#213 (off-host backups) is the one Bar B blocker with real blast radius** — backups land on the same disk as the store. Parked with risk accepted; un-parking needs a destination and a key-custody decision, not code.
 4. #212 remains blocked on authoring a two-caller fixture specimen in drydock-fixture.
