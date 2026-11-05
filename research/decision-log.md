@@ -590,3 +590,31 @@ Verdicts identical within each pair. Where the diff was genuinely broken, `revie
 - Before crediting an intervention with changing an outcome, show the same artifact failing/succeeding without it. Matched pairs, not before/after.
 - A measurement instrument must be able to express the property it claims to measure. Traps with one caller cannot measure "reachable from another caller", no matter how the lesson is worded.
 - Status documents expire. This file's own readiness verdict said "P0 items 1–4: ~3–4 days" when all four had shipped; a stale-but-once-true line misroutes effort worse than an obvious gap.
+
+## 2026-11-05 — #230: authorization became a host-issued grant, because prose was never going to be a wall
+
+**Decision.** A retry after a wall-budget abort is authorized by **state the model cannot write**, not by a string it can. `POST /factory/intake/reopen` on an issue that owes authorization appends exactly one durable grant; `delegate` spends it (after the concurrency claim succeeds) and records `replanSource:"operator"`. Model-authored `replan` text still unlocks the guard — blocking legitimately re-scoped work was #222's explicit acceptance failure — but is recorded as `replanSource:"model"` and logged as resting on the sentence alone. Grants are never issued for an issue with no prior abort, never for a **stopped** one, and buy one attempt each. What shipped deliberately does **not** include judging whether a claimed change is real; that residue is #238.
+
+**What triggered it.** Ninety seconds after the reopen verb (#229) deployed, my own reopen reason — "slice reduced to assertion 4 only" — was injected into a fresh conversation as authoritative operator context and returned as the model's claim that the scope reduction *had happened*. It had not. #222's guard accepted it because the rule is "non-empty string", and `delegate` emitted one log line for that event indistinguishable from the line for a human authorizing a retry.
+
+**The invariant I refined instead of deleting.** `test/intake-reopen.test.mjs` asserted reopen touches `BudgetLedgerDoc` **not at all**. That was a proxy for "a reopen cannot restore budget"; #230 legitimately needs an authorization field in the same document. The assertion now pins the counters themselves (`budgetAborts`, `operatorAborts`, `stopped`, byte-for-byte) while allowing `grants` to append, and the opposite direction got its own test (fresh issue ⇒ **zero** writes to that document), so the refinement cannot decay into "writes anything". A test that forbids the wrong thing gets deleted the first time it is inconvenient; one that forbids the right thing gets refined, in the open.
+
+**The rules.**
+- Provenance is the minimum honest control when a guard cannot judge truth. It converts "the system was fooled" into "the system recorded that nobody authorized this", which is auditable and does not pretend to be a wall.
+- An authorization must cost something: one attempt per grant, consumed on use, never consumed by a call that was refused for an unrelated reason.
+- A non-vacuity test belongs on the *observable* channel, not just the state: strip digits from both authorization log lines and assert they differ. "#230 changed nothing observable" is exactly the outcome that otherwise passes.
+- Mutation-test your own guard before calling it coverage. Three mutations (provenance collapse to `model`, grants never marked spent, guard removed) each produced named failures — with `cp` restores, after `git checkout <file>` destroyed a day's work while reverting a mutation.
+
+## 2026-11-05 — #220: deploy verification is one command, because I ran a gate that does not exist and it exited 0
+
+**Decision.** "Deployed and verified" now means `node --experimental-strip-types fleet/verify-deploy-posture.mjs` printed seven rows with observed values and exited 0 (#237), plus `gates/deploy-posture.mjs` for policy-vs-disk drift (#236). Exit **2** is reserved for "could not run" and is never folded into pass/fail. Sub-gates are consumed by their **collection line**, not their exit code: a gate that exits 0 without stating what it inspected is a FAIL. The manual commands stay in the checklist as the fallback path and as what to read when a row is red.
+
+**What triggered it.** While deploying #230 I ran `gates/gate-posture.mjs` — a filename I had invented, never present in this repository — through `… 2>&1 | tail -2`. Node printed `MODULE_NOT_FOUND`; the step exited **0**, because the pipe reported `tail`'s status; and I wrote "posture verified" into a PR. Both traps were already documented in this repo (the pipe-exit-code note in `runbook-aborts.md`, and R6b/R10 on "not collected" vs "passing") and I reproduced them within the hour of writing about them.
+
+**What the new command found while being built.** Its first live run had three red rows: one **true** (fleet on `9b3a123` against a `9cade1c` checkout — the exact skew the issue names, which I had been eyeballing on every deploy for a week), and two bugs in the command itself: splitting the boot line on `,` mangled `edit(edits[].path,path)` into two tools and leaked `nothing scanned` from `submit_verdict(nothing scanned)`; and a too-permissive sub-gate summarizer that accepted exit 0 with no evidence of collection. Neither was relaxed to reach green.
+
+**The rules.**
+- A verification step must name a file that exists, and should be the only way to perform that check. A habit has no failure mode; a command does. This is the same lesson as eng#78 (nine suites no job ran) seen from the operator's side.
+- Never take an exit code through a pipe. `set -o pipefail`, or check `$?` before piping.
+- Consume another program's verdict only if it states what it inspected, and match that statement **explicitly** — a generic "contains a digit" heuristic is how a checker starts believing itself.
+- An entry guard must survive path resolution: `import.meta.url === pathToFileURL(process.argv[1]).href` silently no-ops through symlinked paths (macOS `/var` → `/private/var`) — exit 0, zero output. Realpath both sides.
