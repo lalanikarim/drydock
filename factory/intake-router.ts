@@ -112,12 +112,154 @@ export function validateIntakeBody(body: Record<string, unknown>):
   return { ok: true, kind, subject: subject.trim(), requestId: requestId.trim(), content };
 }
 
+/** A normalized intake submission, as produced by `validateIntakeBody` or by an operator verb. */
+export type IntakeSubmission = { kind: IntakeKind; subject: string; requestId: string; content: string };
+
+/**
+ * The one path from a validated submission to "a conversation owns this subject and has the input".
+ *
+ * Exported because there are now two front doors that must behave identically — the webhook intake route and
+ * the operator reopen verb (#226). Two implementations of find-or-create + submit + ledger-write is how the
+ * reopen path would quietly stop recording history, and history is the only reason the dedupe is debuggable.
+ *
+ * `forceNewConversation` (reopen only) skips the existing conversation for this key. That is deliberate and
+ * follows #122's own reasoning: a transcript that already contains "this run was aborted" or a refusal reads
+ * its own history as evidence about what is possible, so resubmitting into it starts from a disadvantage the
+ * operator did not agree to. The old conversation id is reported, never reused.
+ */
+export async function dispatchIntake(
+  opts: IntakeRouteOptions,
+  v: IntakeSubmission,
+  rctx: RouteContext,
+  log: (message: string) => void,
+  policy: { forceNewConversation?: boolean } = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const spec = opts.agents[v.kind];
+  if (!spec) {
+    // The adapter classifies with the same policy and should never send this. Reaching here means the
+    // two halves disagree, which is worth a log line rather than a silent drop.
+    log(`refused kind "${v.kind}" — no capability envelope configured for it (policy disabled it?)`);
+    return { status: 409, body: { error: `intake kind "${v.kind}" is not enabled for ${opts.repo}` } };
+  }
+  // A conversation with zero tools cannot do the work it was opened for; refusing at the door beats
+  // scheduling a run that will report itself unable. (This is the #122 shape, seen from the other side.)
+  if (spec.tools.length === 0) {
+    log(`refused kind "${v.kind}" — its capability envelope is empty`);
+    return { status: 500, body: { error: `intake kind "${v.kind}" has no tools registered` } };
+  }
+
+  const key = intakeKey(v.kind, v.subject);
+  const { harness, ctx } = rctx;
+
+  const ledger = await harness.snapshot(IntakeLedgerDoc, ctx);
+  if (ledger?.requests?.some((r) => r.id === v.requestId)) {
+    log(`requestId ${v.requestId} already handled — no new submission`);
+    // The message used to be just `duplicate:true`, which left a caller unable to tell "GitHub redelivered"
+    // (ignore it) from "this issue was aborted and you cannot retry it by re-labeling" (#226). Name the
+    // supported verb in the body, because that is the only surface the caller reads.
+    return {
+      status: 200,
+      body: {
+        accepted: true,
+        duplicate: true,
+        conversationId: ledger.entries[key] ?? null,
+        hint:
+          "This requestId was already handled, so nothing was submitted. If the issue's previous run was aborted or " +
+          'exhausted and you mean to dispatch it again, re-applying the label will never work: an issue has one constant ' +
+          `requestId (issue-<n>) per instance store. Use POST /factory/intake/reopen {"issueNumber":${subjectNumber(
+            v.subject,
+          )},"reason":"what changed"} (#226), which records a new requestId and leaves the budget ledger alone.`,
+      },
+    };
+  }
+
+  // Find-or-create the conversation for this (kind, subject) — unless a reopen deliberately wants a clean
+  // transcript (see `forceNewConversation` above).
+  let conversationId = policy.forceNewConversation ? undefined : ledger?.entries?.[key];
+  const supersededConversationId = policy.forceNewConversation ? ledger?.entries?.[key] : undefined;
+  let created = false;
+  let conv = conversationId ? await harness.conversation(conversationId as never, ctx) : undefined;
+    if (!conv) {
+      if (conversationId) {
+        // The ledger pointed at a conversation that no longer exists (store pruned/restored). Drop the
+        // pointer so the replacement is recorded, rather than failing every later event for this subject.
+        log(`ledger entry ${key} → ${conversationId} is gone; opening a replacement conversation`);
+        await harness.commit(async (tx) => {
+          const d = await tx.doc(IntakeLedgerDoc);
+          delete d.entries[key];
+        }, ctx);
+      }
+      const fresh = await harness.createConversation(
+        {
+          ownership: { kind: "ownerless" },
+          // Capability scoping happens here, at creation: `tools` replaces the conversation's tool set,
+          // so a refinement conversation is not merely told to behave — it cannot call delegate.
+          agent: {
+            model: { provider: opts.modelRef.provider, modelId: opts.modelRef.modelId },
+            thinkingLevel: "medium",
+            tools: spec.tools as never,
+            instructions: spec.instructions,
+          },
+          init: async (tx, id) => {
+            const d = await tx.doc(ConversationMeta, id);
+            d.name = `intake ${key}`;
+            d.createdAt = Date.now();
+          },
+        },
+        ctx,
+      );
+      conversationId = fresh.id as unknown as number;
+      created = true;
+      conv = fresh;
+      await harness.commit(async (tx) => {
+        const d = await tx.doc(IntakeLedgerDoc);
+        d.entries[key] = conversationId!;
+      }, ctx);
+      log(`opened ${v.kind} conversation ${conversationId} for ${v.subject} (${spec.tools.length} tool(s))`);
+    }
+
+  // Submit with the caller's requestId: if this delivery is a redelivery that arrived before our
+  // ledger write (or after a crash between the two commits), the core settles it as a duplicate.
+  let submissionId: number | undefined;
+  try {
+    const sub = await conv.submit({ type: "input", content: v.content, requestId: v.requestId }, ctx);
+    submissionId = sub.id as number;
+  } catch (e) {
+    log(`submission failed for ${key}: ${(e as Error).message}`);
+    return { status: 500, body: { error: `submission failed: ${(e as Error).message}` } };
+  }
+
+  await harness.commit(async (tx) => {
+    const d = await tx.doc(IntakeLedgerDoc);
+    d.entries[key] = conversationId!;
+    d.requests = [...d.requests.filter((r) => r.id !== v.requestId), { id: v.requestId, key, conversationId: conversationId!, at: Date.now() }];
+    if (d.requests.length > REQUEST_TAIL) d.requests = d.requests.slice(-REQUEST_TAIL);
+  }, ctx);
+
+  return {
+    status: 202,
+    body: {
+      accepted: true,
+      conversationId,
+      created,
+      submissionId,
+      ...(supersededConversationId ? { supersededConversationId } : {}),
+    },
+  };
+}
+
+/** Pull the bare issue number out of an intake subject ("#226" → 226) for use in a hint. Undefined-safe. */
+function subjectNumber(subject: string): number | undefined {
+  const m = /(\d+)/.exec(String(subject ?? ""));
+  return m ? Number(m[1]) : undefined;
+}
+
 /**
  * The factory's intake route. Registered via `createCoreInstance({ routes: [...] })`; the kernel's auth
  * gate runs before any app route, so this is bearer-authenticated like `/tasks`.
  *
  * Body: `{ kind, subject, requestId, content }` → 202 `{ accepted, conversationId, created }`, or
- * 200 `{ accepted, duplicate: true, conversationId }` when this exact requestId was already handled.
+ * 200 `{ accepted, duplicate: true, conversationId, hint }` when this exact requestId was already handled.
  */
 export function createIntakeRoute(opts: IntakeRouteOptions): AppRoute {
   const log = opts.log ?? ((m) => console.log(`[factory] ${opts.repo}: intake — ${m}`));
@@ -141,95 +283,8 @@ export function createIntakeRoute(opts: IntakeRouteOptions): AppRoute {
         return;
       }
 
-      const spec = opts.agents[v.kind];
-      if (!spec) {
-        // The adapter classifies with the same policy and should never send this. Reaching here means the
-        // two halves disagree, which is worth a log line rather than a silent drop.
-        log(`refused kind "${v.kind}" — no capability envelope configured for it (policy disabled it?)`);
-        rctx.json(res, 409, { error: `intake kind "${v.kind}" is not enabled for ${opts.repo}` });
-        return;
-      }
-      // A conversation with zero tools cannot do the work it was opened for; refusing at the door beats
-      // scheduling a run that will report itself unable. (This is the #122 shape, seen from the other side.)
-      if (spec.tools.length === 0) {
-        log(`refused kind "${v.kind}" — its capability envelope is empty`);
-        rctx.json(res, 500, { error: `intake kind "${v.kind}" has no tools registered` });
-        return;
-      }
-
-      const key = intakeKey(v.kind, v.subject);
-      const { harness, ctx } = rctx;
-
-      const ledger = await harness.snapshot(IntakeLedgerDoc, ctx);
-      if (ledger?.requests?.some((r) => r.id === v.requestId)) {
-        log(`requestId ${v.requestId} already handled — no new submission`);
-        rctx.json(res, 200, { accepted: true, duplicate: true, conversationId: ledger.entries[key] ?? null });
-        return;
-      }
-
-      // Find-or-create the conversation for this (kind, subject).
-      let conversationId = ledger?.entries?.[key];
-      let created = false;
-      let conv = conversationId ? await harness.conversation(conversationId as never, ctx) : undefined;
-      if (!conv) {
-        if (conversationId) {
-          // The ledger pointed at a conversation that no longer exists (store pruned/restored). Drop the
-          // pointer so the replacement is recorded, rather than failing every later event for this subject.
-          log(`ledger entry ${key} → ${conversationId} is gone; opening a replacement conversation`);
-          await harness.commit(async (tx) => {
-            const d = await tx.doc(IntakeLedgerDoc);
-            delete d.entries[key];
-          }, ctx);
-        }
-        const fresh = await harness.createConversation(
-          {
-            ownership: { kind: "ownerless" },
-            // Capability scoping happens here, at creation: `tools` replaces the conversation's tool set,
-            // so a refinement conversation is not merely told to behave — it cannot call delegate.
-            agent: {
-              model: { provider: opts.modelRef.provider, modelId: opts.modelRef.modelId },
-              thinkingLevel: "medium",
-              tools: spec.tools as never,
-              instructions: spec.instructions,
-            },
-            init: async (tx, id) => {
-              const d = await tx.doc(ConversationMeta, id);
-              d.name = `intake ${key}`;
-              d.createdAt = Date.now();
-            },
-          },
-          ctx,
-        );
-        conversationId = fresh.id as unknown as number;
-        created = true;
-        conv = fresh;
-        await harness.commit(async (tx) => {
-          const d = await tx.doc(IntakeLedgerDoc);
-          d.entries[key] = conversationId!;
-        }, ctx);
-        log(`opened ${v.kind} conversation ${conversationId} for ${v.subject} (${spec.tools.length} tool(s))`);
-      }
-
-      // Submit with the caller's requestId: if this delivery is a redelivery that arrived before our
-      // ledger write (or after a crash between the two commits), the core settles it as a duplicate.
-      let submissionId: number | undefined;
-      try {
-        const sub = await conv.submit({ type: "input", content: v.content, requestId: v.requestId }, ctx);
-        submissionId = sub.id as number;
-      } catch (e) {
-        log(`submission failed for ${key}: ${(e as Error).message}`);
-        rctx.json(res, 500, { error: `submission failed: ${(e as Error).message}` });
-        return;
-      }
-
-      await harness.commit(async (tx) => {
-        const d = await tx.doc(IntakeLedgerDoc);
-        d.entries[key] = conversationId!;
-        d.requests = [...d.requests.filter((r) => r.id !== v.requestId), { id: v.requestId, key, conversationId: conversationId!, at: Date.now() }];
-        if (d.requests.length > REQUEST_TAIL) d.requests = d.requests.slice(-REQUEST_TAIL);
-      }, ctx);
-
-      rctx.json(res, 202, { accepted: true, conversationId, created, submissionId });
+      const result = await dispatchIntake(opts, v, rctx, log);
+      rctx.json(res, result.status, result.body);
     },
   };
 }

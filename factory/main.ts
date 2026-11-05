@@ -21,6 +21,7 @@ import { createCoreInstance, loadConfig } from "../vendor/engram/app/src/core.ts
 import { CONFIG_DIR_ENV, loadFactoryConfig, resolveFactoryConfigPath } from "./factory-config.ts";
 import { factoryPipeline, intakeToolNames, orchestratorInstructions, refinerInstructions } from "./pipeline.ts";
 import { createIntakeRoute } from "./intake-router.ts";
+import { createReopenRoute } from "./intake-reopen.ts";
 import { createRunControlRoute } from "./run-control.ts";
 import { BudgetLedgerDoc, budgetSummary } from "./budget-ledger.ts";
 import { loadRegistry, requireEnabledRepo, scopeOf } from "./repo-registry.ts";
@@ -315,9 +316,14 @@ async function main() {
     // wasn't registered ("unanswered / no_model", 2026-10-30). The repo config's modelId now decides,
     // for the orchestrator as well as for worker/reviewer tasks.
     rootAgent: rootAgentChange,
-    // The factory's own endpoints, behind the kernel's bearer auth (#122): intake, and run control —
-    // POST /factory/runs/abort is the operator lever #141 was missing (#120 can't be documented until it exists).
-    routes: [createIntakeRoute({ repo, agents: intakeAgents, modelRef }), createRunControlRoute({ repo })],
+    // The factory's own endpoints, behind the kernel's bearer auth (#122): intake, run control, and reopen.
+    // POST /factory/runs/abort is the operator lever #141 was missing; POST /factory/intake/reopen is the one
+    // #226 found wanting — an issue's constant requestId means re-labeling after an abort does nothing at all.
+    routes: [
+      createIntakeRoute({ repo, agents: intakeAgents, modelRef }),
+      createReopenRoute({ repo, agents: intakeAgents, modelRef }),
+      createRunControlRoute({ repo }),
+    ],
   }).then(async (instance) => {
     // Check the model against the catalog THIS instance actually built, before announcing readiness.
     // Announcing ready and then settling every task as "unanswered / no_model" is what made a config
