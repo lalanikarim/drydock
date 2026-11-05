@@ -15,6 +15,7 @@
 import { join } from "node:path";
 import { defineExtension } from "@earendil-works/pi-durable";
 import { factoryWorkerTask, factoryDelegateTool } from "./worker.ts";
+import { makeGhIssueProber } from "./issue-body-sha.ts";
 import { factoryReviewerTask, makeReviewerRoleTools } from "./reviewer.ts";
 import { factoryRefineTask, refineIssueTool } from "./refine-task.ts";
 import { openDraftPrTool } from "./open-draft-pr.ts";
@@ -211,7 +212,14 @@ export function factoryPipeline(opts: PipelineOptions) {
   return defineExtension({
     name: "factory",
     tools: [
-      factoryDelegateTool({ taskDef: workerTaskDef, modelRef: opts.modelRef, wallSecsPerIssue: opts.wallSecsPerIssue }),
+      factoryDelegateTool({
+        taskDef: workerTaskDef,
+        modelRef: opts.modelRef,
+        wallSecsPerIssue: opts.wallSecsPerIssue,
+        // #238 — compares a post-abort claim of scope change against the live issue body. Invoked only on that one
+        // path (after an abort, on model-authored authorization), so the common `delegate` costs no extra read.
+        bodyProber: makeGhIssueProber({ repo: opts.fixturesRepo, token: () => auth.token() }),
+      }),
       openDraftPrTool({
         workDir: opts.workDir,
         fixturesRepo: opts.fixturesRepo,

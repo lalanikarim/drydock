@@ -42,12 +42,15 @@ import {
   isBudgetStopped,
   noteBudgetAbort,
   noteRetryAuthorization,
+  noteScopeClaim,
   pendingReopenGrant,
   releaseClaim,
   replanRequiredPayload,
   requiresReplan,
 } from "./budget-ledger.ts";
 import { createGitAuth, gitAuthEnv, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
+import { fetchIssueProjection } from "./gh-read.ts";
+import { compareIssueText, hashIssueText, type IssueProbeResult } from "./issue-body-sha.ts";
 import { resolveGitIdentity } from "./git-identity.ts";
 import type { Notifier } from "./notify-telegram.ts";
 import type { PathScope } from "./path-scope.ts";
@@ -78,8 +81,9 @@ async function sh(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJ
  * as trusted instruction, which is exactly what the markers exist to prevent.
  */
 async function fetchIssue(fixturesRepo: string, issueNumber: number, env: NodeJS.ProcessEnv): Promise<string> {
-  const out = await sh("gh", ["api", `repos/${fixturesRepo}/issues/${issueNumber}`, "--jq", '.title + "\\n--- body ---\\n" + (.body // "")'], { env });
-  return sanitizeUntrusted(out);
+  // #238: the projection lives in gh-read.ts so the retry-time prober reads byte-identical text. Two copies of this
+  // jq expression is exactly how the hash check was born dead — one side hashing title+body, the other body alone.
+  return fetchIssueProjection(fixturesRepo, issueNumber, env);
 }
 
 /** Fresh clone of the fixture on branch agent/issue-<n>, credentials scrubbed. */
@@ -294,7 +298,7 @@ export type WorkerInput = {
 /** Durable checkpoint: `spawn` before a worker conversation exists, `wait` after it does. */
 export type WorkerState =
   | { phase: "spawn"; convId?: undefined }
-  | { phase: "wait"; convId: ConversationId };
+  | { phase: "wait"; convId: ConversationId; /** sha256 of the issue body this attempt was given (#238). */ bodySha?: string };
 
 /**
  * The worker's durable result. Abort facts live in `outcome.result` because the kernel's TaskOutcome union is closed
@@ -411,7 +415,13 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
           { type: "input", content: workerPrompt({ issueNumber, issueText, lessons, testCommand, rework: reworkPrompt, pathScope }), requestId: `worker-${task.id}` },
           ctx,
         );
-        await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", convId: spawnedConvId } }), ctx);
+        // #238 — keep the hash of the spec this attempt was handed. Hashing here (not at abort time) means "the body
+        // as the factory last saw it" is the bytes that were actually put in front of the model, and it costs no
+        // extra GitHub read: `issueText` is already fetched above.
+        await runtime.commit(
+          () => ({ status: "running", checkpoint: { phase: "wait", convId: spawnedConvId, bodySha: hashIssueText(issueText) } }),
+          ctx,
+        );
       }),
       wait: guarded("WAIT", async (task, runtime, ctx) => {
         const convId = task.state.checkpoint.convId;
@@ -437,7 +447,13 @@ export function factoryWorkerTask({ workDir, fixturesRepo, image = "factory-sand
             await runtime.commit(
               async (tx) => {
                 const doc = await tx.doc(BudgetLedgerDoc);
-                note = noteBudgetAbort(doc, task.input.issueNumber, { reason });
+                // #238: the abort carries the hash of the body that failed to fit the clock. Optional because an
+                 // attempt that never fetched a body has nothing honest to record — and a made-up hash would be worse
+                 // than none, since it would later produce a false "clear".
+                note = noteBudgetAbort(doc, task.input.issueNumber, {
+                  reason,
+                  ...(task.state.checkpoint.bodySha ? { bodySha: task.state.checkpoint.bodySha } : {}),
+                });
                 return {
                   status: "terminal",
                   outcome: { status: "aborted", reason, result: { budgetAborted: true, attempts: note.attempts, retryable: false } },
@@ -547,11 +563,18 @@ export function factoryDelegateTool({
   taskDef,
   modelRef,
   wallSecsPerIssue,
+  bodyProber,
 }: {
   taskDef: Task<WorkerInput, WorkerState, WorkerResult, object>;
   modelRef: { provider: string; modelId: string };
   /** Configured worker budget, used only to size the concurrency claim's TTL (#222). */
   wallSecsPerIssue?: number;
+  /**
+   * Reads the current issue body so a post-abort claim of scope change can be compared against bytes (#238).
+   * Injected rather than constructed here: this tool is built once at boot and must not acquire a credential it does
+   * not otherwise need, and tests pass a hostile fake. Absent means the check reports `unavailable` — never `clear`.
+   */
+  bodyProber?: (issueNumber: number) => Promise<IssueProbeResult>;
 }) {
   return defineTool({
     name: "delegate",
@@ -686,6 +709,42 @@ export function factoryDelegateTool({
             `[factory.delegate] issue #${args.issueNumber} re-delegated after a budget abort on MODEL-AUTHORED text — replanSource=model (#230): ` +
               `no operator grant on file, so this attempt rests on the sentence alone: ${replanText.slice(0, 200)}`,
           );
+          // #238 — the one mechanical check #230 left out. Provenance can say nobody authorized this sentence; it
+          // cannot say the sentence is false. Comparing the issue body against the hash taken at abort can: if a
+          // claim of scope change meets byte-identical bytes, that claim is contradicted by an external fact.
+          // Recorded, logged, and NOT enforced — an unchanged body with an honest reason ("same scope, more wall
+          // time") is legitimate, and refusing on this would need its own decision in research/decision-log.md.
+          const shaAtAbort = budgetEntry(ledger, args.issueNumber)?.bodyShaAtAbort;
+          let probe: IssueProbeResult;
+          if (!bodyProber) {
+            probe = { error: "no body prober configured on this delegate tool" };
+          } else {
+            try {
+              probe = await bodyProber(args.issueNumber);
+            } catch (err) {
+              probe = { error: String((err as Error)?.message ?? err) };
+            }
+          }
+          const scope = compareIssueText(shaAtAbort, probe);
+          await api.commit(
+            async (tx) => noteScopeClaim(await tx.doc(BudgetLedgerDoc), args.issueNumber, { verdict: scope.verdict, detail: scope.detail }),
+            ctx,
+          );
+          if (scope.verdict === "contradicted") {
+            console.error(
+              `[factory.delegate] issue #${args.issueNumber} replan claims changes but the issue body is byte-identical to the one at abort ` +
+                `(${scope.detail}) — provenance=model, claimedScopeChangeUnverified=true (#238). Proceeding: this reports, it does not refuse.`,
+            );
+          } else if (scope.verdict === "unavailable") {
+            console.error(
+              `[factory.delegate] issue #${args.issueNumber} could not check the replan claim against the issue body — ${scope.detail}. ` +
+                "Recording verdict=unavailable; this is NOT a pass (#238).",
+            );
+          } else {
+            console.error(
+              `[factory.delegate] issue #${args.issueNumber} replan claim is consistent with an edited issue body (${scope.detail}) — provenance=model (#238)`,
+            );
+          }
         } else {
           // The grant was spent by a concurrent call between the peek and here. Rare, and worth a line: an
           // attempt is running with neither prose nor a live grant behind it, and silence would hide that.

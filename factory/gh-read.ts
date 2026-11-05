@@ -33,3 +33,32 @@ export async function fetchIssueState(
     return null;
   }
 }
+import { sanitizeUntrusted } from "./untrusted.ts";
+
+/**
+ * The exact text a worker is shown for an issue (#238): title, separator, body — sanitized.
+ *
+ * This function exists in ONE place because two callers must agree on it byte for byte: `factory/worker.ts` feeds
+ * the result to the model and hashes it at a wall-budget abort, and `factory/issue-body-sha.ts` re-reads it at retry
+ * to test a claim that the issue changed. When they disagreed — one hashing `title + separator + body`, the other
+ * hashing `.body` alone — every comparison came back "clear" and the check was silently dead. A live run caught it;
+ * no unit test could have, because both sides of every fake used the same string.
+ *
+ * If you change the projection, the hashes recorded before the change stop matching. That is correct behavior (a new
+ * hash per abort) but worth knowing: an in-flight issue's `bodyShaAtAbort` from before the change reads as `clear`,
+ * never as `contradicted`.
+ */
+export const ISSUE_PROJECTION_JQ = '.title + "\\n--- body ---\\n" + (.body // "")';
+
+export async function fetchIssueProjection(
+  repo: string,
+  issueNumber: number,
+  env: NodeJS.ProcessEnv,
+  { exec = pExecFile }: { exec?: typeof pExecFile } = {},
+): Promise<string> {
+  const { stdout } = await exec("gh", ["api", `repos/${repo}/issues/${issueNumber}`, "--jq", ISSUE_PROJECTION_JQ], {
+    env,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  return sanitizeUntrusted(String(stdout ?? ""));
+}

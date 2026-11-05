@@ -21,6 +21,8 @@
 
 import { defineDoc } from "@earendil-works/pi-durable";
 
+import type { ScopeClaimVerdict } from "./issue-body-sha.ts";
+
 // Type aliases, not interfaces: pi-durable's document state is constrained to `JsonObject`
 // (`{ [key: string]: JsonValue }`), and TypeScript gives interfaces no implicit index signature — so an
 // identical `type` is assignable where an `interface` is not. Reported the moment tsc was run on this tree
@@ -65,6 +67,23 @@ export type BudgetEntry = {
   replanSource?: "operator" | "model";
   /** Operator grants issued by `POST /factory/intake/reopen`, one attempt each (#230). */
   grants?: ReopenGrant[];
+  /**
+   * sha256 of the issue body **as the factory last saw it at the moment of a wall-budget abort** (#238).
+   *
+   * This is the input to the one mechanical check #230 left out. Provenance can say "nobody authorized this retry";
+   * it cannot say the sentence being relied on was false. Comparing this hash against the live body at retry time
+   * does exactly that much: an identical body contradicts a claim that the issue changed, and nothing else is judged.
+   *
+   * Latest budget abort wins. `noteOperatorAbort` never writes or clears it — an operator stopping a run says
+   * nothing about the spec, and #141's rule that operator aborts are not evidence about the work extends here.
+   */
+  bodyShaAtAbort?: string;
+  /**
+   * The outcome of the #238 comparison for the most recent retry: `contradicted` means the model claimed changes
+   * against a byte-identical issue body. Recorded and logged, never enforced — refusing on this would need its own
+   * decision recorded in `research/decision-log.md`.
+   */
+  scopeClaim?: { at: number; verdict: ScopeClaimVerdict; detail: string };
 }
 
 /**
@@ -141,7 +160,7 @@ export interface BudgetNoteResult {
 export function noteBudgetAbort(
   state: BudgetLedgerState,
   issueNumber: number,
-  opts: { maxAborts?: number; reason: string; at?: number } = { reason: "wall-clock budget exceeded" },
+  opts: { maxAborts?: number; reason: string; at?: number; bodySha?: string } = { reason: "wall-clock budget exceeded" },
 ): BudgetNoteResult {
   const max = opts.maxAborts ?? DEFAULT_MAX_BUDGET_ABORTS;
   if (!Number.isInteger(max) || max < 1) throw new Error(`maxAborts must be a positive integer, got ${JSON.stringify(max)}`);
@@ -149,6 +168,10 @@ export function noteBudgetAbort(
   e.budgetAborts += 1;
   e.lastAt = opts.at ?? Date.now();
   e.lastReason = opts.reason;
+  // #238 — hash the spec at the moment it failed to fit the clock, so a later claim of scope change can be checked
+  // against bytes instead of believed. Only when the caller actually saw a body: an absent `bodySha` leaves any
+  // earlier hash alone rather than erasing evidence.
+  if (opts.bodySha) e.bodyShaAtAbort = opts.bodySha;
 
   let stopReason: string | undefined;
   if (!e.stopped && e.budgetAborts >= max) {
@@ -161,7 +184,11 @@ export function noteBudgetAbort(
   return { entry: e, attempts: e.budgetAborts, terminal: e.stopped, ...(stopReason ? { stopReason } : {}) };
 }
 
-/** Record an operator-initiated abort. Never charges the cap; see the header. */
+/**
+ * Record an operator-initiated abort. Never charges the cap (see the header), and never touches
+ * `bodyShaAtAbort` (#238): an operator stopping a run is not a statement about the issue body, so it must not
+ * refresh or erase the hash a later claim gets judged against.
+ */
 export function noteOperatorAbort(
   state: BudgetLedgerState,
   issueNumber: number,
@@ -310,6 +337,23 @@ export function releaseClaim(state: BudgetLedgerState, issueNumber: number): voi
 }
 
 /** Record the PR this factory opened, so "did anything come of it?" survives a restart (#222). */
+/**
+ * Record the result of the #238 body-hash comparison for the most recent retry.
+ *
+ * Deliberately a record, not a gate: `contradicted` is a fact about a claim, and acting on it (refusing the attempt)
+ * would also catch the legitimate case — an unchanged body with an honest reason like "same scope, more wall time".
+ * That trade-off belongs in `research/decision-log.md`, not inside a logging change.
+ */
+export function noteScopeClaim(
+  state: BudgetLedgerState,
+  issueNumber: number,
+  opts: { verdict: ScopeClaimVerdict; detail: string; at?: number },
+): BudgetEntry {
+  const e = entry(state, issueNumber);
+  e.scopeClaim = { at: opts.at ?? Date.now(), verdict: opts.verdict, detail: opts.detail };
+  return e;
+}
+
 export function notePrOpened(
   state: BudgetLedgerState,
   issueNumber: number,

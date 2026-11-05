@@ -16,11 +16,13 @@ Why these three are *declared* rather than wired into CI: GitHub runners cannot 
 
 | rank | item | owner |
 |---|---|---|
-| 1 | **#238 — hash the issue body at abort, compare on retry.** Unchanged: the mechanical half of #230 that provenance cannot do. | 🤖 |
+| 1 | ~~**#238**~~ **shipped** — hash the issue text at abort, compare at retry. Verdicts `contradicted` / `clear` / `unavailable`, recorded and logged, never enforced. Two live-caused defects fixed before merge; see the seventeenth refresh. | ✅ |
 | 2 | **eng#81 — nightly live tiers.** Now has a second reason to exist: the host-tier boot suites are declared and checked, but nothing *schedules* them, so they still only run when a human remembers. Deferred with launchd. | 🧑 deferred |
 | 3 | **#217 fleet supervision** — deferred. A reboot still leaves the factory down silently. | 🧑 deferred |
 | 4 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture. | 🤖🧑 |
 | 5 | #147 passive · #172 upstream-only (`pi-durable`) · #42 design doc | mixed 🧑 |
+
+**#238 shipped, and it was dead on arrival twice over — both times caught only by running it.** The first version hashed `gh api --jq .body` at retry and an in-process string at abort; **jq appends a trailing newline**, so unchanged issues hashed differently. The second version fixed that and still compared `.body` against what the worker is actually shown, which is `.title + "\n--- body ---\n" + (.body // "")`, sanitized — so every comparison would have returned `clear`, forever, in production. Sixteen hermetic tests passed both versions, because in a fake both sides of the comparison are the same string by construction. The gate that caught them (`gates/scope-claim-live.mjs`) prints one line: `abort == retry : yes`.
 
 **The finding to carry, sharpened.** #241 was not a missing test; it was a test whose *input choice* was an environment accident and whose *failure message* misdiagnosed itself. Two questions for any green check: can the state it asserts occur in production, and would anything notice if it stopped running? A third now belongs with them: **does it pick its own inputs by position in a list that someone else reorders?**
 
