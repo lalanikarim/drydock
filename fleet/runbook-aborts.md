@@ -148,6 +148,19 @@ what changed, and the string goes into the new conversation verbatim (quoted) pl
 So the retry chain is: **reopen** (restores dispatchability, and grants one attempt) → **`delegate` spends the grant,
 or refuses without a `replan`** (#222/#230) → **stop at two aborts** (#141). Each layer keeps its own job.
 
+### Two doors for a second attempt (#235)
+
+| you call | transcript you get | budget authorization? |
+|---|---|---|
+| `POST /factory/intake` with a **new requestId**, `kind:"issue"` | a **fresh** conversation; the response names `supersededConversationId`; the old transcript keeps its history | **No.** No grant is appended, so `delegate` refuses without a `replan` — and if you do supply prose it records `replanSource:"model"`. This is the cheap probe door: one orchestration turn, nothing spawned while the guard is armed |
+| `POST /factory/intake/reopen` | a fresh conversation (it always was) | **Yes** — appends the one-use grant (#230) |
+
+Before #235 the first row silently resumed the existing conversation: a probe dispatched at 14:28 landed in a transcript whose
+last event was an abort, and `created:false` was the only hint. Identical requestIds are still answered `200 duplicate` before
+any of this runs — which is what makes the rule safe — and `refine` / `pr-feedback` keep steering **one** shared conversation,
+because their requestIds carry comment ids and sharing is the feature. The distinction is encoded as data in
+`CONVERSATION_POLICY` (`factory/intake-router.ts`): per-attempt kinds open a conversation per attempt, per-event kinds share one.
+
 ### Who authorized this? `replanSource` (#230)
 
 Before #230 the guard asked for a string and recorded it, so "a human decided" and "the model wrote a sentence"

@@ -117,23 +117,83 @@ test("the refinement brief never instructs the agent toward a tool it does not h
  */
 
 
-test("two events for one issue share a conversation; two issues never do", async () => {
+/**
+ * #235 rewrote this test rather than deleting it. It asserted that two `issue` submissions with DIFFERENT
+ * requestIds share one conversation — behavior the real adapter cannot even produce, since `intakeRequestId()` is
+ * constant `issue-<n>`; the fake could only reach it by inventing ids. Meanwhile the same code path, driven by an
+ * operator who did hand-write a second requestId, silently resumed a conversation whose last run had been aborted
+ * (#122's hazard). The rule now: for per-attempt kinds a new requestId IS a new attempt, so it gets a clean
+ * transcript and reports what it replaced. Per-event kinds keep sharing — asserted below, because that is the case
+ * a careless fix would destroy.
+ */
+test("per-attempt kind: a new requestId is a new attempt, in a fresh conversation (#235)", async () => {
   const { harness, calls } = fakeHarness();
   const route = createIntakeRoute({ repo: "o/r", agents: { issue: spec(["delegate", "open_draft_pr"]) }, modelRef: { provider: "p", modelId: "m" }, log: () => {} });
 
-  const a = await call(route, harness, { kind: "issue", subject: "#3", requestId: "issue-3-labeled", content: "work on 3" });
+  const a = await call(route, harness, { kind: "issue", subject: "#3", requestId: "issue-3", content: "work on 3" });
   assert.equal(a.status, 202, JSON.stringify(a.json));
   assert.equal(a.json.created, true);
-  const b = await call(route, harness, { kind: "issue", subject: "#3", requestId: "issue-3-comment", content: "also this" });
-  assert.equal(b.json.conversationId, a.json.conversationId, "same subject → same conversation, so the core can dedupe");
-  assert.equal(b.json.created, false);
-  const c = await call(route, harness, { kind: "issue", subject: "#4", requestId: "issue-4-labeled", content: "work on 4" });
-  assert.notEqual(c.json.conversationId, a.json.conversationId, "a different issue must not inherit this transcript");
 
+  // An identical requestId is answered by dedupe before find-or-create — that is what makes the rule below safe.
+  const dup = await call(route, harness, { kind: "issue", subject: "#3", requestId: "issue-3", content: "work on 3" });
+  assert.equal(dup.status, 200, JSON.stringify(dup.json));
+  assert.equal(dup.json.duplicate, true);
+
+  const b = await call(route, harness, { kind: "issue", subject: "#3", requestId: "issue-3#attempt-2", content: "retry after abort" });
+  assert.equal(b.status, 202, JSON.stringify(b.json));
+  assert.equal(b.json.created, true, "a per-attempt kind does not resume an aborted transcript");
+  assert.notEqual(b.json.conversationId, a.json.conversationId);
+  assert.equal(b.json.supersededConversationId, a.json.conversationId, "the operator is told which conversation was left behind");
+  assert.equal(b.json.reusedConversation, undefined, "nothing was reused, so nothing is claimed to be reused");
+
+  // The transcripts are genuinely separate, not two names for one store: each submission carries the conversation
+  // it was made in, and those ids differ.
+  const submitted = calls.submitted.filter((s) => s.requestId === "issue-3#attempt-2");
+  assert.equal(submitted.length, 1);
+  assert.notEqual(submitted[0].id, calls.submitted.find((s) => s.requestId === "issue-3")?.id, "the retry landed in the new conversation");
+
+  // A different issue never inherits either transcript.
+  const c = await call(route, harness, { kind: "issue", subject: "#4", requestId: "issue-4", content: "work on 4" });
+  assert.notEqual(c.json.conversationId, a.json.conversationId);
+  assert.notEqual(c.json.conversationId, b.json.conversationId);
+
+  // A kind with no capability envelope is refused rather than routed into whatever conversation exists.
   const d = await call(route, harness, { kind: "refine", subject: "#3", requestId: "issue-3-refine-label", content: "REFINEMENT REQUEST" });
   assert.equal(d.status, 409, "a kind with no envelope is refused, not routed to whatever conversation exists");
-  void d;
-  assert.equal(calls.created.length, 2);
+
+  // issue#3 attempt 1 + attempt 2 + issue#4 = three conversations; the duplicate opened none.
+  assert.equal(calls.created.length, 3, `expected exactly three created conversations, got ${calls.created.length}`);
+});
+
+test("per-event kinds still steer one shared conversation, and say so (#235)", async () => {
+  const { harness, calls } = fakeHarness();
+  const route = createIntakeRoute({
+    repo: "o/r",
+    agents: { refine: spec(["refine_issue"]), "pr-feedback": spec(["note_lesson"]) },
+    modelRef: { provider: "p", modelId: "m" },
+    log: () => {},
+  });
+
+  const first = await call(route, harness, { kind: "refine", subject: "#7", requestId: "issue-7-refine-c-101", content: "first comment" });
+  assert.equal(first.json.created, true);
+  const second = await call(route, harness, { kind: "refine", subject: "#7", requestId: "issue-7-refine-c-102", content: "second comment" });
+  assert.equal(second.json.conversationId, first.json.conversationId, "comment-scoped ids steer the existing conversation — this is the feature, not the bug");
+  assert.equal(second.json.created, false);
+  assert.equal(second.json.supersededConversationId, undefined, "nothing was superseded");
+  assert.deepEqual(
+    second.json.reusedConversation,
+    { id: first.json.conversationId, priorRequestId: "issue-7-refine-c-101", attemptsRecorded: 2 },
+    "reuse is reported at request time, with the id it reused and how many attempts it already holds",
+  );
+
+  const third = await call(route, harness, { kind: "refine", subject: "#7", requestId: "issue-7-refine-c-103", content: "third comment" });
+  assert.equal(third.json.reusedConversation.attemptsRecorded, 3);
+
+  const pr = await call(route, harness, { kind: "pr-feedback", subject: "#7", requestId: "pr-7-c-501", content: "review note" });
+  assert.equal(pr.json.created, true, "a different kind is a different key, so it opens its own conversation");
+  assert.notEqual(pr.json.conversationId, first.json.conversationId);
+
+  assert.equal(calls.created.length, 2, `refine shared one conversation and pr-feedback opened one: ${calls.created.length}`);
 });
 
 test("the tool set is fixed at creation — a refinement conversation cannot be created with orchestration tools", async () => {
@@ -187,12 +247,15 @@ test("a ledger entry pointing at a deleted conversation opens a replacement inst
 
 test("a submission the kernel rejects surfaces as a 500, not a silent accept", async () => {
   const { harness, conversations } = fakeHarness();
-  const route = createIntakeRoute({ repo: "o/r", agents: { issue: spec(["delegate"]) }, modelRef: { provider: "p", modelId: "m" }, log: () => {} });
-  await call(route, harness, { kind: "issue", subject: "#8", requestId: "r-first", content: "go" });
+  // kind `refine`, not `issue`: this test needs the SECOND dispatch to land in the conversation it patched, and
+  // since #235 a per-attempt kind deliberately opens a fresh one instead. Per-event kinds still reuse, which is what
+  // makes them the right harness for "the kernel refused the submit".
+  const route = createIntakeRoute({ repo: "o/r", agents: { refine: spec(["refine_issue"]) }, modelRef: { provider: "p", modelId: "m" }, log: () => {} });
+  await call(route, harness, { kind: "refine", subject: "#8", requestId: "r-first", content: "go" });
   // Force the conversation's own settlement to fail for a different requestId.
   const conv = [...conversations.values()].at(-1);
   conv.submit = async () => { throw new Error("no_model"); };
-  const res = await call(route, harness, { kind: "issue", subject: "#8", requestId: "r-second", content: "go again" });
+  const res = await call(route, harness, { kind: "refine", subject: "#8", requestId: "r-second", content: "go again" });
   assert.equal(res.status, 500);
   assert.match(res.json.error, /no_model/);
 });

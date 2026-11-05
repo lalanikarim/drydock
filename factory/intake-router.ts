@@ -40,6 +40,49 @@ export function intakeKey(kind: IntakeKind, subject: string): string {
   return `${kind}:${subject}`;
 }
 
+/**
+ * What a `requestId` MEANS for each kind — which decides what a *different* requestId means (#235).
+ *
+ * `per-attempt` (`issue`): the adapter always sends `issue-<n>` (`factory/intake.ts:intakeRequestId`), so the id
+ * identifies one attempt at the issue, not one GitHub event. Dedupe answers an identical id with 200 before this
+ * code runs, therefore arriving here with a different id than the recorded one can only mean a deliberate new
+ * attempt — and #122 says that attempt starts in a clean transcript, the same rule `POST /factory/intake/reopen`
+ * has always followed. Reusing the old conversation on this path is never what the caller meant: it writes into a
+ * transcript whose last entry may be an abort or a refusal, which #122 measured as evidence the model reads.
+ *
+ * `per-event` (`refine`, `pr-feedback`): ids carry the comment id (`issue-<n>-refine-c-<commentId>`,
+ * `pr-<pr>-c-<commentId>`), so many distinct ids for one subject are the feature — steering an existing
+ * conversation. Forcing fresh there would destroy refinement context, and `factory/intake-boot.test.ts` step 5
+ * pins that reuse. Hence a per-kind policy rather than one rule for all three kinds.
+ *
+ * Stated as data with this comment because the alternative — inferring intent from message text or from settle
+ * state — was the option rejected in #235: "sometimes fresh" is worse for a transcript-poisoning hazard than
+ * "always fresh, and here is what it replaced".
+ */
+export const CONVERSATION_POLICY: Record<IntakeKind, "per-attempt" | "per-event"> = {
+  issue: "per-attempt",
+  "pr-feedback": "per-event",
+  refine: "per-event",
+};
+
+/** The most recent requestId recorded for a key. Prefers `lastRequest` (written atomically with the conversation
+ *  pointer); falls back to scanning the bounded tail for stores that predate #235. */
+function lastRequestIdFor(
+  ledger: { lastRequest?: Record<string, string>; requests?: { id: string; key: string }[] } | undefined,
+  key: string,
+): string | undefined {
+  if (ledger?.lastRequest?.[key] !== undefined) return ledger.lastRequest[key];
+  const rows = ledger?.requests ?? [];
+  for (let i = rows.length - 1; i >= 0; i--) if (rows[i].key === key) return rows[i].id;
+  return undefined;
+}
+
+/** How many recorded requests already landed on this conversation. Bounded by the tail, so it is a floor after
+ *  pruning — which is why the response calls it `attemptsRecorded`, not `attempt`. */
+function attemptsOn(ledger: { requests?: { key: string; conversationId: number }[] } | undefined, key: string, conversationId: number): number {
+  return (ledger?.requests ?? []).filter((r) => r.key === key && r.conversationId === conversationId).length;
+}
+
 type RequestRecord = { id: string; key: string; conversationId: number; at: number };
 
 /**
@@ -51,9 +94,21 @@ export const IntakeLedgerDoc = defineDoc({
   scope: "session",
   kind: "factory.intake-ledger",
   version: 1,
-  initial: (): { entries: Record<string, number>; requests: RequestRecord[] } => ({
+  initial: (): {
+    entries: Record<string, number>;
+    requests: RequestRecord[];
+    /**
+     * Last requestId per key (#235). Written in the SAME commit as `entries[key]`, which is why it exists at all:
+     * deriving "what was the previous attempt's id" from the bounded `requests` tail leaves a crash window between
+     * the conversation-write and the tail-append, and a caller retrying inside that window would be judged a new
+     * attempt and get a second conversation for one submission. Optional because stores predating #235 lack it;
+     * readers fall back to the tail.
+     */
+    lastRequest?: Record<string, string>;
+  } => ({
     entries: {},
     requests: [],
+    lastRequest: {},
   }),
 });
 
@@ -174,9 +229,23 @@ export async function dispatchIntake(
   }
 
   // Find-or-create the conversation for this (kind, subject) — unless a reopen deliberately wants a clean
-  // transcript (see `forceNewConversation` above).
-  let conversationId = policy.forceNewConversation ? undefined : ledger?.entries?.[key];
-  const supersededConversationId = policy.forceNewConversation ? ledger?.entries?.[key] : undefined;
+  // transcript (`forceNewConversation` above), or the kind's own policy says this submission IS a new attempt
+  // (#235, `CONVERSATION_POLICY`).
+  const priorRequestId = lastRequestIdFor(ledger ?? undefined, key);
+  const policyWantsFresh =
+    CONVERSATION_POLICY[v.kind] === "per-attempt" &&
+    ledger?.entries?.[key] !== undefined &&
+    priorRequestId !== undefined &&
+    priorRequestId !== v.requestId;
+  if (policyWantsFresh) {
+    log(
+      `${v.kind} ${v.subject}: requestId changed (${priorRequestId} → ${v.requestId}) — per-attempt kind, so this opens a fresh conversation (#235). ` +
+        "Use POST /factory/intake/reopen when the new attempt also needs budget authorization.",
+    );
+  }
+  const forceFresh = Boolean(policy.forceNewConversation) || policyWantsFresh;
+  let conversationId = forceFresh ? undefined : ledger?.entries?.[key];
+  const supersededConversationId = forceFresh ? ledger?.entries?.[key] : undefined;
   let created = false;
   let conv = conversationId ? await harness.conversation(conversationId as never, ctx) : undefined;
     if (!conv) {
@@ -214,6 +283,8 @@ export async function dispatchIntake(
       await harness.commit(async (tx) => {
         const d = await tx.doc(IntakeLedgerDoc);
         d.entries[key] = conversationId!;
+        // Same commit as the pointer, on purpose — see IntakeLedgerDoc.lastRequest (#235).
+        d.lastRequest = { ...d.lastRequest, [key]: v.requestId };
       }, ctx);
       log(`opened ${v.kind} conversation ${conversationId} for ${v.subject} (${spec.tools.length} tool(s))`);
     }
@@ -229,13 +300,31 @@ export async function dispatchIntake(
     return { status: 500, body: { error: `submission failed: ${(e as Error).message}` } };
   }
 
+  // Counted BEFORE the ledger write below: a snapshot implementation that hands back a live document reference
+  // (as the test fake does) would otherwise make this submission count itself, and an off-by-one here is exactly
+  // the kind of number an operator would believe.
+  const reusedConversationInfo =
+    !created && conversationId !== undefined
+      ? {
+          id: conversationId,
+          priorRequestId: priorRequestId ?? null,
+          attemptsRecorded: attemptsOn(ledger ?? undefined, key, conversationId) + 1,
+        }
+      : undefined;
+
   await harness.commit(async (tx) => {
     const d = await tx.doc(IntakeLedgerDoc);
     d.entries[key] = conversationId!;
+    d.lastRequest = { ...d.lastRequest, [key]: v.requestId };
     d.requests = [...d.requests.filter((r) => r.id !== v.requestId), { id: v.requestId, key, conversationId: conversationId!, at: Date.now() }];
     if (d.requests.length > REQUEST_TAIL) d.requests = d.requests.slice(-REQUEST_TAIL);
   }, ctx);
 
+  // #235: writing into an existing transcript is now visible at request time. `created:false` used to be the only
+  // signal, which is how a probe landed in a conversation whose last run had been aborted and nobody noticed until
+  // reading the log days later. Deliberately NOT an outcome classification: deciding "was the last run aborted?"
+  // means reading pi-durable task stores across instances, and that reader belongs to the settlement gates (#204),
+  // not inside a request path.
   return {
     status: 202,
     body: {
@@ -244,6 +333,7 @@ export async function dispatchIntake(
       created,
       submissionId,
       ...(supersededConversationId ? { supersededConversationId } : {}),
+      ...(reusedConversationInfo ? { reusedConversation: reusedConversationInfo } : {}),
     },
   };
 }
@@ -260,6 +350,8 @@ function subjectNumber(subject: string): number | undefined {
  *
  * Body: `{ kind, subject, requestId, content }` → 202 `{ accepted, conversationId, created }`, or
  * 200 `{ accepted, duplicate: true, conversationId, hint }` when this exact requestId was already handled.
+ * When an existing conversation is reused the response also carries `reusedConversation` (prior requestId + how
+ * many attempts it already holds); when one is superseded it carries `supersededConversationId` (#235).
  */
 export function createIntakeRoute(opts: IntakeRouteOptions): AppRoute {
   const log = opts.log ?? ((m) => console.log(`[factory] ${opts.repo}: intake — ${m}`));
