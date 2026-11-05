@@ -6,6 +6,34 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Thirteenth refresh — 2026-11-05 (overnight)
+
+Verified state: drydock `main` = **`e1dce67`**, fleet running **`f8b5c11`** (delta is docs-only; no restart owed). engram `main` = `2072958`, released as **v0.2.4**, vendored at that tag. Suite 633 tests / 0 fail. Fleet health `build.sha: f8b5c11`, inference reachable, 0 quarantine, approval-block probe exit 0, settlement window clean.
+
+**Four operator decisions taken overnight — these changed the queue more than any code did:**
+
+| decision | effect |
+|---|---|
+| **Throughput batch cancelled at n=2** | `research/factory-throughput-baseline.md` §7: measuring tasks invented to be measurable measures the invention. No third dispatch planned; §7 lists what would justify one |
+| **#213 parked, single-disk risk accepted** | no destination/key-custody decision was made, so off-host copies are a stated accepted risk, not pending work. Readiness doc updated to say so plainly — restore-proven ≠ recoverable |
+| **Merge authority withdrawn** | nothing lands on my judgement any more; PRs arrive as drafts with a review note. (Seven were merged today under an earlier standing ask: #77, #79, #221, #223, #224, #225, #227) |
+| **engram version truth = git tags** | `package.json` stays at `0.2.0`; nothing consumes it and tags are what drydock pins. Documented in engram so the next person doesn't audit a phantom drift |
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **#226 — reopen verb for an issue whose conversation was aborted.** `requestId` dedupe is durable and constant per issue, so an issue gets **one dispatch per instance store ever**; re-labeling after an abort silently does nothing. Found the hard way while trying to re-run tonight's failed dispatch. Constraint on the fix: reopening must never clear `budgetAborts`, or it undoes #141/#222 in one call. | 🤖 |
+| 2 | **eng#78 — nine test files executed by no CI job** (`hardening`, `sandbox`, `core-instance`, …). Triage, wire what should run, fix what fails, add the collection check. The containment suites are the ones a gate regression would break first, and they run nowhere. | 🤖 |
+| 3 | **#220 slice as a fresh issue** — deploy-posture verifier, assertion 4 only (policy vs on-disk `gates.json` drift) + its test. #220 itself cannot be re-dispatched until #226 exists, so this is the dispatchable form of it. | 🤖 |
+| 4 | **#212 — gate-side rule-placement enforcement.** Still needs a two-caller fixture specimen, which does not exist; treat as blocked on fixture work, not on me. | 🤖🧑 |
+| 5 | **#217 fleet supervision** — deferred by the operator. Not forgotten: a reboot today leaves the factory down silently, and #226's reopen gap makes that recovery worse than it looks. | 🧑 |
+| 6 | #147 passive (needs a live T2 stall) · #172 upstream-only (`pi-durable`; `assertAbortable` already refuses to boot without the fix locally) · #42 design doc | mixed 🧑 |
+
+**Shipped overnight:** **engram v0.2.3 → v0.2.4** (destructive floor judges effect-bearing args; operator page for `gates.json`; a test CI was never collecting), drydock pin to both (`c993bdd`, `436bc8b`), **#218** (`delegate` refuses impossible `feedback.prNumber` at the tool boundary), **#222 → `f8b5c11`** (re-delegation after a budget abort requires a stated `replan`; one-issue-one-worker claim; TTL-bounded, released on every outcome), `fleet/runbook-aborts.md` (**`taskId` settles a task, `conversationId` stops the loop** — learned at 2× budget).
+
+**Honest caveats carried forward:** #222's guard is unit-proven and deployed but **has never fired in production** — that log line waits on the next real budget abort, which #226 currently prevents from being manufactured. And `replan` accepts any non-empty string: it converts "costs 2× budget plus a human at 01:50 UTC" into "costs 1× budget plus one sentence, recorded". The hard stop is still the cap at two aborts (#141).
+
+---
+
 # Twelfth refresh — 2026-11-04 (late)
 
 Verified state: drydock `main` = **`723161b`** (615 tests / 614 pass / 0 fail, one pre-existing skip; typecheck clean; boot tests executed against live inference, no skips). Fleet restarted onto it and verified per `fleet/release-checklist.md` steps 4–5: `/health` → `{status: ok, build.sha: 723161b, inference: reachable}`, single-SIGTERM shutdown took ~1 s, lock released, zero orphans, 0 quarantine lines, approval probe 5/5 explained, settlement window exit 0. Fixture `main` unchanged (`1378884`), suite green (132/132) before any gate ran.
