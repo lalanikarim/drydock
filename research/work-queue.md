@@ -6,6 +6,25 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Fifteenth refresh — 2026-11-05 (afternoon)
+
+Verified state: drydock `main` = **`43aed60`**, suite **685 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`43aed60`**, and for the first time that fact comes from a command rather than my scrollback (`fleet/verify-deploy-posture.mjs` → `PASS`, seven rows). engram `main` = **`d48aee1`**, vendored at tag **`v0.2.4`** — everything since is test infrastructure and docs that drydock does not import, so per the version-truth rule (engram#80) no release is owed. No open PRs in either repo.
+
+**Closed since the fourteenth refresh:** **eng#78** (engram#82: nine unrun suites triaged — all pass, 213 assertions — `classifier` wired into CI, the rest marked `// manual-only:` with scripts grouped by prerequisite, and `app/test/script-coverage.test.ts` failing when a suite is unreachable from any job) · **#230** (#234: `replanSource`, one-use operator grants, deployed) · **#222** (closed on live evidence — its refusal branch fired in production with no worker spawned) · **#220** (#236 + #237: policy-vs-disk drift gate and the seven-row deploy verifier). **Filed:** **#235** intake/`reopen` disagree about transcript isolation, **#238** the retry guard still cannot tell that a claimed scope change is false.
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **#235 — two doors, two rules for transcript isolation.** `POST /factory/intake` with a fresh requestId lands in the *existing* conversation for a `(kind, subject)`, including one whose last run was aborted; `reopen` always opens a fresh one and reports the superseded id. #122's reasoning is cited in the code comment for one path and ignored by the other. Needs a decision before code — the naive fix ("new requestId ⇒ new conversation") breaks `refine`, where cross-request reuse is load-bearing and already pinned by a test. Recommendation in the issue: make the response honest first (`reusedConversation: {id, lastOutcome}`), then force-new for `kind:"issue"` only. | 🧑 decides · 🤖 builds |
+| 2 | **#238 — hash the issue body at abort, compare on retry.** The mechanical half of #230, deliberately left out of it: nothing can currently say that "the issue has since been sliced down to assertion 4 only" was false. Cheap, falsifiable, and honest about its limits (an edit satisfies it; an unchanged body with an honest reason must not be blocked). | 🤖 |
+| 3 | **eng#81 — nightly live tiers.** The hermetic suites plus the collection check run on every push now; the model/sandbox/webui tiers (200 checks, ~4 min) run when a human remembers. Committed launchd plist + one induced-red demonstration. This is what turns "CI green" back into a proxy for safe on the containment path. | 🧑 host · 🤖 prepares |
+| 4 | **#217 fleet supervision** — still deferred by you, still true: a reboot leaves the factory down silently and every alert we have is event-driven, so absence of alerts ≠ presence of service. ~30 min, one plist + one install command. Now the **only** Bar B blocker that is neither an accepted risk nor a soft-guard question. | 🧑 |
+| 5 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture; fixture work, not code work. | 🤖🧑 |
+| 6 | #147 passive (needs a live T2 stall) · #172 upstream-only (`pi-durable`) · #42 design doc | mixed 🧑 |
+
+**The finding to carry forward.** I "verified" a deploy today by running `gates/gate-posture.mjs` — a filename I invented, never in the repository — piped through `tail -2`, which reported `tail`'s status: Node printed `MODULE_NOT_FOUND` and the step exited **0**, and I wrote down "posture verified". Both traps were already documented here (the pipe-exit-code note in `runbook-aborts.md`, R6b/R10 on "not collected" vs "passing") and I hit them anyway, an hour after writing about them. The general form is not "always script your checks" — it is that **a verification step must name a file that exists and must be the only way to perform that check**, because a habit has no failure mode. Hence one command, seven rows, exit 2 reserved for "could not run", and every row printing what it observed.
+
+---
+
 # Fourteenth refresh — 2026-11-05 (morning)
 
 Verified state: drydock `main` = **`d647c3c`**, suite **643 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`6ce582e`** — the delta since is docs + `.gitignore`, so no restart is owed. engram `main` = **`43b1350`**, vendored at tag **`v0.2.4`**; main is two docs commits past the tag, which per the version-truth rule needs no release. Health ok, inference reachable, 0 quarantine, nothing running, both probes exit 0. **No open PRs in either repo.**
@@ -14,9 +33,9 @@ Verified state: drydock `main` = **`d647c3c`**, suite **643 tests / 0 fail** (on
 
 | rank | item | owner |
 |---|---|---|
-| 1 | **eng#78 — nine test files executed by no CI job**, including `hardening`, `sandbox`, `core-instance`. Triage: wire what belongs in `test:unit`, declare the rest manual, and add the check that fails when an unrun test file appears. Highest-known-risk item on the board: a containment regression lands green today, and this repo has now produced three separate "green while collecting nothing" defects (R10, #231-class gates, eng#76's own artifact). | 🤖 |
-| 2 | **#230 — `delegate` cannot tell an operator's authorization from the model's assertion about one.** Found live within 90 s of #226 deploying: my reopen reason ("slice reduced to assertion 4 only") came back as the model's false claim of completed scope reduction, and #222's guard accepted it because the rule is "non-empty string". Fix is small and already specified in the issue: host-issued grants (consumed on use), `replanSource` provenance in ledger + log, and the one mechanical check that exists — did the issue body change since the abort. | 🤖 |
-| 3 | **#220 — deploy-posture verifier, sliced to assertion 4 only** (policy vs on-disk `gates.json` drift, which is a hole in #219's own claim). Now dispatchable two ways: edit #220's body down to the slice and **reopen** it (also produces real `reopen-2` evidence), or file a fresh issue. Two rules from hard experience: the spec must **permit registering its own test**, and setup is ~4 min of any budget, so one assertion per dispatch. | 🤖 |
+| 1 | ~~**eng#78 — nine test files executed by no CI job**~~ **closed** (engram#82): triaged, wired or declared manual, and a CI check that fails when an unrun file appears. Two rules it produced: never forbid a worker from touching test wiring (eng#76's constraint caused the defect), and a checker's failure mode is collecting nothing while passing everything. |
+| 2 | ~~**#230 — `delegate` cannot tell an operator's authorization from the model's assertion about one**~~ **shipped** (#234, deployed): grants issued by reopen, consumed on use, `replanSource` in ledger + log, distinct log lines. Residual → **#238**. |
+| 3 | ~~**#220 — deploy-posture verifier**~~ **closed** (#236 gate + #237 aggregator): policy-vs-`gates.json` drift per instance and a seven-row deploy check that prints what it collected. |
 | 4 | **#217 fleet supervision** — deferred by you, still true: a reboot leaves the factory down silently, no `KeepAlive`, no alert. ~30 min, one plist + one install command. | 🧑 |
 | 5 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture; treat as fixture work, not code work. | 🤖🧑 |
 | 6 | #147 passive (needs a live T2 stall) · #172 upstream-only (`pi-durable`; local `assertAbortable` already refuses boot without the fix) · #42 design doc | mixed 🧑 |
