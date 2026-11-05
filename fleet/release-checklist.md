@@ -117,6 +117,11 @@ See [`runbook-aborts.md`](runbook-aborts.md) before reaching for either (#222, l
 
 ## Step 5 — prove the running thing is the thing you released
 
+If the release touched the retry guard or the issue projection (`factory/issue-body-sha.ts`, `gh-read.ts`), run the
+#238 live gate before believing the hermetic suite: `node gates/scope-claim-live.mjs <owner/repo> <issue>` must print
+`abort == retry : yes`. That single line is what the unit tests structurally cannot prove — that the bytes hashed at
+abort and the bytes re-read at retry come from the same projection. It found two defects the suite passed over.
+
 **Run the command, not your memory of it:**
 
 ```bash
