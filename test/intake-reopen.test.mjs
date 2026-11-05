@@ -30,21 +30,23 @@ function instrument(harness) {
   return { touched };
 }
 
-/** Put an issue in the state tonight's #220 was in: dispatched once, budget aborted once, operator stopped. */
-function dispatchedOnce({ harness, docs }, issueNumber = 220, conversationId = 100) {
+/** Put an issue in the state tonight's #220 was in: dispatched once, budget aborted once, operator stopped.
+ *  `stopped` is a parameter because #230 makes that distinction load-bearing — a stopped issue must NOT be
+ *  granted an attempt, and an aborted-but-unsuppressed one must be. */
+function dispatchedOnce({ harness, docs }, issueNumber = 220, conversationId = 100, { stopped = true, budgetAborts = 1 } = {}) {
   docs.set(IntakeLedgerDoc.definition?.kind ?? IntakeLedgerDoc.kind, {
     entries: { "issue:#220": conversationId },
     requests: [{ id: `issue-${issueNumber}`, key: `issue:#${issueNumber}`, conversationId, at: 1 }],
   });
   docs.set(BudgetLedgerDoc.definition?.kind ?? BudgetLedgerDoc.kind, {
-    issues: { [String(issueNumber)]: { budgetAborts: 1, operatorAborts: 1, lastAt: 2, lastReason: "aborted by operator", stopped: true } },
+    issues: { [String(issueNumber)]: { budgetAborts, operatorAborts: 1, lastAt: 2, lastReason: "aborted by operator", stopped } },
   });
 }
 
 /** A fake that also *has* the prior conversation, so "did reopen reuse it?" is observable rather than vacuous. */
-function seeded(issueNumber = 220, conversationId = 100) {
+function seeded(issueNumber = 220, conversationId = 100, opts = {}) {
   const f = fakeHarness({ settled: [[`issue:#${issueNumber}`, conversationId]] });
-  dispatchedOnce(f, issueNumber, conversationId);
+  dispatchedOnce(f, issueNumber, conversationId, opts);
   return f;
 }
 
@@ -88,20 +90,58 @@ test("repeated reopens get distinct, ordered request ids and keep history intact
   assert.deepEqual(ids, ["issue-220", "issue-220#reopen-1", "issue-220#reopen-2"], "history is appended, never rewritten");
 });
 
-test("the budget ledger is read but NEVER written by a reopen (#141/#222 must survive an operator's convenience)", async () => {
-  const f = seeded();
+test("reopen never touches the budget counters — the #141/#222 slack cannot be restored by an operator verb", async () => {
+  const f = seeded(undefined, undefined, { stopped: false });
   const { touched } = instrument(f.harness);
+  const before = structuredClone(f.docs.get(BudgetLedgerDoc.definition?.kind ?? BudgetLedgerDoc.kind));
 
   const res = await call(mkReopen(), f.harness, { issueNumber: 220, reason: "please retry" });
 
   assert.ok(touched.includes("factory.intake-ledger"), `reopen must record its own dispatch; touched: ${touched.join(",")}`);
-  assert.equal(touched.includes("factory.budget-ledger"), false, "a reopen that could reset budgetAborts would undo #141 and #222 in one call");
-  const budgets = f.docs.get(BudgetLedgerDoc.definition?.kind ?? BudgetLedgerDoc.kind);
-  assert.deepEqual(budgets.issues["220"], { budgetAborts: 1, operatorAborts: 1, lastAt: 2, lastReason: "aborted by operator", stopped: true });
-  // And the operator is told the consequence up front rather than discovering it in a worker log.
-  assert.equal(res.json.budget.stopped, true);
-  assert.match(res.json.warning, /STOPPED/);
-  assert.match(res.json.warning, /restores dispatchability, not budget/i);
+  const after = f.docs.get(BudgetLedgerDoc.definition?.kind ?? BudgetLedgerDoc.kind).issues["220"];
+  // The counters are the invariant, not the document. #230 legitimately appends `grants` here; if this test ever
+  // wants to assert "no write at all", it is asserting a proxy and will be deleted rather than refined.
+  for (const field of ["budgetAborts", "operatorAborts", "lastAt", "lastReason", "stopped"]) {
+    assert.deepEqual(after[field], before.issues["220"][field], `${field} must survive a reopen unchanged (#141) — was ${JSON.stringify(before.issues["220"][field])}, became ${JSON.stringify(after[field])}`);
+  }
+  assert.equal(res.json.budget.budgetAborts, 1, "and the response reports the real ledger, not a flattering one");
+});
+
+test("#230: reopening an issue that owes authorization grants exactly one attempt", async () => {
+  const f = seeded(undefined, undefined, { stopped: false });
+  const res = await call(mkReopen(), f.harness, { issueNumber: 220, reason: "issue body rewritten to the drift check only" });
+
+  assert.equal(res.json.grant?.requestId, "issue-220#reopen-1", "the grant is traceable to the reopen that issued it");
+  assert.equal(res.json.grant.reason, "issue body rewritten to the drift check only", "verbatim, so nobody can paraphrase permission into existence");
+  const ledger = f.docs.get(BudgetLedgerDoc.definition?.kind ?? BudgetLedgerDoc.kind);
+  assert.equal(ledger.issues["220"].grants.length, 1);
+  assert.equal(ledger.issues["220"].grants[0].consumedAt, undefined, "granted, not yet spent");
+  assert.match(res.json.warning, /ONE operator-authorized attempt/i);
+  assert.match(res.json.warning, /replanSource=operator/);
+});
+
+test("#230: a stopped issue is dispatched but granted nothing — reopening never lifts #141", async () => {
+  const f = seeded(); // stopped: true, the state tonight's #220 reached via two aborts
+  const { touched } = instrument(f.harness);
+
+  const res = await call(mkReopen(), f.harness, { issueNumber: 220, reason: "one more go" });
+
+  assert.equal(res.status, 202, "dispatch is intake's job; refusing is delegate's (#141)");
+  assert.equal(res.json.grant, null, "no authorization is manufactured for a stopped issue");
+  assert.equal(touched.includes("factory.budget-ledger"), false, "a stopped issue's ledger must not be written by this verb at all");
+  assert.match(res.json.warning, /No attempt was granted/i);
+  assert.match(res.json.warning, /does not lift a stop/i);
+});
+
+test("#230: an issue that owes nothing gets no grant — otherwise a latent authorization waits for a future abort", async () => {
+  const f = fakeHarness({ settled: [] }); // never dispatched, no budget history at all
+  const { touched } = instrument(f.harness);
+
+  const res = await call(mkReopen(), f.harness, { issueNumber: 7, reason: "fresh dispatch via reopen" });
+
+  assert.equal(res.status, 202);
+  assert.equal(res.json.grant, null);
+  assert.equal(touched.includes("factory.budget-ledger"), false, `nothing needed authorizing, so the ledger stays untouched; touched: ${touched.join(",")}`);
 });
 
 test("a stopped issue still reopens — the verb restores dispatchability, and #141 does the refusing", async () => {
@@ -153,7 +193,7 @@ test("buildReopenContent says what it is, what changed, and what did not", () =>
   assert.match(c, /#\s?220|#220/);
   assert.match(c, /"split to the drift check"/, "the reason is quoted, so it cannot be mistaken for instructions");
   assert.match(c, /superseded conversation was 100/);
-  assert.match(c, /Do not work around that/i, "the agent must be told the guard is still armed");
+  assert.match(c, /Do not work around any of that/i, "the agent must be told the guards are still armed");
 });
 
 test("the duplicate intake response now names the supported way forward (#226's other half)", async () => {

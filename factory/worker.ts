@@ -38,8 +38,11 @@ import {
   budgetShortCircuitPayload,
   claimIssue,
   claimTtlMs,
+  consumeReopenGrant,
   isBudgetStopped,
   noteBudgetAbort,
+  noteRetryAuthorization,
+  pendingReopenGrant,
   releaseClaim,
   replanRequiredPayload,
   requiresReplan,
@@ -627,7 +630,12 @@ export function factoryDelegateTool({
       // model was told to stop" into "someone stated what changed" — and states it durably, so an audit can see
       // who authorized the second full-budget attempt.
       const replanText = typeof args.replan === "string" ? args.replan.trim() : "";
-      if (requiresReplan(ledger, args.issueNumber) && replanText === "") {
+      const needsAuthorization = requiresReplan(ledger, args.issueNumber);
+      // #230 — an operator grant outranks prose, and it is only *peeked* here. Spending happens after the
+      // concurrency claim succeeds, because a call refused for an unrelated reason (another worker owns the
+      // issue) must not consume an authorization it never used.
+      const operatorGrant = needsAuthorization ? pendingReopenGrant(ledger, args.issueNumber) : undefined;
+      if (needsAuthorization && replanText === "" && !operatorGrant) {
         const payload = replanRequiredPayload(args.issueNumber, budgetEntry(ledger, args.issueNumber)!);
         console.error(
           `[factory.delegate] issue #${args.issueNumber} refused without work: ${payload.attempts} prior budget abort(s), no PR recorded — a non-empty \`replan\` is required (#222)`,
@@ -650,12 +658,48 @@ export function factoryDelegateTool({
         );
         return { output: [{ type: "text" as const, text: JSON.stringify(payload) }] };
       }
-      if (replanText !== "") {
-        await api.commit(async (tx) => {
-          const e = (await tx.doc(BudgetLedgerDoc)).issues[String(args.issueNumber)];
-          if (e) e.replan = replanText;
-        }, ctx);
-        console.error(`[factory.delegate] issue #${args.issueNumber} re-delegated after a budget abort with replan: ${replanText.slice(0, 200)}`);
+      // #230 — record WHO authorized this attempt. Before this, "a human reopened the issue" and "the model
+      // wrote a sentence" produced one identical log line and no ledger field, which is how a false claim of
+      // scope reduction (derived from my own reopen wording) bought a second full-budget run unnoticed.
+      if (needsAuthorization) {
+        const spent = operatorGrant
+          ? await api.commit(
+              async (tx) => consumeReopenGrant(await tx.doc(BudgetLedgerDoc), args.issueNumber, { consumedBy: api.taskId }),
+              ctx,
+            )
+          : undefined;
+        if (spent) {
+          await api.commit(
+            async (tx) => noteRetryAuthorization(await tx.doc(BudgetLedgerDoc), args.issueNumber, { source: "operator", text: spent.reason }),
+            ctx,
+          );
+          console.error(
+            `[factory.delegate] issue #${args.issueNumber} re-delegated after a budget abort on an OPERATOR GRANT — replanSource=operator (#230): ` +
+              `${JSON.stringify(spent.requestId)} granted ${new Date(spent.grantedAt).toISOString()}: ${spent.reason.slice(0, 200)}`,
+          );
+        } else if (replanText !== "") {
+          await api.commit(
+            async (tx) => noteRetryAuthorization(await tx.doc(BudgetLedgerDoc), args.issueNumber, { source: "model", text: replanText }),
+            ctx,
+          );
+          console.error(
+            `[factory.delegate] issue #${args.issueNumber} re-delegated after a budget abort on MODEL-AUTHORED text — replanSource=model (#230): ` +
+              `no operator grant on file, so this attempt rests on the sentence alone: ${replanText.slice(0, 200)}`,
+          );
+        } else {
+          // The grant was spent by a concurrent call between the peek and here. Rare, and worth a line: an
+          // attempt is running with neither prose nor a live grant behind it, and silence would hide that.
+          console.error(
+            `[factory.delegate] issue #${args.issueNumber} had an operator grant at check time but none at spend time (#230 race) — recording no authorization`,
+          );
+        }
+      } else if (replanText !== "") {
+        // No authorization was required (fresh issue, or a PR already exists). Keep the verbatim text for audit
+        // without implying it authorized anything.
+        await api.commit(
+          async (tx) => noteRetryAuthorization(await tx.doc(BudgetLedgerDoc), args.issueNumber, { source: "model", text: replanText }),
+          ctx,
+        );
       }
 
       let settled: Awaited<ReturnType<typeof api.waitForTask>>;

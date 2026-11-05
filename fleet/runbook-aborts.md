@@ -132,8 +132,9 @@ What it does, and what it pointedly does not:
 |---|---|
 | **Appends** a new requestId (`issue-220#reopen-1`, then `-2`) | never deletes the original record — attempt count stays readable from history |
 | Opens a **fresh conversation** | never submits into the superseded one: a transcript containing an abort or a refusal treats that as evidence (#122) |
-| Leaves `BudgetLedgerDoc` **untouched** | a reopen that reset `budgetAborts` would undo #141 and #222 in one convenient call; a test asserts no commit touches that document |
-| Returns `budget` + a `warning` when the issue is stopped or has prior aborts | you learn immediately that `delegate` will refuse, instead of finding out from a worker log 40 minutes later |
+| Never changes `budgetAborts`, `operatorAborts` or `stopped` | a reopen that reset those would undo #141 and #222 in one convenient call; tests compare the counters byte-for-byte afterward |
+| **Appends a one-use grant** when the issue actually owes authorization (#230) | `delegate` then proceeds without model-authored prose and records `replanSource:"operator"`. No grant for an issue with no prior abort (a latent grant would silently buy an attempt later), and none for a **stopped** issue — reopening does not lift #141 |
+| Returns `budget`, the `grant`, and a `warning` when the issue is stopped or has prior aborts | you learn immediately what this call authorized, instead of finding out from a worker log 40 minutes later |
 
 `reason` is required and non-empty. That is #222's rule applied upward: an authorized second attempt should say
 what changed, and the string goes into the new conversation verbatim (quoted) plus the log line.
@@ -144,8 +145,23 @@ what changed, and the string goes into the new conversation verbatim (quoted) pl
  "warning":"budget ledger shows 1 prior abort(s): delegate will require a non-empty `replan` (#222) …"}
 ```
 
-So the retry chain is: **reopen** (restores dispatchability) → **`delegate` refuses without `replan`** (#222)
-→ **stop at two aborts** (#141). Each layer keeps its own job.
+So the retry chain is: **reopen** (restores dispatchability, and grants one attempt) → **`delegate` spends the grant,
+or refuses without a `replan`** (#222/#230) → **stop at two aborts** (#141). Each layer keeps its own job.
+
+### Who authorized this? `replanSource` (#230)
+
+Before #230 the guard asked for a string and recorded it, so "a human decided" and "the model wrote a sentence"
+decided nothing — and looked identical in the log. Now every retry records **who** authorized it:
+
+| | ledger `replanSource` | log line |
+|---|---|---|
+| operator reopened the issue | `operator` | `… re-delegated after a budget abort on an OPERATOR GRANT — replanSource=operator (#230): "issue-220#reopen-1" granted <iso8601>: …` |
+| orchestrator supplied prose, no grant on file | `model` | `… re-delegated after a budget abort on MODEL-AUTHORED text — replanSource=model (#230): no operator grant on file, so this attempt rests on the sentence alone: …` |
+
+Reading that second line in production is not an alarm — legitimate re-scoping looks exactly like it, which is why
+the prose path stays open. It is the audit trail that lets you tell, after the fact, whether a full-budget retry
+had a human behind it. **If you mean to authorize one, reopen the issue.** That is the difference the field exists
+to record.
 
 ### Write the reason as a fact, not an intention — your words become the model's justification
 
@@ -174,6 +190,14 @@ model-authored assertion:
 - Expect `delegate` to proceed on any non-empty reason. It is an audit trail, not a wall — and if you want the
   refusal path observed rather than assumed, that requires a delegate call *without* a replan, which a model that
   wants to continue will not produce.
+
+What #230 changed about all this: your reopen is now **itself** the authorization rather than raw material for one.
+Reopening an issue that owes authorization appends a grant worth exactly one attempt, `delegate` spends it and
+records `replanSource:"operator"`, and a further attempt falls back to needing prose. What it did **not** change:
+prose still unlocks the guard (blocking re-scoped work was an explicit acceptance failure in #222), and no grant
+lifts #141's two-abort stop. The remaining honest gap is that nothing here judges whether a claimed scope change is
+real — #230 lists verifying that as a non-goal, deliberately, because checking a claim with a string the claimant
+supplies is theater with extra steps.
 
 ## Partial branches
 
