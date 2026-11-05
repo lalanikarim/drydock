@@ -6,15 +6,36 @@ Owner: 🤖 = buildable now · 🧑 = needs you (credential, click, or merge) ·
 
 ---
 
+# Sixteenth refresh — 2026-11-05 (evening)
+
+Verified state: drydock `main` = **`0a0455b`**, suite **686 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`0a0455b`** — `fleet/verify-deploy-posture.mjs` → `PASS`, seven rows, exit 0. engram unchanged at `d48aee1` / vendored tag `v0.2.4`. No open PRs.
+
+**#235 shipped (#240) and closed on live evidence.** The three intake kinds disagreed about what a `requestId` means and the router treated them identically: `issue` sends a constant `issue-<n>` (an **attempt**), while `refine`/`pr-feedback` send comment-scoped ids whose sharing *is* the feature (an **event**). Now `CONVERSATION_POLICY` states that per kind — a per-attempt kind with a changed requestId opens a fresh conversation and names what it replaced; per-event kinds steer as before. Verified against #220: `conversationId:2196, created:true, supersededConversationId:2059`, where 2059 was the conversation aborted eleven hours earlier. The budget door stayed shut — no `grants` key appeared, `delegate` refused on its usual line, nothing spawned.
+
+| rank | item | owner |
+|---|---|---|
+| 1 | **#238 — hash the issue body at abort, compare on retry.** The mechanical half of #230 that was deliberately left out: provenance records that nobody authorized a claim; it cannot say the claim was false. Cheap, falsifiable, limits written into the spec (an edit satisfies it; an unchanged body with an honest reason must not be blocked). | 🤖 |
+| 2 | **#241 — drydock has its own eng#78.** `npm run test:boot` fails deterministically and no CI job runs it (`ci.yml` invokes `npm test`, which excludes the boot suite). Verified pre-existing and not inference-side: reproduced identically in an unmodified `origin/main` worktree while `/v1/models` listed 27 models and a raw completion returned in 5.9 s, and production generation is proven by tonight's probe executing `delegate`. Either put it in CI or declare it manual — and add the collection assertion that would have caught it. | 🤖 |
+| 3 | **eng#81 — nightly live tiers.** Deferred with the rest of launchd (your call, 2026-11-05): hermetic suites + collection check run per push; model/sandbox/webui run on operator initiative. | 🧑 deferred |
+| 4 | **#217 fleet supervision** — also deferred. Still the fact that a reboot leaves the factory down silently while every alert we have is event-driven. | 🧑 deferred |
+| 5 | **#212 gate-side rule placement** — blocked on a two-caller fixture specimen that does not exist in drydock-fixture. | 🤖🧑 |
+| 6 | #147 passive · #172 upstream-only (`pi-durable`) · #42 design doc | mixed 🧑 |
+
+**The finding to carry.** Two of this session's three real defects were *coverage of the wrong thing*, not absence of coverage: a test pinned that two `issue` submissions with different requestIds share a conversation, which the adapter cannot produce because its requestId is constant; and an integration suite that fails locally while no job invokes it. Ask of any green check: *can the state it asserts actually occur in production, and would anything notice if it stopped running?*
+
+---
+
 # Fifteenth refresh — 2026-11-05 (afternoon)
 
 Verified state: drydock `main` = **`43aed60`**, suite **685 tests / 0 fail** (one pre-existing skip), typecheck clean. Fleet running **`43aed60`**, and for the first time that fact comes from a command rather than my scrollback (`fleet/verify-deploy-posture.mjs` → `PASS`, seven rows). engram `main` = **`d48aee1`**, vendored at tag **`v0.2.4`** — everything since is test infrastructure and docs that drydock does not import, so per the version-truth rule (engram#80) no release is owed. No open PRs in either repo.
 
 **Closed since the fourteenth refresh:** **eng#78** (engram#82: nine unrun suites triaged — all pass, 213 assertions — `classifier` wired into CI, the rest marked `// manual-only:` with scripts grouped by prerequisite, and `app/test/script-coverage.test.ts` failing when a suite is unreachable from any job) · **#230** (#234: `replanSource`, one-use operator grants, deployed) · **#222** (closed on live evidence — its refusal branch fired in production with no worker spawned) · **#220** (#236 + #237: policy-vs-disk drift gate and the seven-row deploy verifier). **Filed:** **#235** intake/`reopen` disagree about transcript isolation, **#238** the retry guard still cannot tell that a claimed scope change is false.
 
+<!-- rank table below superseded by the sixteenth refresh; kept as filed history -->
+
 | rank | item | owner |
 |---|---|---|
-| 1 | **#235 — two doors, two rules for transcript isolation.** `POST /factory/intake` with a fresh requestId lands in the *existing* conversation for a `(kind, subject)`, including one whose last run was aborted; `reopen` always opens a fresh one and reports the superseded id. #122's reasoning is cited in the code comment for one path and ignored by the other. Needs a decision before code — the naive fix ("new requestId ⇒ new conversation") breaks `refine`, where cross-request reuse is load-bearing and already pinned by a test. Recommendation in the issue: make the response honest first (`reusedConversation: {id, lastOutcome}`), then force-new for `kind:"issue"` only. | 🧑 decides · 🤖 builds |
+| 1 | ~~**#235 — two doors, two rules for transcript isolation.**~~ **shipped (#240), see sixteenth refresh.** `POST /factory/intake` with a fresh requestId lands in the *existing* conversation for a `(kind, subject)`, including one whose last run was aborted; `reopen` always opens a fresh one and reports the superseded id. #122's reasoning is cited in the code comment for one path and ignored by the other. Needs a decision before code — the naive fix ("new requestId ⇒ new conversation") breaks `refine`, where cross-request reuse is load-bearing and already pinned by a test. Recommendation in the issue: make the response honest first (`reusedConversation: {id, lastOutcome}`), then force-new for `kind:"issue"` only. | 🧑 decides · 🤖 builds |
 | 2 | **#238 — hash the issue body at abort, compare on retry.** The mechanical half of #230, deliberately left out of it: nothing can currently say that "the issue has since been sliced down to assertion 4 only" was false. Cheap, falsifiable, and honest about its limits (an edit satisfies it; an unchanged body with an honest reason must not be blocked). | 🤖 |
 | 3 | **eng#81 — nightly live tiers.** The hermetic suites plus the collection check run on every push now; the model/sandbox/webui tiers (200 checks, ~4 min) run when a human remembers. Committed launchd plist + one induced-red demonstration. This is what turns "CI green" back into a proxy for safe on the containment path. | 🧑 host · 🤖 prepares |
 | 4 | **#217 fleet supervision** — still deferred by you, still true: a reboot leaves the factory down silently and every alert we have is event-driven, so absence of alerts ≠ presence of service. ~30 min, one plist + one install command. Now the **only** Bar B blocker that is neither an accepted risk nor a soft-guard question. | 🧑 |
