@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RefusalBudget } from "../factory/refusal-budget.ts";
 
 const { openDraftPrTool } = await import("../factory/open-draft-pr.ts");
 
@@ -198,6 +199,53 @@ test("waived repo: no test command is policy-disclosed, but a red suite still bl
     assert.equal(payload.refused, true);
     assert.match(payload.reason, /waives the requirement to verify, but not a failing run/);
     assert.deepEqual(second.calls, []);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("a verification run that cannot execute refuses as infrastructure and does not spend the budget (#247)", async () => {
+  // This must hold in every environment, which is why it needs no fake: a sandbox image that cannot be
+  // pulled answers exit 125 wherever podman exists, and ENOENT where it does not. Both are "nothing ran",
+  // and the two things that matter are that the push is refused AND that the issue's retry budget is not
+  // consumed by our own infrastructure (#100's classing rule).
+  const fx = makeFixture({ failing: false });
+  try {
+    const budget = new RefusalBudget();
+    const beforeSha = git(fx.bare, "rev-parse", "agent/issue-1");
+    const tool = openDraftPrTool({
+      workDir: fx.workDir,
+      fixturesRepo: "octo/scratch",
+      ghToken: "",
+      modelRef: { provider: "p", modelId: "m" },
+      reviewerTaskDef: { name: "unused" },
+      testCommand: "node --test",
+      requireVerification: true,
+      verificationMode: "sandbox",
+      sandboxImage: "definitely-not-a-real-image-247:none",
+      refusalBudget: budget,
+    });
+    const { calls, api } = stubApi();
+    const result = await tool.execute({ issueNumber: 1, title: "t", summary: "s" }, api, {});
+    const payload = JSON.parse(resultText(result));
+
+    assert.equal(payload.refused, true, `expected a refusal, got ${resultText(result)}`);
+    assert.equal(payload.infrastructure, true, "the payload must say this is our runtime, not the branch");
+    assert.equal(payload.counted, false, "an infrastructure refusal must not consume the issue's attempts");
+    assert.ok(!payload.runStopped, "a broken container runtime must not stop an otherwise healthy run");
+    assert.match(payload.reason, /infrastructure/i);
+    assert.match(String(payload.hint), /[Oo]perator/);
+    assert.equal(payload.verification.where, "sandbox", "the PR/refusal says where it tried to run");
+    assert.deepEqual(calls, [], "nothing that costs inference runs after a refusal to even execute");
+
+    // Observable effect on the budget, not just the payload: recorded in the ledger, never counted.
+    const infra = budget.ledger().filter((r) => r.class === "infrastructure");
+    assert.equal(infra.length, 1, `expected one infrastructure ledger entry, saw ${JSON.stringify(budget.ledger())}`);
+    assert.equal(infra[0].count, 0, "uncounted means the signature count never moved");
+    assert.equal(budget.isStopped(1), false, "the issue is still runnable once the runtime is fixed");
+
+    const afterSha = git(fx.bare, "rev-parse", "agent/issue-1");
+    assert.equal(afterSha, beforeSha, "origin's branch tip is untouched when nothing could be verified");
   } finally {
     fx.cleanup();
   }
