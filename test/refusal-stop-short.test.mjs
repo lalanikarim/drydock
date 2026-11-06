@@ -99,6 +99,8 @@ const makeTool = (fx, budget, extra = {}) =>
     reviewerTaskDef: { name: "unused" },
     testCommand: "node --test",
     requireVerification: true,
+    // Host execution: CI's unit job has no container runtime; this file asserts refusal-budget classes (#247).
+    verificationMode: "host",
     refusalBudget: budget,
     ...extra,
   });

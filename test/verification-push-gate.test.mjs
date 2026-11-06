@@ -109,6 +109,10 @@ test("a red test suite refuses the push, and nothing reaches origin", async () =
       reviewerTaskDef: { name: "unused" },
       testCommand: "node --test",
       requireVerification: true,
+      // Explicit host execution: CI's unit job runs with no container runtime (see .github/workflows/ci.yml),
+      // and this file asserts the *gate wiring*, not containment. Sandboxed execution is asserted in
+      // test/verification-sandbox-live.test.mjs; "host" is never an implicit fallback (#247).
+      verificationMode: "host",
     });
 
     const { calls, api } = stubApi();
@@ -140,6 +144,7 @@ test("a green suite passes the verification gate (and stops at the next one)", a
       reviewerTaskDef: { name: "unused" },
       testCommand: "node --test",
       requireVerification: true,
+      verificationMode: "host", // see the note above — gate wiring, not containment
     });
     const { calls, api } = stubApi();
     await assert.rejects(
@@ -165,6 +170,7 @@ test("waived repo: no test command is policy-disclosed, but a red suite still bl
       reviewerTaskDef: { name: "unused" },
       testCommand: null, // no test command at all
       requireVerification: false, // and policy waives it
+      verificationMode: "host", // no container runtime in CI (see note above)
       pathScope: { allowlist: null, protectedPaths: [] },
     });
     const { calls, api } = stubApi();
@@ -183,6 +189,7 @@ test("waived repo: no test command is policy-disclosed, but a red suite still bl
       reviewerTaskDef: { name: "unused" },
       testCommand: "node --test",
       requireVerification: false,
+      verificationMode: "host", // no container runtime in CI (see note above)
       pathScope: { allowlist: null, protectedPaths: [] },
     });
     const second = stubApi();

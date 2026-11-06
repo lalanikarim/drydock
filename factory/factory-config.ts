@@ -62,6 +62,9 @@ export function resolveFactoryConfigPath(
 export const DEFAULTS = {
   sandboxImage: "factory-sandbox:latest",
   testCommand: "node --test",
+  // #247: the verification command runs repository-authored code, so it runs in a container unless this
+  // instance says otherwise. A config that omits the field gets the safe answer.
+  verificationMode: "sandbox" as "sandbox" | "host",
   budgets: { wallSecsPerIssue: 1800, maxReviewRetries: 2 },
   approvalTtlHours: 24,
 };
@@ -84,6 +87,13 @@ export interface FactoryConfig {
   sandboxImage: string;
   setupCommand: string | null;
   testCommand: string;
+  /**
+   * Where `testCommand` runs for the push gate (#247): "sandbox" (default) is a one-shot container with
+   * no network and no host environment; "host" inherits this process's environment and must be chosen
+   * on purpose — it is logged at boot and disclosed on every PR. Declared inline rather than imported
+   * from verification.ts to keep this module dependency-free (verification.ts imports commandArgv here).
+   */
+  verificationMode: "sandbox" | "host";
   models: { provider: string; modelId: string };
   gitToken: string;
   budgets: { wallSecsPerIssue: number; maxReviewRetries: number };
@@ -95,7 +105,7 @@ export interface FactoryConfig {
 export function validateFactoryConfig(raw: unknown): FactoryConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("config must be a JSON object");
   const obj = raw as Record<string, unknown>;
-  const known = new Set(["repo", "sandboxImage", "setupCommand", "testCommand", "models", "gitToken", "budgets", "lessonsFile", "approvalTtlHours"]);
+  const known = new Set(["repo", "sandboxImage", "setupCommand", "testCommand", "verificationMode", "models", "gitToken", "budgets", "lessonsFile", "approvalTtlHours"]);
   for (const key of Object.keys(obj)) {
     // Two exact names may carry prose. A config that lives outside the repository has no diff to explain it,
     // so the file explains itself — but only these two, because a blanket "leading underscore is ignored"
@@ -112,6 +122,12 @@ export function validateFactoryConfig(raw: unknown): FactoryConfig {
   if (obj.setupCommand !== undefined) validateCommand(obj.setupCommand, "setupCommand");
   const sandboxImage = (obj.sandboxImage ?? DEFAULTS.sandboxImage) as string;
   if (typeof sandboxImage !== "string" || !sandboxImage.trim()) throw new Error("sandboxImage must be a non-empty string");
+  // Exact values only, and a typo fails at boot rather than silently selecting a mode: `"Sandbox"` or
+  // `"container"` reading as "host" would be the worst possible outcome of a spelling mistake.
+  if (obj.verificationMode !== undefined && obj.verificationMode !== "sandbox" && obj.verificationMode !== "host") {
+    throw new Error(`verificationMode must be "sandbox" or "host", got: ${JSON.stringify(obj.verificationMode)}`);
+  }
+  const verificationMode = (obj.verificationMode ?? DEFAULTS.verificationMode) as "sandbox" | "host";
   // Model ref for worker/reviewer tasks. The core resolves its own default
   // separately; the factory pipeline needs an explicit one (provider/modelId).
   if (!obj.models || typeof obj.models !== "object" || Array.isArray(obj.models)) {
@@ -150,6 +166,7 @@ export function validateFactoryConfig(raw: unknown): FactoryConfig {
     models: { provider: models.provider, modelId: models.modelId },
     setupCommand: (obj.setupCommand as string) ?? null,
     testCommand,
+    verificationMode,
     gitToken: (obj.gitToken as string) ?? "",
     budgets,
     lessonsFile: (obj.lessonsFile as string) ?? null,

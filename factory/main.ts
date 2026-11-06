@@ -226,6 +226,7 @@ async function main() {
     modelRef,
     image,
     testCommand: factoryCfg.testCommand,
+    verificationMode: factoryCfg.verificationMode,
     setupCommand: factoryCfg.setupCommand,
     wallSecsPerIssue: factoryCfg.budgets.wallSecsPerIssue,
     lessonsFile: factoryCfg.lessonsFile ?? join(root, "lessons.md"),
@@ -276,6 +277,14 @@ async function main() {
     policy.requireVerification
       ? `[factory] ${repo}: verification required — open_draft_pr runs \`${factoryCfg.testCommand}\` and refuses to push on a non-zero exit`
       : `[factory] ${repo}: WARNING — verification waived by registry policy; draft PRs may be opened with no test run at all`,
+  );
+  // Where that command executes (#247), stated as its own posture because the two failure modes are
+  // opposite: a waived gate ships unverified code, an unsandboxed gate runs model-authored code with this
+  // process's GitHub App credentials, model key and bot token in scope. Only "host" is worth shouting at.
+  console.log(
+    factoryCfg.verificationMode === "sandbox"
+      ? `[factory] ${repo}: verification is sandboxed — \`${factoryCfg.testCommand}\` runs in ${image} with --network none and no host environment`
+      : `[factory] ${repo}: WARNING — verificationMode is "host": \`${factoryCfg.testCommand}\` executes on this host with the instance's full environment (#247). Set verificationMode:"sandbox" unless the suite genuinely cannot run in a container`,
   );
   // Retry posture (#100) stated at boot, the same way the merge and verification postures are: what
   // a human needs to know before a run starts, not after it has been retrying for an hour.

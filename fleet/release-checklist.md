@@ -12,7 +12,9 @@ that a release has an **order**, and the interesting failures are the steps that
 | `factory/**`, `fleet/*.ts`, `vendor/engram` pin, `factory/repo-registry.json`, `gate-policy.ts` | yes | **full battery for a pin bump or any posture change** | **yes — owed, not optional** |
 
 "Posture change" = anything that alters what the agent may do or how it is verified: toolset, gates config, approval
-tiers, auto-merge, test command, model pin. A pin bump changes runtime code you did not read, so it takes the full
+tiers, auto-merge, test command, **where the test command runs** (#247), model pin. If your diff touches
+`factory/container.ts`, `factory/verification.ts` or a repo's `verificationMode`, run `npm run gate:verification` on the
+factory host — it is one command and it checks containment against the real runtime, not against a stub. A pin bump changes runtime code you did not read, so it takes the full
 battery even when the diff is one line.
 
 ## Step 1 — local, before anything is pushed
@@ -140,7 +142,13 @@ grep -ci quarantin /tmp/fleet-*.log     # 0 unless a repo genuinely failed to bo
 node --experimental-strip-types gates/approval-block-probe.mjs       # detection still explains real stores (#188)
 node --experimental-strip-types gates/deploy-posture.mjs             # on-disk gates.json == gate-policy.ts, per instance (#220)
 node --experimental-strip-types gates/settlement-window.mjs          # exits 0 only when every alarming row is examined
+npm run gate:verification                                            # the push gate still runs repo code SEALED, and leaves nothing behind (#247)
 ```
+
+`gate:verification` needs no model endpoint and no GitHub credential — it drives `verifyWorkspace` directly against podman
+and asserts the four things that matter: the suite ran in the container (observable: a file written from inside), no host
+secret crossed the boundary, there is no egress, and a timed-out run leaves zero containers behind. It fails if the runtime
+is missing, because on this host the runtime is a dependency of verification.
 
 **Why `deploy-posture.mjs` is on this list (#220, 2026-11-05).** Each instance's `config/gates.json` is written at boot by
 whichever build was running, so the file describes *that* build — if main narrows or widens the destructive floor and nobody

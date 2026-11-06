@@ -15,7 +15,8 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type Task, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord/context"; // chord owns Context (#173)
 import { checkPathScope, formatScopeFailure, UNRESTRICTED_SCOPE, type PathScope } from "./path-scope.ts";
-import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence } from "./verification.ts";
+import { verifyWorkspace, verificationGate, formatVerificationEvidence, type VerificationEvidence, type VerificationMode } from "./verification.ts";
+import type { SandboxPolicy } from "./container.ts";
 import { gitAuthEnv, cloneUrlWithAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import {
   DIFF_SUMMARY_HEADING,
@@ -182,6 +183,17 @@ export interface OpenDraftPrOptions {
    */
   requireVerification?: boolean;
   /**
+   * Where the verification command runs (#247). Defaults to `"sandbox"`: a one-shot container with no
+   * network and no host environment, because the code under test was authored by a model from issue text
+   * while this process holds GitHub App credentials. `"host"` is an explicit per-instance opt-out — it is
+   * never a fallback, and it is disclosed in bold on the PR body.
+   */
+  verificationMode?: VerificationMode;
+  /** Container image for sandboxed verification (defaults to the worker's own sandbox image). */
+  sandboxImage?: string;
+  /** Image allowlist + mount root for the verification container, enforced before it starts. */
+  sandboxPolicy?: SandboxPolicy | null;
+  /**
    * Which paths this repo's policy lets a run change (factory/path-scope.ts + the repo registry).
    * Defaults to unrestricted-except-protected, because `vendor/` is protected unconditionally — the
    * vendored kernel pin is a human decision and must not be changeable by omission.
@@ -219,7 +231,7 @@ export function prNumberFromPrUrl(url: string): number | undefined {
   return m ? Number(m[1]) : undefined;
 }
 
-export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m), notify }: OpenDraftPrOptions) {
+export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, modelRef, reviewerTaskDef, testCommand = "node --test", requireVerification = true, verificationMode = "sandbox", sandboxImage, sandboxPolicy = null, pathScope = UNRESTRICTED_SCOPE, refusalBudget = new RefusalBudget(), findOpenPr, postPrComment, reportLog = (m) => console.warn(m), notify }: OpenDraftPrOptions) {
   const findPr = findOpenPr ?? ((branch: string, env: NodeJS.ProcessEnv) => ghFindOpenPr(fixturesRepo, branch, env));
   const postComment = postPrComment ?? ((prNumber: number, body: string, env: NodeJS.ProcessEnv) => ghPostPrComment(fixturesRepo, prNumber, body, env));
   const auth: GitAuth = gitAuth ?? gitAuthFromToken(ghToken);
@@ -238,7 +250,7 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
   return defineTool({
     name: "open_draft_pr",
     description:
-      "Push the worker's branch agent/issue-<n> and open a DRAFT pull request for it (never merges). Two structural gates run before the push and neither can be skipped: (1) this repo's test command is executed and a non-zero exit refuses the push outright; (2) an independent read-only review of the committed branch, which also refuses the push on failure. Refusals return the findings and create nothing — re-delegate the worker with them and call again. Idempotent: returns the existing draft PR if one is already open for the branch.",
+      "Push the worker's branch agent/issue-<n> and open a DRAFT pull request for it (never merges). Two structural gates run before the push and neither can be skipped: (1) this repo's test command is executed — in a sealed container with no network and no host environment, because the code under test is model-authored — and a non-zero exit refuses the push outright; (2) an independent read-only review of the committed branch, which also refuses the push on failure. Refusals return the findings and create nothing — re-delegate the worker with them and call again. Idempotent: returns the existing draft PR if one is already open for the branch.",
     parameters: Type.Object({
       issueNumber: Type.Integer(),
       title: Type.String(),
@@ -365,8 +377,33 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
       // minutes of inference — but note this is NOT a substitute for the review: a green suite says
       // the change did not break known behavior, which is exactly the thing a wrong-but-passing
       // implementation survives. Both gates own their own evidence.
-      const tests = await verifyWorkspace({ cwd: ws, testCommand });
+      const tests = await verifyWorkspace({ cwd: ws, testCommand, mode: verificationMode, sandboxImage, sandboxPolicy });
       const gate = verificationGate(tests, { requireVerification });
+      if (gate.action === "refuse" && gate.infra) {
+        // The runtime could not run the command at all (#247). Charged as infrastructure and NOT counted:
+        // a missing container runtime is not the task's fault, and burning the issue's attempts on our
+        // own infrastructure is how a restart turns into a stopped run. Same treatment as the
+        // cannot-compute-merge-base path above.
+        const { text } = charged(
+          { class: "infrastructure", reason: `verification could not run (${tests.infraError})` },
+          {
+            refused: true,
+            reason: gate.reason,
+            infrastructure: true,
+            counted: false,
+            verification: { ran: tests.ran, command: tests.command, infraError: tests.infraError, where: tests.where, image: tests.image },
+            hint: "Operator action, not worker action: check that the container runtime is running and that the sandbox image exists (`podman images`). Re-running the worker cannot fix this. To opt out knowingly, set verificationMode:\"host\" in this repo's runtime config — that discloses on the PR.",
+          },
+        );
+        await report({
+          outcome: "refused",
+          previousHead: existingPr?.headRefOid ?? null,
+          newHead: null,
+          refusalReason: gate.reason ?? "verification could not run",
+          runStopped: false,
+        });
+        return { output: [{ type: "text" as const, text }] };
+      }
       if (gate.action === "refuse") {
         const { text, rec } = charged(
           { class: "verification", reason: gate.reason },

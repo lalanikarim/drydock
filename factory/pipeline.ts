@@ -24,6 +24,7 @@ import { noteLessonTool } from "./lessons.ts";
 import { RefusalBudget } from "./refusal-budget.ts";
 import type { Notifier } from "./notify-telegram.ts";
 import type { PathScope } from "./path-scope.ts";
+import type { VerificationMode } from "./verification.ts";
 import { createGitAuth, gitAuthFromToken, type GitAuth } from "./github-auth.ts";
 import { assertAbortable } from "./task-contract.ts";
 
@@ -143,6 +144,12 @@ export interface PipelineOptions {
    */
   requireVerification?: boolean;
   /**
+   * Where open_draft_pr's verification command runs (#247). Default "sandbox" — a sealed container with
+   * no network and no host environment, because the code under test is model-authored. "host" is a
+   * per-instance opt-out that must be set deliberately, is logged at boot, and is disclosed on every PR.
+   */
+  verificationMode?: VerificationMode;
+  /**
    * Retry budget for refusals (#100). Created by factory/main.ts so the same object can be reported
    * on at boot and inspected after a run; one per factory process, keyed internally by issue.
    */
@@ -226,8 +233,13 @@ export function factoryPipeline(opts: PipelineOptions) {
         gitAuth: auth,
         modelRef: opts.modelRef,
         reviewerTaskDef,
+        // Verification runs inside a sealed container by default (#247) — this is the one place the
+        // factory executes model-authored code, so `image` + `sandboxPolicy` decide where it runs.
         testCommand: opts.testCommand,
         requireVerification: opts.requireVerification,
+        verificationMode: opts.verificationMode,
+        sandboxImage: opts.image,
+        sandboxPolicy: opts.sandboxPolicy ?? null,
         pathScope: opts.pathScope,
         refusalBudget,
         notify: opts.notify,

@@ -7,6 +7,10 @@
 //   git_diff      — host-side `git diff origin/main...HEAD` (read-only)
 //   run_tests     — test command inside the conversation's Podman sandbox
 //                   (untrusted test code never runs on the host; network=none, no host env)
+//                   As of #247 this claim covers the push-gate verification run too — it used to be a host
+//                   `execFile` with `process.env`, which made the sentence above true only for this tool
+//                   while the same suite was executed unsandboxed one gate earlier. Both paths now go
+//                   through factory/container.ts; where a run happened is recorded in the evidence.
 //   submit_verdict — captures a machine-consumable {verdict, evidence, concerns}
 //
 // Sandbox wiring through the core: the reviewer conversation is flagged
