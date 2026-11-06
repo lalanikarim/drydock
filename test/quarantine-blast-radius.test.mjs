@@ -203,8 +203,9 @@ test("supervisor with two repos: the sick one quarantines, the healthy one keeps
   let child = null;
   let alertServer = null;
   try {
-    // Two registered repos (the registry has no test seam, so a real fleet file must name real ones), each with
-    // its own instances root so nothing touches production factory-instances/.
+    // Two registered repos, each with its own instances root so nothing touches production factory-instances/.
+    // The registry is written into the redirected config dir below, so "registered" here means the fixture, not
+    // whatever this machine happens to manage.
     // A self-contained model catalog (#47/#171): the kernel builds its catalog from $PI_AGENT_DIR/models.json
     // and refuses to boot a pinned ref that is not in it, so the healthy sibling needs a provider that really
     // resolves — declared here rather than read from the operator's home directory, which keeps this test
@@ -220,6 +221,18 @@ test("supervisor with two repos: the sick one quarantines, the healthy one keeps
     // is the value of running the suite somewhere that has none of your setup.
     const cfgDir = join(dir, "configs");
     mkdirSync(cfgDir, { recursive: true });
+    // The repo registry lives beside the runtime configs now, so the same DRYDOCK_CONFIG_DIR redirect makes
+    // policy hermetic too. Naming exactly these two repos is also what keeps a production entry — with its
+    // autoMerge and pathAllowlist — out of a test that spawns real processes.
+    writeFileSync(
+      join(cfgDir, "repo-registry.json"),
+      JSON.stringify({
+        repos: [
+          { repo: "lalanikarim/factory-fixture", enabled: true, autoMerge: false },
+          { repo: "lalanikarim/factory-fixture-2", enabled: true, autoMerge: false },
+        ],
+      }),
+    );
     const goodConfig = join(cfgDir, "lalanikarim_factory-fixture.json");
     writeFileSync(goodConfig, JSON.stringify({ repo: "lalanikarim/factory-fixture", models: { provider: "testprov", modelId: "test/model" } }));
     // The exact incident: one unknown key. Strict-at-boot is correct, so this child dies immediately, every time.

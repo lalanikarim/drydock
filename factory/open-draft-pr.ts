@@ -359,7 +359,7 @@ export function openDraftPrTool({ workDir, fixturesRepo, ghToken = "", gitAuth, 
             detail: formatScopeFailure(scope),
             // retryable:false is the point (#100): policy is read at process start and lives in a
             // file this run cannot write, so re-delegating the same task cannot change the answer.
-            hint: "This repo's pathAllowlist will not change during this run. Either produce the change without touching the offending paths (if the task truly requires them, it is not satisfiable here — say so), or have a human change pathAllowlist in factory/repo-registry.json and restart the factory.",
+            hint: "This repo's pathAllowlist will not change during this run. Either produce the change without touching the offending paths (if the task truly requires them, it is not satisfiable here — say so), or have a human change pathAllowlist in $DRYDOCK_CONFIG_DIR/repo-registry.json and restart the factory.",
           },
         );
         await report({

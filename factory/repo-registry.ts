@@ -16,8 +16,10 @@
 //   fleet/fleet.example.json            per-DEPLOYMENT supervision file: one entry per running
 //                                       factory plus its webhook secret and instance token. Contains
 //                                       secrets, is environment-specific, and is not checked in.
-//   factory/repo-registry.json (here)   POLICY: what we allow, independent of what happens to be
-//                                       running. No secrets, so it can be reviewed like code.
+//   $DRYDOCK_REGISTRY_PATH or            POLICY: what we allow, independent of what happens to be
+//   $DRYDOCK_CONFIG_DIR/                 running. DEPLOYMENT STATE, not a repo artifact — see
+//   repo-registry.json                   registryPath() below for why it left the tree.
+//                                       factory/repo-registry.example.json is the committed shape.
 //
 // The registry lists repos, not paths: the runtime file for `owner/name` is `<owner>_<name>.json` in the
 // config dir. A pointer field here used to say where the runtime config lived, which meant two things could
@@ -43,7 +45,49 @@ import type { PathScope } from "./path-scope.ts";
 import { CONFIG_DIR_ENV, configDir, configSlug } from "./factory-config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-export const DEFAULT_REGISTRY_PATH = join(HERE, "repo-registry.json");
+
+/** Env override for the registry location — same idiom as DRYDOCK_CONFIG_DIR. */
+export const REGISTRY_ENV_VAR = "DRYDOCK_REGISTRY_PATH";
+
+/**
+ * Where the repo registry lives: `$DRYDOCK_REGISTRY_PATH`, else `<config dir>/repo-registry.json`.
+ *
+ * It used to be `factory/repo-registry.json`, inside this repository. That made three things true that
+ * should not have been:
+ *
+ * 1. **Runtime truth was `git checkout`-able.** The supervisor reads and reloads this file live, so
+ *    switching branches changed which repositories the fleet routes — an unmerged branch could widen a
+ *    path scope in running policy just by being checked out.
+ * 2. **A drydock self-run could edit its own policy.** `factory/` is inside drydock's own pathAllowlist,
+ *    so the file deciding scope and auto-merge was itself writable by the thing it governs. §5.28 moved
+ *    `testCommand` out of the tree for exactly this reason; this is the rest of that argument.
+ * 3. **CI asserted on deployment state.** A unit test held a hard-coded list of managed repositories, so
+ *    onboarding one required editing a test — and a green suite was really asserting about one laptop.
+ *
+ * Policy content is now checked where it lives: `gates/registry-posture.mjs` audits the live file on the
+ * factory host. Unit tests assert the mechanism against `test/fixtures/repo-registry.fixture.json`.
+ */
+export function registryPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[REGISTRY_ENV_VAR];
+  if (typeof override === "string" && override.trim() !== "") return resolve(override.trim());
+  return join(configDir(env), "repo-registry.json");
+}
+
+/** The committed shape, for the error message that tells an operator how to create the real one. */
+export const EXAMPLE_REGISTRY_PATH = join(HERE, "repo-registry.example.json");
+
+/**
+ * A missing registry is a setup gap, not a mystery: name both places it can come from. Only added for
+ * ENOENT — a file that exists but does not parse has a different fix and should not be told to go copy
+ * the example over it.
+ */
+function registryHint(cause: unknown): string {
+  if ((cause as NodeJS.ErrnoException)?.code !== "ENOENT") return "";
+  return (
+    `\n  The repo registry is deployment state, not a repository artifact. Create it at this path `
+    + `(copy ${EXAMPLE_REGISTRY_PATH} and edit), or set ${REGISTRY_ENV_VAR} to point somewhere else.`
+  );
+}
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 const NO_SHELL_RE = /[;&|`$<>(){}[\]*!#~]/;
@@ -336,12 +380,12 @@ export function validateRegistry(raw: unknown, opts: RegistryParseOptions = {}):
  * tooling that reads the registry — status, gates, this file's own tests — has no business failing because a
  * config dir is absent. Starting a factory for such a repo is a different claim, and that one must fail loudly.
  */
-export function loadRegistry(path: string = DEFAULT_REGISTRY_PATH): Registry {
+export function loadRegistry(path: string = registryPath()): Registry {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
-    throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}`);
+    throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}${registryHint(e)}`);
   }
   return validateRegistry(raw);
 }
@@ -355,14 +399,14 @@ export function loadRegistry(path: string = DEFAULT_REGISTRY_PATH): Registry {
  * continuing on "{}" would quietly deregister every repository.
  */
 export function loadRegistryTolerant(
-  path: string = DEFAULT_REGISTRY_PATH,
+  path: string = registryPath(),
   onWarning?: (message: string) => void,
 ): Registry {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
-    throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}`);
+    throw new Error(`cannot read repo registry at ${path}: ${(e as Error).message}${registryHint(e)}`);
   }
   return validateRegistry(raw, { tolerateUnknownFields: true, onWarning });
 }

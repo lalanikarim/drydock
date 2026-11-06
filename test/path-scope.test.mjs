@@ -12,6 +12,10 @@ import { join } from "node:path";
 import { checkPathScope, ALWAYS_PROTECTED_PATHS, UNRESTRICTED_SCOPE, formatScopeFailure } from "../factory/path-scope.ts";
 import { loadRegistry, scopeOf, validateRegistry } from "../factory/repo-registry.ts";
 
+// Policy is deployment state now (see registryPath()), so scope assertions run against a fixture that
+// mirrors the shipped shape. Live-policy invariants are audited on the factory host by gates/registry-posture.mjs.
+const POLICY_FIXTURE = new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname;
+
 test("vendor/ is protected unconditionally", () => {
   // The submodule pointer change: git reports the submodule path itself.
   const v = checkPathScope(["vendor/engram"], UNRESTRICTED_SCOPE);
@@ -108,8 +112,8 @@ test("real git behavior the design relies on: a submodule pointer bump reports a
   }
 });
 
-test("the real registry scopes: fixtures to src|test|README, drydock to its own source dirs", () => {
-  const registry = loadRegistry();
+test("policy scopes a run: fixtures to src|test|README, drydock to its own source dirs", () => {
+  const registry = loadRegistry(POLICY_FIXTURE);
   const entryOrThrow = (name) => {
     const found = registry.repos.find((e) => e.repo === name);
     assert.ok(found, `${name} missing from the registry`);

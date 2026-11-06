@@ -94,7 +94,7 @@ async function main() {
     console.log(`[factory] generated API_TOKEN for this boot: ${process.env.API_TOKEN}`);
   }
 
-  // Repo POLICY (factory/repo-registry.json) is resolved FIRST — before the per-repo runtime config
+  // Repo POLICY ($DRYDOCK_CONFIG_DIR/repo-registry.json) is resolved FIRST — before the per-repo runtime config
   // is even read — for two reasons: an unregistered or disabled repo gets a policy explanation rather
   // than a confusing "config file missing" ENOENT, and everything below can trust `policy` instead of
   // re-checking it. Consequences: only registered+enabled repos start at all, and autoMerge:false

@@ -241,6 +241,6 @@ export function terminalRefusalPayload(record: RefusalRecord): Record<string, un
     hint:
       "Do not re-delegate this task and do not call open_draft_pr again for it: the answer will be this same payload. " +
       "Report to the human that the task is unsatisfiable under this repo's current policy, naming the offending paths, " +
-      "and that a person can widen factory/repo-registry.json's pathAllowlist (or rewrite the issue) if the task is wanted.",
+      "and that a person can widen $DRYDOCK_CONFIG_DIR/repo-registry.json's pathAllowlist (or rewrite the issue) if the task is wanted.",
   };
 }

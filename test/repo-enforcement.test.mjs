@@ -63,7 +63,12 @@ test("the prompt cannot drift from the capability", () => {
 test("the supervisor refuses to run a factory the registry does not allow", () => {
   // Registered + enabled: fine. drydock is here too now that self-work is enabled (§5.12); what still
   // stops it from merging is capability removal, asserted above.
-  checkRegistryPolicy(["lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", "lalanikarim/drydock"]);
+  // An explicit registry path, never the default: the default is this machine's deployment state, and a
+  // test that read it would pass here and fail on a runner with no ~/.drydock.
+  checkRegistryPolicy(
+    ["lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", "lalanikarim/drydock"],
+    new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname,
+  );
   // Not registered at all: message lists what IS allowed.
   assert.throws(() => checkRegistryPolicy(["someone/random"]), /someone\/random is not in the repo registry \(known:/);
 });

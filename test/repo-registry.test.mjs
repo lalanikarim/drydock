@@ -1,4 +1,4 @@
-// Repo registry tests (factory/repo-registry.json + factory/repo-registry.ts).
+// Repo registry tests (factory/repo-registry.ts + the policy fixture it loads).
 //   node --experimental-strip-types --test test/repo-registry.test.mjs
 //
 // The registry is where "may the pipeline merge here?" and "which label makes an issue workable?"
@@ -7,14 +7,29 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname;
-const { validateRegistry, loadRegistry, requireRepo, requireEnabledRepo, enabledRepos, registryRepoNames, missingRuntimeConfigs } = await import(
-  "../factory/repo-registry.ts"
-);
+
+// Policy content is deployment state (see registryPath()), so the assertions about what a policy does —
+// scope, labels, oracle routing — run against this fixture, which mirrors the shipped shape. Invariants
+// about THIS machine's live registry are audited by gates/registry-posture.mjs on the factory host.
+const POLICY_FIXTURE = new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname;
+const {
+  validateRegistry,
+  loadRegistry,
+  requireRepo,
+  requireEnabledRepo,
+  enabledRepos,
+  registryRepoNames,
+  missingRuntimeConfigs,
+  registryPath,
+  EXAMPLE_REGISTRY_PATH,
+  REGISTRY_ENV_VAR,
+} = await import("../factory/repo-registry.ts");
 const { configDir } = await import("../factory/factory-config.ts");
 const { loadProbes } = await import("../gates/behavior-probes.mjs");
 const { loadFactoryConfig } = await import("../factory/factory-config.ts");
@@ -146,11 +161,17 @@ test("lookup helpers fail with the registry contents in the message", () => {
 // The real registry, and its relationship to the oracles.
 // ---------------------------------------------------------------------------
 
-test("factory/repo-registry.json loads and describes the expected registry", () => {
-  const registry = loadRegistry();
-  // The snapshot is deliberate: adding a repo to policy must be visible here, because this list is the
-  // difference between "the factory may act on this repository" and it is not.
-  assert.deepEqual(registryRepoNames(registry), ["lalanikarim/factory-fixture", "lalanikarim/factory-fixture-2", "lalanikarim/drydock", "lalanikarim/engram"]);
+test("the policy fixture loads and describes every managed repo", () => {
+  const registry = loadRegistry(POLICY_FIXTURE);
+  // The snapshot is deliberate: this list is the difference between "the factory may act on this
+  // repository" and it is not, so a fixture edit must be an intentional one.
+  assert.deepEqual(registryRepoNames(registry), [
+    "lalanikarim/factory-fixture",
+    "lalanikarim/factory-fixture-2",
+    "lalanikarim/drydock",
+    "lalanikarim/engram",
+    "lalanikarim/tasklight",
+  ]);
   const fx1 = requireEnabledRepo(registry, "lalanikarim/factory-fixture");
   assert.equal(fx1.oracleBoot.portFrom, "stdout", "fixture-1 logs the port it bound");
   const fx2 = requireEnabledRepo(registry, "lalanikarim/factory-fixture-2");
@@ -158,7 +179,7 @@ test("factory/repo-registry.json loads and describes the expected registry", () 
 });
 
 test("drydock is enabled for self-work and can never auto-merge", () => {
-  const raw = JSON.parse(readFileSync(join(ROOT, "factory/repo-registry.json"), "utf8"));
+  const raw = JSON.parse(readFileSync(POLICY_FIXTURE, "utf8"));
   const drydock = raw.repos.find((r) => r.repo === "lalanikarim/drydock");
   // Enabled since #58. Dispatch still requires a deliberate act by an allowlisted sender:
   // the `build` eligibility label on an issue, or a `/factory` comment on a factory PR.
@@ -177,7 +198,7 @@ test("engram is managed but can never auto-merge, and the vendored pin stays pro
   // Onboarding engram closes most of #78: it was reachable-but-unmanaged, which left "the App could write
   // an unprotected kernel main" as a residual. Managed is only safer than reachable if the posture below
   // holds, so it is pinned rather than trusted to the JSON reading well.
-  const registry = loadRegistry();
+  const registry = loadRegistry(POLICY_FIXTURE);
   const engram = requireEnabledRepo(registry, "lalanikarim/engram");
   assert.equal(engram.autoMerge, false, "the kernel repo stops at a draft PR for human merge");
   assert.notEqual(engram.eligibilityLabel, "agent", "engram's own backlog is not factory work by default");
@@ -206,7 +227,7 @@ test("safety flags must be real booleans — \"false\" as a string is a typo, no
 test("no checked-in repo waives verification", () => {
   // The escape hatch exists for repos with no runnable suite. None of ours qualify, and the day one
   // is waived this test names it instead of the waiver being a quiet diff in a JSON file.
-  const registry = loadRegistry();
+  const registry = loadRegistry(POLICY_FIXTURE);
   for (const entry of registry.repos) {
     assert.equal(entry.requireVerification, true, `${entry.repo} waives verification — PR bodies there would say "NOT VERIFIED"`);
   }
@@ -221,11 +242,83 @@ test("the checked-in config template validates and stays a template", () => {
   assert.ok(!/qwen|gpt|claude/i.test(cfg.models.modelId), `template pins a real model: ${cfg.models.modelId}`);
 });
 
-test("runtime configs on this machine parse and agree with the registry", (t) => {
-  // Deployment-side files, so they exist only where a fleet actually runs. CI has none — that is the point of
-  // moving them out — so this skips rather than pretending to have checked something.
+// --- where the registry lives ---------------------------------------------------------------
+// It used to be factory/repo-registry.json. These are the guards that keep it from creeping back:
+// policy must resolve outside the tree, say so when absent, and stay out of git.
+
+test("registryPath resolves the env override, then the config dir — never the source tree", () => {
+  assert.equal(registryPath({ DRYDOCK_REGISTRY_PATH: "/etc/drydock/registry.json" }), "/etc/drydock/registry.json");
+  assert.equal(
+    registryPath({ DRYDOCK_CONFIG_DIR: "/srv/fleet/configs" }),
+    join("/srv/fleet/configs", "repo-registry.json"),
+    "the config dir is the default home",
+  );
+  const live = registryPath({});
+  assert.ok(!live.startsWith(ROOT), `the registry must not resolve inside the source tree: ${live}`);
+  // Empty/whitespace overrides are ignored rather than resolving to a relative surprise.
+  assert.ok(!registryPath({ DRYDOCK_REGISTRY_PATH: "   " }).startsWith(ROOT));
+});
+
+test("a missing registry names all three ways to fix it", () => {
+  const gone = join(mkdtempSync(join(tmpdir(), "reg-absent-")), "repo-registry.json");
+  assert.throws(
+    () => loadRegistry(gone),
+    (e) =>
+      /cannot read repo registry/.test(e.message) &&
+      e.message.includes(gone) &&
+      e.message.includes(EXAMPLE_REGISTRY_PATH) &&
+      e.message.includes(REGISTRY_ENV_VAR),
+    "the message must name the path, the committed example, and the env override",
+  );
+});
+
+test("a registry that exists but does not parse is NOT told to copy the example over it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "reg-corrupt-"));
+  const path = join(dir, "repo-registry.json");
+  writeFileSync(path, "{ nope ");
+  assert.throws(
+    () => loadRegistry(path),
+    (e) => /cannot read repo registry/.test(e.message) && !e.message.includes("copy"),
+  );
+});
+
+test("the committed example validates and stays a template", () => {
+  const example = loadRegistry(EXAMPLE_REGISTRY_PATH);
+  assert.ok(example.repos.length >= 1, "an example with no entries teaches nothing");
+  for (const entry of example.repos) {
+    assert.ok(entry.repo.startsWith("example/"), `template names a real repo: ${entry.repo}`);
+  }
+  assert.ok(!JSON.stringify(example).includes("lalanikarim"), "the template must not leak this deployment");
+});
+
+test("factory/repo-registry.json is not a tracked artifact", (t) => {
+  // The regression this prevents: someone restores the file 'because it was here before', and policy
+  // silently becomes branch-switchable and self-editable again.
+  let tracked;
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", "factory/repo-registry.json"], { cwd: ROOT, stdio: "ignore" });
+    tracked = true;
+  } catch (e) {
+    if (e && e.code === "ENOENT") {
+      t.skip("git unavailable — cannot inspect the index");
+      return;
+    }
+    tracked = false;
+  }
+  assert.equal(tracked, false, "factory/repo-registry.json is tracked again — it is deployment state; see registryPath()");
+});
+
+test("runtime configs on this machine parse and agree with the live registry", (t) => {
+  // Deployment-side files, so they exist only where a fleet actually runs. CI has neither the registry nor
+  // the per-repo configs — that is the point of moving them out — so this skips rather than pretending.
   const dir = configDir();
-  const registry = loadRegistry();
+  let registry;
+  try {
+    registry = loadRegistry();
+  } catch (e) {
+    t.skip(`no live repo registry on this machine: ${String(e.message).split("\n")[0]}`);
+    return;
+  }
   const present = registry.repos.filter((r) => {
     try {
       readFileSync(join(dir, `${r.repo.replace("/", "_")}.json`), "utf8");
@@ -247,7 +340,7 @@ test("runtime configs on this machine parse and agree with the registry", (t) =>
 });
 
 test("every oracle declares a repo, and every oracle repo is in the registry", async () => {
-  const registry = loadRegistry();
+  const registry = loadRegistry(POLICY_FIXTURE);
   const known = new Set(registryRepoNames(registry));
   const probes = await loadProbes();
   assert.ok(probes.size >= 13, `expected at least 13 oracles, found ${probes.size}`);
@@ -292,7 +385,7 @@ test("prFeedback must be a real boolean — Boolean(\"false\") is true (R6)", ()
 });
 
 test("drydock opts in, the fixtures do not", () => {
-  const registry = loadRegistry(join(ROOT, "factory/repo-registry.json"));
+  const registry = loadRegistry(POLICY_FIXTURE);
   const byName = Object.fromEntries(registry.repos.map((r) => [r.repo, r]));
   // drydock: dogfooding target — a human comments "/factory rebase" on its own draft PRs.
   assert.equal(byName["lalanikarim/drydock"].prFeedback, true);
@@ -308,7 +401,7 @@ test("the supervisor copies prFeedback onto the route it hands the adapter", asy
     { repo: "lalanikarim/drydock", secret: "s1" },
     { repo: "lalanikarim/factory-fixture", secret: "s2" },
   ];
-  const registry = loadRegistry(join(ROOT, "factory/repo-registry.json"));
+  const registry = loadRegistry(POLICY_FIXTURE);
   const routes = buildRoutes(factories, new Map(), registry, { WEBHOOK_SECRET_LALANIKARIM_DRYDOCK: "x1", WEBHOOK_SECRET_LALANIKARIM_FACTORY_FIXTURE: "x2" });
   const drydock = routes.find((r) => r.repo === "lalanikarim/drydock");
   const fixture = routes.find((r) => r.repo === "lalanikarim/factory-fixture");
@@ -358,7 +451,7 @@ test("sweepTargets covers enabled repos with an id; missingWebhookIds names the 
 test("the real registry records a hook id for every deployed repo", () => {
   // A pin, deliberately: deleting these turns the scheduled sweep back into the version that quietly ignored
   // a repo. Engram was in exactly that state from the day it was onboarded.
-  const targets = sweepTargets(loadRegistry(join(ROOT, "factory/repo-registry.json")));
+  const targets = sweepTargets(loadRegistry(POLICY_FIXTURE));
   const byRepo = Object.fromEntries(targets.map((t) => [t.repo, t.webhookId]));
   assert.equal(byRepo["lalanikarim/drydock"], 703101252);
   assert.equal(byRepo["lalanikarim/engram"], 706043067);

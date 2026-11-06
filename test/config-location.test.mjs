@@ -119,7 +119,10 @@ test("no shipped entrypoint resolves runtime config from inside the checkout (so
   }
 });
 
-test("configs present on this machine are readable by the same resolver the factory uses", (t) => {
+test("every json in the config dir parses under the reader that owns it", async (t) => {
+  // The directory holds two kinds of file now: per-repo runtime configs (<owner>_<repo>.json) and the repo
+  // registry. Each has its own schema, so "does it parse" is only meaningful with the matching reader —
+  // loadFactoryConfig on the registry would reject fields that are correct for it ("repos", "defaults").
   const dir = configDir();
   let files;
   try {
@@ -132,8 +135,16 @@ test("configs present on this machine are readable by the same resolver the fact
     t.skip(`no runtime configs in ${dir}`);
     return;
   }
+  const { loadRegistry, registryPath } = await import("../factory/repo-registry.ts");
   for (const file of files) {
-    const cfg = loadFactoryConfig(join(dir, file));
+    const path = join(dir, file);
+    if (file === "repo-registry.json") {
+      const registry = loadRegistry(path);
+      assert.ok(registry.repos.length >= 1, `${file} declares no repositories`);
+      assert.equal(path, registryPath(), `${file} is not where the loader looks — a stale name here silently disables policy`);
+      continue;
+    }
+    const cfg = loadFactoryConfig(path);
     assert.equal(defaultConfigPathFor(cfg.repo, {}), join(configDir({}), file), `${file} is not named for the repo it declares`);
   }
 });

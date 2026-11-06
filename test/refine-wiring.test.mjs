@@ -15,6 +15,9 @@ import { join } from "node:path";
 
 const { factoryPipeline, orchestratorInstructions } = await import("../factory/pipeline.ts");
 const { validateRegistry, loadRegistry } = await import("../factory/repo-registry.ts");
+
+// A fixture, not the live registry: which repos are managed is deployment state (see registryPath()).
+const POLICY_FIXTURE = new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname;
 const { classifyWebhookEvent, renderRefineContent, renderIntakeContent, validateRoutes } = await import("../factory/intake.ts");
 const { buildRoutes } = await import("../fleet/supervisor.ts");
 const { makeRouteDispatch } = await import("../factory/adapter.ts");
@@ -81,8 +84,8 @@ test("refine must be a real boolean (R6: Boolean(\"false\") is true)", () => {
   assert.throws(() => validateRegistry({ defaults: {}, repos: [regEntry({ refineLabel: "   " })] }), /refineLabel/);
 });
 
-test("drydock opts in, and its two labels stay distinct", () => {
-  const reg = loadRegistry();
+test("drydock opts into refinement, and its two labels stay distinct", () => {
+  const reg = loadRegistry(POLICY_FIXTURE);
   const drydock = reg.repos.find((r) => r.repo === "lalanikarim/drydock");
   assert.equal(drydock.refine, true);
   assert.notEqual(drydock.refineLabel, drydock.eligibilityLabel);

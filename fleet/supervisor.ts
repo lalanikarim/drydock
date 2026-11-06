@@ -36,7 +36,7 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
-import { loadRegistry, loadRegistryTolerant, missingRuntimeConfigs, requireEnabledRepo, DEFAULT_REGISTRY_PATH } from "../factory/repo-registry.ts";
+import { loadRegistry, loadRegistryTolerant, missingRuntimeConfigs, requireEnabledRepo, registryPath as resolveRegistryPath } from "../factory/repo-registry.ts";
 import { acquireInstanceLock, defaultLockPath } from "./single-instance.ts";
 import { readSweepState } from "./redeliver-failed.mjs";
 import { defaultConfigPathFor } from "../factory/factory-config.ts";
@@ -239,7 +239,7 @@ async function runFleet(fleetPath: string): Promise<void> {
 
   // #143: the fleet died once because nobody could tell that a supervisor two days older than the tree it
   // reads was about to reject a field that new code had just added. Log what is running, in a form an
-  // operator (or a gate) can compare against `git log -1` and `sha256sum factory/repo-registry.json`. The
+  // operator (or a gate) can compare against `git log -1` and `sha256sum "$DRYDOCK_CONFIG_DIR/repo-registry.json"`. The
   // sha also goes to children via DRYDOCK_BUILD_SHA so /health reports it and staleness is visible remotely.
   const buildSha = (() => {
     try {
@@ -251,7 +251,7 @@ async function runFleet(fleetPath: string): Promise<void> {
   if (!process.env.DRYDOCK_BUILD_SHA) process.env.DRYDOCK_BUILD_SHA = buildSha;
   let registryDigest = "unreadable";
   try {
-    registryDigest = createHash("sha256").update(readFileSync(DEFAULT_REGISTRY_PATH)).digest("hex").slice(0, 12);
+    registryDigest = createHash("sha256").update(readFileSync(resolveRegistryPath())).digest("hex").slice(0, 12);
   } catch {
     /* boot's strict read reports the real reason */
   }
@@ -397,7 +397,7 @@ async function runFleet(fleetPath: string): Promise<void> {
     const routesFile = rel(fleetPath, fleet.adapter.routesFile);
     let registry: ReturnType<typeof loadRegistryTolerant>;
     try {
-      registry = loadRegistryTolerant(DEFAULT_REGISTRY_PATH, (m) => {
+      registry = loadRegistryTolerant(resolveRegistryPath(), (m) => {
         console.warn(`[supervisor] registry ignored a field (reload from ${why}): ${m}`);
       });
     } catch (e) {

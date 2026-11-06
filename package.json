@@ -19,6 +19,8 @@
     "test": "node --experimental-strip-types factory/pipeline.test.ts && node --experimental-strip-types factory/intake.test.ts && node --experimental-strip-types --test 'test/*.test.mjs'",
     "test:boot": "node --experimental-strip-types factory/core-spike.test.ts && node --experimental-strip-types factory/pipeline-boot.test.ts && node --experimental-strip-types factory/intake-boot.test.ts",
     "gate:verification": "node gates/verification-sandbox-live.mjs",
+    "gate:registry": "node gates/registry-posture.mjs",
+    "gate:registry:selftest": "node gates/registry-posture.mjs --self-test",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

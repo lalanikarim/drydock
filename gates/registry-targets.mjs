@@ -10,26 +10,27 @@
 // error, not a plausible-looking subset.
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { registryPath } from "../factory/repo-registry.ts";
 
-export const DEFAULT_REGISTRY = fileURLToPath(new URL("../factory/repo-registry.json", import.meta.url));
+// No DEFAULT_REGISTRY constant any more. The path is deployment state and resolves per call (env override,
+// then config dir), so freezing it at import time would pin whichever environment imported this first.
 
 /**
  * Managed repo names (`owner/name`) from the registry itself.
  * @throws if the file is missing, unparseable, or names no repository.
  */
-export function registryRepoNames(registryPath = DEFAULT_REGISTRY, { includeDisabled = true } = {}) {
+export function registryRepoNames(path = registryPath(), { includeDisabled = true } = {}) {
   let raw;
   try {
-    raw = readFileSync(registryPath, "utf8");
+    raw = readFileSync(path, "utf8");
   } catch (e) {
-    throw new Error(`cannot read repo registry at ${registryPath}: ${e.message}`);
+    throw new Error(`cannot read repo registry at ${path}: ${e.message}`);
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`repo registry at ${registryPath} is not valid JSON: ${e.message}`);
+    throw new Error(`repo registry at ${path} is not valid JSON: ${e.message}`);
   }
   // Disabled entries stay in the list on purpose: a repo policy mentions but switched off is still IN
   // policy, and reporting it as "reachable but unmanaged" (#78's residual) would be a false alarm.
@@ -37,15 +38,15 @@ export function registryRepoNames(registryPath = DEFAULT_REGISTRY, { includeDisa
     .filter((r) => r && typeof r.repo === "string" && (includeDisabled || r.enabled !== false))
     .map((r) => r.repo);
   if (names.length === 0) {
-    throw new Error(`repo registry at ${registryPath} lists no repository — refusing to report "nothing to probe" as a pass`);
+    throw new Error(`repo registry at ${path} lists no repository — refusing to report "nothing to probe" as a pass`);
   }
   return [...new Set(names)];
 }
 
 /** Non-throwing form for tools that must degrade loudly rather than at all. */
-export function tryRegistryRepoNames(registryPath = DEFAULT_REGISTRY) {
+export function tryRegistryRepoNames(path = registryPath()) {
   try {
-    return { names: registryRepoNames(registryPath), error: null };
+    return { names: registryRepoNames(path), error: null };
   } catch (e) {
     return { names: [], error: e.message };
   }

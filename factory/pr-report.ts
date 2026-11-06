@@ -88,7 +88,7 @@ export function buildPrReport(facts: PrReportFacts): string {
   lines.push(
     "",
     facts.outcome === "refused"
-      ? "_Nothing on the branch or the PR changed. Comment `/factory <directive>` again with a different instruction, or widen this repo's policy in `factory/repo-registry.json` if the request genuinely needs it._"
+      ? "_Nothing on the branch or the PR changed. Comment `/factory <directive>` again with a different instruction, or widen this repo's policy in `$DRYDOCK_CONFIG_DIR/repo-registry.json` if the request genuinely needs it._"
       : `_Replied automatically by the factory after a \`/factory\` comment ${issueLink(96)}._`,
   );
   return lines.join("\n");
