@@ -79,6 +79,23 @@
       ],
       "eligibilityLabel": "build",
       "note": "Kernel repo managed by the factory. testCommand uses test:unit (pure-logic subset) because the sealed sandbox has network=none and the full suite needs a live model endpoint — see engram#66. poc/lib/ is protected because drydock vendors it and a factory run must not break the pin discipline. autoMerge false: stops at draft PR for human merge."
+    },
+    {
+      "repo": "lalanikarim/tasklight",
+      "enabled": true,
+      "webhookId": 708328878,
+      "autoMerge": false,
+      "pathAllowlist": [
+        "src/",
+        "test/",
+        "docs/",
+        "package.json"
+      ],
+      "protectedPaths": [
+        "README.md"
+      ],
+      "eligibilityLabel": "build",
+      "note": "Spec-driven greenfield target (onboarded 2026-11-06). The repo is a specification only — README.md is the behavior contract and the worker prompt defers to it, so it is protected: a run may not amend the spec it is being judged against. Bootstrap sequence: issue #1 lands test/spec.test.mjs + test/helpers.mjs verbatim (the oracle), then README gains test/spec.test.mjs in protectedPaths by human edit, then issue #2 implements src/ until the oracle passes. autoMerge false permanently for this repo: runs stop at the draft PR. No setupCommand — v0 is dependency-free, so verification needs no install step."
     }
   ]
 }
