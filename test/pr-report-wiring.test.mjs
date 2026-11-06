@@ -70,6 +70,8 @@ function makeTool(fx, { pr, postThrows = false, ...extra }) {
     reviewerTaskDef: { name: "unused" },
     testCommand: "node --test",
     requireVerification: true,
+    // Host execution: CI's unit job has no container runtime, and this file asserts PR-report wiring (#247).
+    verificationMode: "host",
     findOpenPr: async () => pr,
     postPrComment: async (prNumber, body) => {
       if (postThrows) throw new Error("api: comment create refused (502)");

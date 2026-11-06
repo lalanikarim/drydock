@@ -229,6 +229,9 @@ test("the second identical path-scope refusal notifies exactly once, and a throw
       reviewerTaskDef: { name: "unused" },
       testCommand: "node --test",
       requireVerification: true,
+      // Host execution because CI's unit job has no container runtime; this file is about notification
+      // counting, not containment (#247).
+      verificationMode: "host",
       // Everything except docs/ is out of scope, so the worker's change cannot be pushed (#52).
       pathScope: { allowlist: ["docs/"], protectedPaths: [] },
       refusalBudget: budget,

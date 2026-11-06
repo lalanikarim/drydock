@@ -1,6 +1,14 @@
 // #61 / decision C1: a draft PR cannot exist without recorded verification, and a failing run
 // cannot be talked past. The gate decision is pure, so the whole matrix is exercised here;
 // verifyWorkspace is exercised against real processes in a scratch workspace.
+//
+// Every verifyWorkspace call below passes `mode: "host"` on purpose (#247). These are evidence-semantics
+// tests — exit code recorded verbatim, timeout distinct from red, zero-collected-not-a-pass, argv-not-shell,
+// NODE_TEST_CONTEXT stripping — and they need a node that exists, so they run against the host interpreter.
+// CI has podman but no sandbox image, so leaving the default here would turn every one of these into an
+// infrastructure refusal and quietly stop measuring anything. Containment itself is asserted in
+// test/verification-sandbox.test.mjs (decisions, with a hostile stub runtime) and against the real runtime by
+// `npm run gate:verification`.
 //   node --experimental-strip-types --test test/verification-gate.test.mjs
 
 import test from "node:test";
@@ -62,7 +70,7 @@ test("verifyWorkspace records exit code and output for real commands", async () 
   writeFileSync(join(ws, "pass.mjs"), "console.log('# tests 3\\n# pass 3\\n# fail 0');\n");
   writeFileSync(join(ws, "fail.mjs"), "console.error('boom: expected 1 got 2');\nprocess.exit(1);\n");
 
-  const ok = await verifyWorkspace({ cwd: ws, testCommand: "node pass.mjs" });
+  const ok = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node pass.mjs" });
   assert.equal(ok.ran, true);
   assert.equal(ok.exitCode, 0);
   assert.equal(ok.passed, true);
@@ -72,17 +80,17 @@ test("verifyWorkspace records exit code and output for real commands", async () 
   assert.equal(verificationGate(ok).action, "proceed");
 
   writeFileSync(join(ws, "suite.test.mjs"), "import test from 'node:test';\ntest('t', () => {});\n");
-  const nodeTest = await verifyWorkspace({ cwd: ws, testCommand: "node --test" });
+  const nodeTest = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node --test" });
   assert.equal(nodeTest.passed, true);
   assert.deepEqual([nodeTest.total, nodeTest.passCount, nodeTest.failCount], [1, 1, 0]);
 
-  const bad = await verifyWorkspace({ cwd: ws, testCommand: "node fail.mjs" });
+  const bad = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node fail.mjs" });
   assert.equal(bad.passed, false);
   assert.equal(bad.exitCode, 1, "the exit code is the evidence — it must be recorded verbatim");
   assert.match(bad.tail, /boom: expected 1 got 2/);
   assert.equal(verificationGate(bad).action, "refuse");
 
-  const missing = await verifyWorkspace({ cwd: ws, testCommand: null });
+  const missing = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: null });
   assert.equal(missing.ran, false);
   assert.equal(verificationGate(missing).action, "refuse");
 });
@@ -91,7 +99,7 @@ test("exit 0 with zero tests collected is NOT verification (vacuous green)", asy
   // A runner that matched no test files can still exit 0. That must never satisfy the gate.
   const ws = mkdtempSync(join(tmpdir(), "verify-empty-"));
   writeFileSync(join(ws, "readme.md"), "no tests here\n");
-  const res = await verifyWorkspace({ cwd: ws, testCommand: "node --test" });
+  const res = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node --test" });
   assert.equal(res.vacuous, true, `expected vacuous, got ${JSON.stringify(res)}`);
   assert.equal(res.passed, false);
   for (const requireVerification of [true, false]) {
@@ -110,7 +118,7 @@ test("the outer harness's own runner state cannot neuter the verification run", 
   writeFileSync(join(ws, "real.test.mjs"), "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('genuine', () => { assert.equal(1, 1); });\n");
   process.env.NODE_TEST_CONTEXT = "child-v8";
   try {
-    const res = await verifyWorkspace({ cwd: ws, testCommand: "node --test" });
+    const res = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node --test" });
     assert.equal(res.total, 1, `nested runner was skipped: ${JSON.stringify(res)}`);
     assert.equal(res.passed, true);
     assert.equal(res.vacuous, undefined);
@@ -122,7 +130,7 @@ test("the outer harness's own runner state cannot neuter the verification run", 
 test("a hanging suite is a timeout, not a pass, and cannot be pushed", async () => {
   const ws = mkdtempSync(join(tmpdir(), "verify-hang-"));
   writeFileSync(join(ws, "hang.mjs"), "setTimeout(() => process.exit(0), 60_000);\n");
-  const res = await verifyWorkspace({ cwd: ws, testCommand: "node hang.mjs", timeoutSecs: 1 });
+  const res = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node hang.mjs", timeoutSecs: 1 });
   assert.equal(res.timedOut, true, `expected timeout, got ${JSON.stringify(res)}`);
   assert.equal(res.passed, false);
   assert.match(res.tail, /exceeded 1s/);
@@ -135,7 +143,7 @@ test("the test command is argv, never a shell — metacharacters cannot smuggle 
   const ws = mkdtempSync(join(tmpdir(), "verify-argv-"));
   // Echoes its argv so we can see what the process actually received.
   writeFileSync(join(ws, "argv.mjs"), "console.log(JSON.stringify(process.argv.slice(2)));\n");
-  const res = await verifyWorkspace({ cwd: ws, testCommand: "node argv.mjs && touch pwned.txt" });
+  const res = await verifyWorkspace({ cwd: ws, mode: "host", testCommand: "node argv.mjs && touch pwned.txt" });
 
   // The security property that matters: `&&`/`touch` were arguments, not commands.
   const { existsSync } = await import("node:fs");
