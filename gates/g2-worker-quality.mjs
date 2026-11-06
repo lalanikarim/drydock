@@ -4,7 +4,7 @@
 //   node gates/g2-worker-quality.mjs --issues 34,35 [--allow-existing] [--max-files 6]
 //   node gates/g2-worker-quality.mjs --repo lalanikarim/factory-fixture-2 --preflight-only
 //
-// Which repo is judged comes from the repo registry (factory/repo-registry.json): it supplies the issue
+// Which repo is judged comes from the repo registry ($DRYDOCK_CONFIG_DIR/repo-registry.json): it supplies the issue
 // eligibility label and the oracleBoot recipe for starting that repo's server. `--repo all` on
 // --regression walks every registered repo; a plain run targets one repo.
 //
@@ -72,7 +72,7 @@ const allowExisting = argv.includes("--allow-existing");
 const maxScopeFiles = Number(opt("--max-files", "5"));
 
 loadFactoryEnv();
-// The repo registry (factory/repo-registry.json) decides which repo we judge, which label makes an issue
+// The repo registry ($DRYDOCK_CONFIG_DIR/repo-registry.json) decides which repo we judge, which label makes an issue
 // workable there, and how that repo's server is started for behavior oracles. That last one is why
 // this exists: fixture-1 logs "127.0.0.1:<port>" after binding 0, while fixture-2 reads PORT and
 // logs the *requested* value — so a second repo could not be judged with fixture-1's boot recipe.
@@ -88,7 +88,7 @@ const registryEntry = repoOpt === "all"
   ? enabledRepos(registry).find((e) => e.oracleBoot)
   : requireEnabledRepo(registry, repoOpt);
 if (!registryEntry) {
-  console.error("no enabled repo in the registry has an oracleBoot — nothing can be judged (add one to factory/repo-registry.json)");
+  console.error("no enabled repo in the registry has an oracleBoot — nothing can be judged (add one to $DRYDOCK_CONFIG_DIR/repo-registry.json)");
   process.exit(2);
 }
 const fixturesRepo = registryEntry.repo;
@@ -237,7 +237,7 @@ const waitForListening = (port, deadlineMs) =>
  * (fixture-2 logs the requested port, which is meaningless when we ask for 0).
  */
 async function withServer(dir, boot, fn) {
-  if (!boot) throw new Error(`${fixturesRepo} has no oracleBoot in factory/repo-registry.json — cannot run behavior oracles`);
+  if (!boot) throw new Error(`${fixturesRepo} has no oracleBoot in $DRYDOCK_CONFIG_DIR/repo-registry.json — cannot run behavior oracles`);
   const env = { ...process.env };
   let port = 0;
   if (boot.portFrom === "env") {
@@ -419,7 +419,7 @@ if (regression) {
   for (const entry of repos) {
     const group = [...probes.values()].filter((p) => p.repo === entry.repo);
     if (!entry.oracleBoot) {
-      console.log(`\n${entry.repo}: SKIPPED — no oracleBoot in factory/repo-registry.json (${group.length} oracle(s) unrunnable)`);
+      console.log(`\n${entry.repo}: SKIPPED — no oracleBoot in $DRYDOCK_CONFIG_DIR/repo-registry.json (${group.length} oracle(s) unrunnable)`);
       continue;
     }
     if (group.length === 0) {

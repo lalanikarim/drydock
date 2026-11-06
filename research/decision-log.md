@@ -637,3 +637,25 @@ Verdicts identical within each pair. Where the diff was genuinely broken, `revie
 - **A container run must prove its own cleanup.** "We asked the runtime to remove it" is a claim about a call, not about state — same lesson as R6b/R10, one layer down.
 - **Distinguish "it failed" from "it could not run"** in every gate that refuses. The orchestrator's only lever on an infrastructure refusal is an operator; charging it to the retry budget turns a restart into a stopped run.
 - Sandboxed verification still writes through the bind mount (R15 residual): containment here covers credentials and egress, not filesystem quota or resource exhaustion. Limits are the next slice (engram#92).
+
+---
+
+## 2026-11-07 — #258: policy stopped being a file a branch switch could edit
+
+**Decision.** `factory/repo-registry.json` is no longer tracked. The registry resolves from `$DRYDOCK_REGISTRY_PATH`, else `$DRYDOCK_CONFIG_DIR/repo-registry.json`; `factory/repo-registry.example.json` is the committed shape. This completes §5.28, which moved per-repo runtime config out of the tree and left the file that decides *scope and auto-merge* behind.
+
+**Why — three defects in one artifact.**
+
+- **Runtime truth was `git checkout`-able.** The supervisor reloads the registry live, so checking out an older or unmerged branch changed which repositories the running fleet routed, and what each was allowed to touch. A file that a process reads as configuration is not a source file, whatever git thinks.
+- **A self-run could edit the policy that governs it.** drydock's `pathAllowlist` includes `factory/`, and the registry sat at `factory/repo-registry.json`. Scope and `autoMerge` were one writable path away from a run whose entire job is editing files in that directory.
+- **CI was asserting on deployment state.** A unit test held a hard-coded list of managed repos. Onboarding tasklight required editing a test; the test passing on a runner proved nothing about any fleet, and it failing on a laptop proved too much about one.
+
+**What replaced the assertions, and where they run now.** `gates/registry-posture.mjs` (`npm run gate:registry`) audits the live file on the factory host — nothing waives verification, no allowlist grants `.github`, no self-contradictory `vendor/`, drydock cannot auto-merge, `gates/probes/` stays protected — and prints `inspected N enabled of M entries` because an audit that inspected zero things must not exit 0 (R10). `--self-test` pushes poisoned registries through the same checker: **it caught a decorative rule in my first draft**, where `allow.includes(".github/")` never matched `.github/workflows/ci.yml`. A gate whose checks cannot fail is a status light wired to nothing, and only a hostile input reveals that.
+
+**Evidence (2026-11-07).** Migration verified by content, not hope: `cp` then sha256 compare (`6e72b601…` equal on both sides) before removing the tracked copy. `npm run typecheck` clean; `npm test` → 728 tests, 727 pass, 1 pre-existing skip, 0 fail; `gate:registry --self-test` → 9/9 rules fire; live audit → inspected 5 enabled of 5, 0 failures, 2 warnings (both stated residuals, below). Two supervisor-spawning tests had to gain a registry seam and one of them had carried the comment "the registry has no test seam" since it was written — it passed here and failed on CI because it was reading my home directory as policy.
+
+**Residuals, deliberately not fixed here.**
+
+- drydock's allowlist still contains `factory/`, so a self-run can propose edits to the code that *interprets* policy. Contained by `autoMerge:false` + review + CI, not by scope; the gate warns on it every run so the move is not mistaken for closure.
+- The registry now has no review trail in git. That trade was accepted knowingly: the alternative was a tracked file with runtime authority. Restoring a trail means a private git repo or an audit log of `(time, sha256, supervisor boot)` — see #258 follow-up.
+- `webhookId` is deployment data living in a policy file (two repos legitimately have none). Splitting routing data from policy is the natural next cut, not this one.

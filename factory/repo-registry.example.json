@@ -1,0 +1,33 @@
+{
+  "$comment": "TEMPLATE ONLY — never loaded. Copy to $DRYDOCK_CONFIG_DIR/repo-registry.json (default ~/.drydock/configs/repo-registry.json) or point DRYDOCK_REGISTRY_PATH at your own file, then edit. This is DEPLOYMENT STATE: which repositories this factory may act on and what each one is allowed to do. It deliberately does not live in the source tree — the supervisor reads it live, so a file inside the tree would make policy changeable by switching branches, and drydock's own pathAllowlist covers `factory/`, meaning a self-run could edit the policy that governs it (see factory/repo-registry.ts registryPath() and research/multi-repo-factory-plan.md §5.28). Fields per repo: eligibilityLabel (the label that starts a run), autoMerge (false = runs stop at the draft PR), enabled, webhookId (this deployment's hook id — without it, failed deliveries for that repo are never swept), pathAllowlist (null = any non-protected path; vendor/ is protected everywhere regardless), protectedPaths, requireVerification (default true), oracleBoot (argv executed by behavior gates — shell metacharacters rejected at load), refine/refineLabel/prFeedback. Per-repo RUNTIME config (model pin, testCommand, setupCommand, budgets) is a separate file: <owner>_<repo>.json in the same directory.",
+  "defaults": {
+    "eligibilityLabel": "agent",
+    "autoMerge": true,
+    "enabled": true
+  },
+  "repos": [
+    {
+      "repo": "example/disposable-fixture",
+      "enabled": true,
+      "webhookId": 123456789,
+      "pathAllowlist": ["src/", "test/", "README.md"],
+      "oracleBoot": {
+        "command": "node",
+        "args": ["src/server.mjs", "0"],
+        "portFrom": "stdout",
+        "stdoutPattern": "127\\.0\\.0\\.1:(\\d+)"
+      },
+      "note": "A repo the factory may auto-merge: it is a throwaway fixture with no history worth protecting."
+    },
+    {
+      "repo": "example/repo-that-matters",
+      "enabled": true,
+      "webhookId": 987654321,
+      "autoMerge": false,
+      "pathAllowlist": ["src/", "test/", "docs/", "README.md"],
+      "protectedPaths": ["gates/", ".github/"],
+      "eligibilityLabel": "build",
+      "note": "autoMerge false and a narrow scope: runs stop at a draft PR for a human, and the oracles that judge a run sit outside the run's reach. Add a protectedPaths entry for anything a run must not amend — including its own test oracle once one exists."
+    }
+  ]
+}

@@ -39,7 +39,7 @@ export async function loadProbes() {
     // Required: which fleet repo this oracle speaks to. Two fixtures expose different APIs, so an
     // unqualified oracle is one `--repo` flag away from judging the wrong service.
     if (typeof mod.repo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(mod.repo)) {
-      throw new Error(`probe ${file} must export repo: "owner/name" (a fleet entry in factory/repo-registry.json)`);
+      throw new Error(`probe ${file} must export repo: "owner/name" (a fleet entry in $DRYDOCK_CONFIG_DIR/repo-registry.json)`);
     }
     if (probes.has(mod.key)) throw new Error(`duplicate probe key "${mod.key}" in ${file}`);
     probes.set(mod.key, { key: mod.key, title: mod.title, check: mod.check, repo: mod.repo, sourceIssue: mod.sourceIssue, file });

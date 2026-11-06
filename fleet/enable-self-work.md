@@ -37,7 +37,7 @@ gh api -X DELETE repos/lalanikarim/drydock/rulesets/<id>     # drop the review g
 
 | Item | Status | Evidence |
 |---|---|---|
-| Registry entry enabled, `autoMerge: false` | done | `factory/repo-registry.json`; capability removal means a self-run has no `merge_pr` tool at all |
+| Registry entry enabled, `autoMerge: false` | done | `$DRYDOCK_CONFIG_DIR/repo-registry.json` (deployment state since §5.31 — not in the tree); capability removal means a self-run has no `merge_pr` tool at all. `npm run gate:registry` asserts this posture on the host |
 | Eligibility label threaded per route | done | `buildRoutes()` in `fleet/supervisor.ts`, `test/fleet-routes.test.mjs` |
 | `build` label exists on the repo | done | created 2026-10-31 (GitHub does not auto-create labels; intake matches on name) |
 | Path scope excludes `gates/`; `gates/probes/` protected | done | registry + `test/path-scope.test.mjs` |
@@ -237,7 +237,7 @@ A comment on an open PR can now drive the factory:
 
 **Enable it in three places**, each of which fails silently if skipped:
 
-1. **Registry policy** — `prFeedback: true` on the repo entry in `factory/repo-registry.json` (default `false`; must be a real boolean).
+1. **Registry policy** — `prFeedback: true` on the repo entry in `$DRYDOCK_CONFIG_DIR/repo-registry.json` (default `false`; must be a real boolean).
 2. **Routes** — automatic: the supervisor copies the flag onto the route, and the adapter refuses comment events for repos without it. Restart the supervisor after changing the registry, since routes are written at start.
 3. **Webhook events** — the hook must subscribe to `issue_comment` in addition to `issues`:
 
@@ -278,7 +278,7 @@ pass).
 | comment **`/refine <guidance>`** on an issue | one pass per comment, with your guidance folded in |
 | comment **`/refine`** with nothing after it | a plain "expand this" pass — the common case |
 
-Both are opt-in per repository (`refine: true` in `factory/repo-registry.json`; label name configurable via
+Both are opt-in per repository (`refine: true` in `$DRYDOCK_CONFIG_DIR/repo-registry.json`; label name configurable via
 `refineLabel`). The registry **refuses to load** if `refineLabel` equals `eligibilityLabel`: one gesture must
 never be able to mean both "expand this" and "go build it".
 
@@ -413,7 +413,7 @@ conversation is no longer on the webhook path`.
 Run the sweep after any supervisor restart, and on a schedule otherwise:
 
 ```bash
-# the one to run: sweep every deployed repo, targets derived from factory/repo-registry.json
+# the one to run: sweep every deployed repo, targets derived from $DRYDOCK_CONFIG_DIR/repo-registry.json
 node --experimental-strip-types fleet/redeliver-failed.mjs --from-registry --since 24h \
   --skip-file fleet/data/acknowledged-deliveries.txt --state-file fleet/data/last-sweep.json
 
@@ -688,8 +688,10 @@ curl -sS http://127.0.0.1:9700/health                             # build sha + 
 
 There is no runtime per-repo stop verb, and killing a child always respawns it. To keep a repo down, remove its
 entry from the `factories` array in `fleet/fleet.local.json` (a deployment file, not checked in) and restart the
-supervisor. Disabling it in `factory/repo-registry.json` is the other lever and also stops its webhook route; use
-that when the reason is policy rather than a fire.
+supervisor. Disabling it in `$DRYDOCK_CONFIG_DIR/repo-registry.json` is the other lever and also stops its webhook
+route; use that when the reason is policy rather than a fire. Both files are deployment state now (§5.31): neither is
+in the tree, so neither changes when you switch branches — and `git checkout` is not a way to edit what a running
+fleet permits.
 
 ### Two traps that cost real time on 2026-11-02
 
@@ -1019,8 +1021,8 @@ Five things are announced, because a channel that carries everything is read by 
 | a refinement brief is posted (`refine_posted`) | issue and the comment URL (#65) |
 
 Everything else stays where it already lives: PR comments, `fleet/data/intake-adapter.jsonl`, durable task
-state. Notifications are deployment configuration (who to tell), never repository policy (what is allowed) —
-`factory/repo-registry.json` remains the only place capability decisions are made.
+state. Notifications are deployment configuration (who to tell), never repository policy (what is allowed) — the repo
+registry (`$DRYDOCK_CONFIG_DIR/repo-registry.json`) remains the only place capability decisions are made.
 
 ### Properties worth knowing before you rely on it
 

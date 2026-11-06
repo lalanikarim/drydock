@@ -394,7 +394,7 @@ export function verificationGate(evidence: VerificationEvidence, { requireVerifi
   if (!evidence.ran) {
     return {
       action: "refuse",
-      reason: "verification is required for this repo but no test command is configured — set testCommand in the per-repo config, or requireVerification:false in factory/repo-registry.json to waive it deliberately",
+      reason: "verification is required for this repo but no test command is configured — set testCommand in the per-repo config, or requireVerification:false in $DRYDOCK_CONFIG_DIR/repo-registry.json to waive it deliberately",
     };
   }
   if (evidence.timedOut) {
@@ -429,7 +429,7 @@ export function formatVerificationEvidence(evidence: VerificationEvidence, { req
   if (!evidence.ran) {
     return [
       `**NOT VERIFIED — nothing was executed.** ${evidence.skippedReason ?? ""}`.trim(),
-      `This repo sets \`requireVerification: false\` in factory/repo-registry.json (decision C1 escape hatch${requireVerification ? "; note: the effective policy here is to require verification" : ""}).`,
+      `This repo sets \`requireVerification: false\` in $DRYDOCK_CONFIG_DIR/repo-registry.json (decision C1 escape hatch${requireVerification ? "; note: the effective policy here is to require verification" : ""}).`,
       "A human reviewing this PR is the only verification it has had.",
     ].join("\n");
   }

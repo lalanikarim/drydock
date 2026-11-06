@@ -131,7 +131,7 @@ export interface PipelineOptions {
    */
   gitAuth?: GitAuth;
   /**
-   * Registry policy (factory/repo-registry.json `autoMerge`). When false, merge_pr is not registered
+   * Registry policy ($DRYDOCK_CONFIG_DIR/repo-registry.json `autoMerge`). When false, merge_pr is not registered
    * at all and the orchestrator prompt stops at the draft PR — capability removal rather than a
    * runtime refusal, so there is no approval to grant and nothing to forget to check.
    * Defaults to true; the caller (factory/main.ts) reads it from the registry, never from config.

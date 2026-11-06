@@ -300,9 +300,10 @@ node --experimental-strip-types gates/g2-worker-quality.mjs --regression        
 |---|---|---|---|
 | `factory/config/<owner>_<repo>.json` | per-repo **runtime** config: model provider, `testCommand`, `setupCommand`, sandbox image, budgets | ~~yes~~ → **no**, superseded by §5.28 | a run fails or uses the wrong model |
 | `fleet/fleet.example.json` (per deployment) | **deployment**: one entry per running factory + its webhook secret + instance token; supervisor rewrites the derived routes file | no (secrets) | nothing starts |
-| `factory/repo-registry.json` | **policy**: which repos are managed, `eligibilityLabel`, `autoMerge`, `oracleBoot` | yes | something gets merged that should not have been |
+| `$DRYDOCK_CONFIG_DIR/repo-registry.json` | **policy**: which repos are managed, `eligibilityLabel`, `autoMerge`, `oracleBoot` | ~~yes~~ → **no**, superseded by §5.31 | something gets merged that should not have been |
+| `factory/repo-registry.example.json` | the registry's **shape**, as a template (no real repos) | yes | an operator bootstraps policy from nothing, or invents their own schema |
 
-Separating policy from deployment is the point: the registry contains no secrets, so it can be reviewed like code, and "is anything else auto-merging?" is a one-screen question instead of a grep across per-repo files. Two rules make it fail closed (`test/repo-registry.test.mjs`, 12 checks): a **disabled entry may not declare `autoMerge=true`** (a leftover grant on a repo someone disabled is a surprise for whoever re-enables it), and an **enabled entry requires runtime config** — then by a `configFile` pointer checked at load, now by naming convention in `$DRYDOCK_CONFIG_DIR` (§5.28). Unknown fields are rejected — `{automerge: true}` must not silently mean "not set".
+Separating policy from deployment was the point, and §5.31 finished it: the registry holds no secrets either way, but "reviewable like code" was never worth as much as "not changeable by `git checkout` while a fleet reads it live". "Is anything else auto-merging?" is now answered on the factory host by `npm run gate:registry` rather than by reading a file in CI. Two rules make it fail closed (`test/repo-registry.test.mjs`, 12 checks): a **disabled entry may not declare `autoMerge=true`** (a leftover grant on a repo someone disabled is a surprise for whoever re-enables it), and an **enabled entry requires runtime config** — then by a `configFile` pointer checked at load, now by naming convention in `$DRYDOCK_CONFIG_DIR` (§5.28). Unknown fields are rejected — `{automerge: true}` must not silently mean "not set".
 
 **Oracles are now per-repo.** Each probe exports `repo`, and each registry entry declares `oracleBoot` with explicit port discovery, because the two fixtures genuinely differ: fixture-1 binds port 0 and logs `127.0.0.1:<bound>`, while fixture-2 reads `PORT` and logs **the requested value** — meaningless when we ask for 0. So `portFrom` is either `"stdout"` (parse the log) or `"env"` (we reserve a free port, export it, and wait for the socket to accept). A probe whose `repo` does not match the repo being judged is refused rather than run: an invoice oracle against the jobs service would judge nothing, and might accidentally "pass".
 
@@ -668,7 +669,7 @@ merged to `main`. Same model, same gates, same repo. The variable was the ticket
 
 Refinement makes that rewrite a repeatable step instead of a favor from whoever happens to notice.
 
-**Two triggers, both opt-in per repository** (`refine` in `factory/repo-registry.json`, default false, plus
+**Two triggers, both opt-in per repository** (`refine` in the repo registry (`$DRYDOCK_CONFIG_DIR/repo-registry.json`), default false, plus
 a configurable `refineLabel` defaulting to `"refine"`):
 
 | trigger | event | request id |
@@ -814,7 +815,7 @@ Anything else belongs in the PR comment or the audit log. A notification channel
 read by nobody, so the module refuses to be a general-purpose logger: three event shapes, one line each.
 
 **Deployment-level, not repository policy.** Who to tell is configuration (`TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`); what is allowed stays exclusively in `factory/repo-registry.json`. Putting a notification
+`TELEGRAM_CHAT_ID`); what is allowed stays exclusively in the repo registry (`$DRYDOCK_CONFIG_DIR/repo-registry.json`). Putting a notification
 flag in the registry would create a second place where behavior diverges per repo without any safety meaning.
 
 **Three properties this module owns:**
@@ -922,3 +923,19 @@ With `--boot`, an instance is started against the restored tree via `FACTORY_INS
 **Run (2026-11-02), real stores, real inference host:** `lalanikarim_drydock` snapshot integrity ok; restored tree matched `conversations=15 entries=460 tasks=430 submissions=28 documents=89 document_revisions=90` and 6 document kinds; write probe ok; instance booted from the restore and listed **15 conversations recovered**. `BACKUP DRILL PASSED`.
 
 **What this does not buy.** The backup directory is on the same physical disk as the stores, so it survives operator error, a bad migration and store corruption — not a dead machine. Off-host encrypted copies are the open half; runbook §11 says so rather than letting "we have backups" mean disaster recovery. Scheduling (launchd, like `com.drydock.redeliver`) is deliberately not installed: an unwatched backup job is how a month of silent failures accumulates, so schedule it with pruning and check the first few manifests.
+
+### 5.31 The repo registry leaves the source tree (#258, 2026-11-07)
+
+`factory/repo-registry.json` was tracked in git. It is now `$DRYDOCK_REGISTRY_PATH` if set, else `$DRYDOCK_CONFIG_DIR/repo-registry.json`, with `factory/repo-registry.example.json` committed as the shape. Three defects, one file:
+
+1. **Runtime truth was `git checkout`-able.** The supervisor reads and reloads this file live (`watchRegistry`), so switching branches changed which repositories the fleet routed and what each could touch. §5.28 removed per-repo runtime config from the tree for exactly this reason; policy was the same class of thing and had been left behind.
+2. **A drydock self-run could edit its own scope.** `factory/` is inside drydock's own `pathAllowlist`, so the file deciding `pathAllowlist`/`autoMerge` was writable by the thing it governs. Moving it out does not make policy uneditable-by-code (`factory/repo-registry.ts` still interprets it, and that stays in scope) but it removes the direct case: no run can now write a policy file and have it take effect on reload.
+3. **CI asserted on deployment state.** `test/repo-registry.test.mjs` held a hard-coded snapshot of managed repo names, so onboarding tasklight meant editing a unit test — and worse, that test passing on a runner proved nothing about any fleet while failing loudly the moment one laptop gained a repo.
+
+**What replaced the CI assertions.** `gates/registry-posture.mjs` (`npm run gate:registry`) audits the live file on the factory host: nothing waives verification, no allowlist grants `.github`, no self-contradictory `vendor/`, drydock cannot auto-merge, `gates/probes/` stays protected. It prints `inspected N enabled of M entries` and **exits non-zero when it inspects nothing** (R10: "not collected" is not "passing"). `--self-test` feeds it poisoned registries and fails unless each rule fires — which caught a real bug in the first draft: `Array.includes(".github/")` on an allowlist does not match `.github/workflows/ci.yml`, so the rule was decorative until its own self-test said so.
+
+**Unit tests keep the mechanism, against `test/fixtures/repo-registry.fixture.json`.** Anything that spawns the supervisor now gets a registry through the same `$DRYDOCK_CONFIG_DIR` redirect it already used for runtime configs — `test/quarantine-blast-radius.test.mjs` had commented for months that "the registry has no test seam"; it does now, and that test was passing on my machine and failing on CI for want of one.
+
+**Migration (2026-11-07).** `cp` to the config dir, verify sha256 equal (`6e72b601…`), then delete the tracked copy; `git rm --cached`, ignore rule with the reason inline. The backup drill already copied every `*.json` in `$DRYDOCK_CONFIG_DIR`, so policy silently gained backup coverage — and lost its now-always-"absent, skipped" entry in the drill's repo-file list.
+
+**Residual, stated.** drydock's allowlist still contains `factory/`, so a self-run can propose changes to the code that enforces policy. The gate reports this as a warning on every run rather than letting the move imply the problem is closed. What contains it is `autoMerge:false` plus review plus CI — not scope.

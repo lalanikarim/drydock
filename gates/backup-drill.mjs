@@ -161,7 +161,9 @@ if (existsSync(cfg)) {
 } else {
   fail(`runtime config dir not found: ${cfg}`);
 }
-for (const rel of ["fleet/fleet.local.json", "fleet/data/routes.json", "factory/repo-registry.json"]) {
+// The repo registry is not listed here any more: it left the tree with #258 and is copied above as part of
+// the config directory, which is what a backup of deployment state should have included all along.
+for (const rel of ["fleet/fleet.local.json", "fleet/data/routes.json"]) {
   const p = join(ROOT, rel);
   if (!existsSync(p)) { note(`${rel}: absent, skipped`); continue; }
   const dst = join(outDir, rel.replace(/^/, "repo/"));

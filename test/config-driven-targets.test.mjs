@@ -15,17 +15,41 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { registryRepoNames, tryRegistryRepoNames, DEFAULT_REGISTRY } from "../gates/registry-targets.mjs";
+import { registryRepoNames, tryRegistryRepoNames } from "../gates/registry-targets.mjs";
+
+// Policy is deployment state now (see registryPath()), so this reads the fixture. The live file is audited
+// on the factory host by gates/registry-posture.mjs.
+const POLICY_FIXTURE = new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname;
 
 const ROOT = resolve(import.meta.dirname, "..");
 
-test("targets come from policy: every probed name is declared in the registry", () => {
-  const names = registryRepoNames();
-  const declared = new Set(JSON.parse(readFileSync(DEFAULT_REGISTRY, "utf8")).repos.map((r) => r.repo));
+test("targets come from policy, and only from policy", () => {
+  // The original form of this test compared the reader's output against the same file it read — true no
+  // matter what the code did, which is precisely the vacuity this repo keeps getting burned by (R10).
+  // Non-vacuous version: point the reader at a registry naming ONE unusual repo. A hardcoded floor would
+  // still return lalanikarim/* alongside it.
+  const dir = mkdtempSync(join(tmpdir(), "targets-only-"));
+  try {
+    const only = join(dir, "only.json");
+    writeFileSync(only, JSON.stringify({ repos: [{ repo: "zzb/sole-entry", enabled: true }] }));
+    assert.deepEqual(registryRepoNames(only), ["zzb/sole-entry"], "the reader returned more than policy declared — a floor is back");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 
-  assert.ok(names.length > 0);
-  // The point of the fix: nothing outside the registry can appear in a probe's target list.
-  for (const n of names) assert.ok(declared.has(n), `${n} probed but not declared in repo-registry.json`);
+  // And the reader must not name a repository in executable code. Comments are stripped first: this file's
+  // own header quotes the old hardcoded list as a cautionary tale, and an assertion that fires on prose
+  // teaches nothing about behavior.
+  const src = readFileSync(new URL("../gates/registry-targets.mjs", import.meta.url), "utf8")
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n");
+  assert.ok(!/lalanikarim\//.test(src), "registry-targets.mjs hardcodes a repo name — that is the #78 drift this file exists to prevent");
+
+  const declared = new Set(JSON.parse(readFileSync(POLICY_FIXTURE, "utf8")).repos.map((r) => r.repo));
+  const names = registryRepoNames(POLICY_FIXTURE);
+  assert.ok(names.length > 0, "a policy with no entries yields no targets (see gates/registry-posture.mjs)");
+  for (const n of names) assert.ok(declared.has(n), `${n} probed but not declared in the registry`);
 });
 
 test("a registry that cannot be read is an error, never a stale floor", () => {

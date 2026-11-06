@@ -13,3 +13,9 @@ g5-results.json
 # pi project settings: per-operator local defaults (model, thinking level, theme).
 # Shared project config would be a deliberate commit; personal model choices are not.
 .pi/settings.json
+
+# The repo registry is DEPLOYMENT STATE, not source: which repos this factory manages and what each
+# may change. It used to be tracked here, which made policy changeable by `git checkout` (the supervisor
+# reloads it live) and editable by a drydock self-run, since `factory/` is inside drydock's own pathAllowlist.
+# Live copy: $DRYDOCK_CONFIG_DIR/repo-registry.json — committed shape: factory/repo-registry.example.json
+factory/repo-registry.json

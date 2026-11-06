@@ -11,6 +11,9 @@ import assert from "node:assert/strict";
 import { buildRoutes } from "../fleet/supervisor.ts";
 import { loadRegistry } from "../factory/repo-registry.ts";
 
+// A fixture, not the live registry: which repos are managed is deployment state (see registryPath()).
+const POLICY_FIXTURE = new URL("fixtures/repo-registry.fixture.json", import.meta.url).pathname;
+
 const factories = [
   { repo: "octo/fix", secret: "fleet-secret" },
   { repo: "octo/build", secret: "other-fleet-secret", token: "tok", allowedSenders: ["alice"] },
@@ -49,8 +52,8 @@ test("secret env override and target/token/sender passthrough still hold", () =>
   assert.equal(build.token, "tok");
 });
 
-test("the real registry produces the labels we think it does", () => {
-  const real = loadRegistry();
+test("policy routes each repo by its own eligibility label", () => {
+  const real = loadRegistry(POLICY_FIXTURE);
   const labelFor = (repo) => real.repos.find((r) => r.repo === repo)?.eligibilityLabel;
   assert.equal(labelFor("lalanikarim/factory-fixture"), "agent");
   assert.equal(labelFor("lalanikarim/factory-fixture-2"), "agent");

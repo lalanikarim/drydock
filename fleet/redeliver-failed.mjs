@@ -24,7 +24,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { loadRegistry, sweepTargets, missingWebhookIds } from "../factory/repo-registry.ts";
+import { loadRegistry, sweepTargets, missingWebhookIds, registryPath as defaultRegistryPath } from "../factory/repo-registry.ts";
 
 const API = "https://api.github.com";
 
@@ -274,7 +274,7 @@ async function runRegistrySweep({ argv, env, fetchImpl, log, listOnly = false })
   const registryPath = opt("registry");
   let targets, untracked;
   try {
-    const registry = registryPath ? loadRegistry(registryPath) : loadRegistry();
+    const registry = loadRegistry(registryPath ?? defaultRegistryPath());
     targets = sweepTargets(registry);
     untracked = missingWebhookIds(registry);
   } catch (e) {
@@ -282,7 +282,7 @@ async function runRegistrySweep({ argv, env, fetchImpl, log, listOnly = false })
     return { code: 2, failed: [], applied: [] };
   }
 
-  log(`sweep targets (${registryPath ?? "factory/repo-registry.json"}): ${targets.map((t) => `${t.repo} hook ${t.webhookId}`).join(", ") || "none"}`);
+  log(`sweep targets (${registryPath ?? defaultRegistryPath()}): ${targets.map((t) => `${t.repo} hook ${t.webhookId}`).join(", ") || "none"}`);
   // Loud, but not fatal: an untracked repo's deliveries are simply never examined, which is worse than a
   // noisy line here and nobody would ever find out.
   if (untracked.length) log(`WARNING enabled repos with no webhookId — their deliveries are NOT swept: ${untracked.join(", ")}`);

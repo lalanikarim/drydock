@@ -61,7 +61,7 @@ export function main({ argv = process.argv.slice(2), log = console.log } = {}) {
   const { lines, failures } = auditLines({ registry, fleetRepos });
   for (const l of lines) log(l);
   if (failures > 0) {
-    log(`\n${failures} deployed repo(s) have no webhookId — record it in factory/repo-registry.json so the sweep covers them.`);
+    log(`\n${failures} deployed repo(s) have no webhookId — record it in $DRYDOCK_CONFIG_DIR/repo-registry.json so the sweep covers them.`);
     return 1;
   }
   if (fleetPath) log("\nno gaps found for the repos this fleet deploys.");
