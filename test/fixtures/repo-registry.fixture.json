@@ -92,10 +92,12 @@
         "package.json"
       ],
       "protectedPaths": [
-        "README.md"
+        "README.md",
+        "test/spec.test.mjs",
+        "test/helpers.mjs"
       ],
       "eligibilityLabel": "build",
-      "note": "Spec-driven greenfield target (onboarded 2026-11-06). The repo is a specification only — README.md is the behavior contract and the worker prompt defers to it, so it is protected: a run may not amend the spec it is being judged against. Bootstrap sequence: issue #1 lands test/spec.test.mjs + test/helpers.mjs verbatim (the oracle), then README gains test/spec.test.mjs in protectedPaths by human edit, then issue #2 implements src/ until the oracle passes. autoMerge false permanently for this repo: runs stop at the draft PR. No setupCommand — v0 is dependency-free, so verification needs no install step."
+      "note": "Spec-driven target (onboarded 2026-11-06). README.md is the behavior contract and the worker prompt defers to it, so it is protected: a run may not amend the spec it is judged against. The oracle landed verbatim in PR #3 (SHA-256 verified out of band — see drydock#263 for why that verification is not yet mechanical) and is now protected too: no later run may edit the tests that grade it. Bootstrap corrected as shipped: ONE issue carried oracle + src/, because the push gate refuses any non-zero exit and an oracle alone is red. autoMerge false permanently: runs stop at a draft PR. No setupCommand — v0 is dependency-free."
     }
   ]
 }
