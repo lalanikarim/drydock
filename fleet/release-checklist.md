@@ -37,6 +37,17 @@ that blind spot structural now rather than a reminder:
   to whatever `/models` returns first. Taking `data[0].id` is what broke: the list reordered, the chosen model accepted
   submissions and never generated, and the printed diagnosis ("provider unreachable") was false.
 
+When you change **how configuration is resolved**, run the suite the way a runner does — an empty home and no
+deployment env — because that is the only run that can tell a seam from a decoration:
+
+```bash
+mkdir -p /tmp/cihome
+env -u DRYDOCK_CONFIG_DIR -u DRYDOCK_REGISTRY_PATH -u PI_AGENT_DIR HOME=/tmp/cihome npm test
+```
+
+A resolution change verified only on the factory host passes for the wrong reason: your `~/.drydock` answers
+whatever the code asked. This caught #259's first push, where one of two calls in a test still read the default.
+
 Policy changes are not diffs any more. The repo registry is deployment state (§5.31), so `git diff` cannot show you
 that auto-merge or a path scope changed; `npm run gate:registry` reads the live file and fails on the posture rules CI
 used to assert when the registry was tracked (nothing waives verification, no allowlist grants `.github`, drydock
