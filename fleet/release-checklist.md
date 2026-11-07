@@ -62,8 +62,11 @@ grep -c "all checks passed" /tmp/boot.log   # must be 3 — one per suite, same 
 grep -c "SKIP" /tmp/boot.log                # must be 0; a skip is not a pass (#241)
 ```
 
-Last run on the host at `a3a2c03`: `npm run verify` → 695 tests, 0 fail (one pre-existing skip); `test:boot` → 3/3
-"all checks passed", 0 skips, model resolved from `drydock-config`.
+Last run on the host at `0cb9382` (2026-11-07): `npm run verify` → 728 tests, 0 fail (one pre-existing skip);
+`test:boot` → both boot suites "all checks passed", 0 skips, model resolved from `drydock-config`;
+`npm run gate:registry` → inspected 5 enabled of 5 entries, 2 known warnings (#259 residual: `factory/` in drydock's
+own scope, fixtures without a webhookId); `npm run gate:verification` → all #247 checks passed against the real
+runtime; `fleet/verify-deploy-posture.mjs` → PASS.
 
 ## Step 2 — infrastructure truth, before your code is blamed for it
 
